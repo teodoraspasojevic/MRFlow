@@ -1,3 +1,4 @@
+import os
 import time
 import types
 
@@ -30,7 +31,6 @@ class LatentAutoregressiveGenerator:
         config,
         block_size: int = 16,
         overlap: int = 8,
-        stop_value: float = 1.0,
         eps: float = 0.1,
     ):
         self.denoiser = denoiser
@@ -40,18 +40,35 @@ class LatentAutoregressiveGenerator:
         self.config = config
         self.block_size = block_size
         self.overlap = overlap
-        self.stop_value = stop_value
         self.eps = eps
         self.dtype = torch.float32
         self.trim = True
 
-        # Pre-encode zero and one frames as boundary references
-        self.zero_latent = self.encode_image(torch.zeros(1, 3, 256, 256))
+        # The black seed and white stop tokens, at the ends of whatever pixel range the dataset
+        # was normalized to (`black_value` / `white_value` in the config). Preprocessing already
+        # cached the MR pair, and reusing it means inference seeds and stops with byte-identical
+        # tokens to the ones training saw.
+        black, white = self.boundary_latents()
 
-        one_latent = self.encode_image(torch.ones(1, 3, 256, 256))
-        one_latent = sample_latents(self.config, one_latent)
+        self.zero_latent = black
+        one_latent = sample_latents(self.config, white)
         one_latent = scale_latents(one_latent, vae_scaling)
         self.one_latent = one_latent
+
+    def boundary_latents(self):
+        """(black, white) as [1, C, s, s], from the preprocessing cache when there is one."""
+        mri = self.config.get("mri", None)
+        if mri is not None:
+            cache = os.path.join(mri.dataset_root, "boundary")
+            if os.path.exists(os.path.join(cache, "black.pt")):
+                return tuple(
+                    torch.load(os.path.join(cache, f"{n}.pt"), map_location=self.device)
+                    .unsqueeze(0).to(self.dtype)
+                    for n in ("black", "white")
+                )
+        res = self.config.globals.resolution
+        return tuple(self.encode_image(torch.full((1, 3, res, res), float(v)))
+                     for v in (self.config.black_value, self.config.white_value))
 
     def encode_image(self, img):
         with torch.no_grad():
@@ -71,8 +88,7 @@ class LatentAutoregressiveGenerator:
                 decoded_chunks.append(decoded)
 
             latents = torch.cat(decoded_chunks, dim=0)
-            latents = latents * 306
-            latents = latents.clamp(0, 255).to(torch.uint8).cpu()
+            latents = to_uint8_frames(latents, self.config).cpu()
             latents = rearrange(latents, "(b t) c h w -> b c t h w", b=b)
             print("Decoded latents shape:", latents.shape)
 

@@ -1,5 +1,7 @@
+import csv
 import os
 import random
+from glob import glob
 
 import torch
 from torch.utils.data import Dataset
@@ -60,6 +62,82 @@ class LatentBlockDataset(Dataset):
         }
 
 
+class MRRateLatentBlockDataset(Dataset):
+    """
+    Dataset for auto-regressive block-wise training on MR-RATE.
+
+    Returns the same three keys as LatentBlockDataset, so the training loop is unchanged. What
+    differs is that the two sequence boundaries are sampled explicitly, because the rollout needs
+    all three cases trained rather than just the interior:
+
+        start     black boundary block  -> first block          (inference seeds with black)
+        interior  block [t, t+B)        -> block [t+B, t+2B)
+        end       last block            -> white boundary block (the learned stop signal)
+
+    Without `start` the black-seeded first inference step is off-distribution; without `end` the
+    stop token is never emitted and every volume runs to max_blocks. `p_start=0.3` matches the
+    released CTFlow checkpoint's own run, whose name records `black_rate_0.3`.
+
+    Preprocessing keeps only volumes with at least 2 * block_size slices, so every row can produce
+    any of the three kinds and there is no short-volume special case.
+    """
+
+    def __init__(self, root, split, block_size=16, p_start=0.3, p_end=0.2,
+                 deterministic=False, seed=42):
+        self.root = root
+        self.block_size = block_size
+        self.p_start = p_start
+        self.p_end = p_end
+        self.deterministic = deterministic
+        self.seed = seed
+
+        self.rows = []
+        for path in sorted(glob(os.path.join(root, "manifest", "*.csv"))):
+            with open(path, newline="") as f:
+                self.rows += [r for r in csv.DictReader(f) if r["split"] == split]
+        if not self.rows:
+            raise RuntimeError(f"no {split!r} rows found in {root}/manifest/*.csv")
+
+        black, white = (
+            torch.load(os.path.join(root, "boundary", f"{name}.pt"), map_location="cpu")
+            for name in ("black", "white")
+        )
+        # (C, s, s) -> (C, B, s, s) by repeating along the block axis, which is what the generator
+        # does for its seed block -- so a trained start example and an inference seed are identical.
+        self.black = black.unsqueeze(1).repeat(1, block_size, 1, 1)
+        self.white = white.unsqueeze(1).repeat(1, block_size, 1, 1)
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        row = self.rows[idx]
+        # __getitem__ runs in dataloader workers, so a deterministic draw has to come from
+        # (seed, idx) rather than global RNG state, which varies with worker count.
+        rng = random.Random(f"{self.seed}-{idx}") if self.deterministic else random
+
+        latent = torch.load(os.path.join(self.root, row["latent_path"]), map_location="cpu")
+        b, T = self.block_size, latent.shape[1]
+
+        roll = rng.random()
+        if roll < self.p_start:
+            block_curr, block_next = self.black, latent[:, :b]
+        elif roll < self.p_start + self.p_end:
+            block_curr, block_next = latent[:, T - b:], self.white
+        else:
+            t = rng.randint(0, T - 2 * b)
+            block_curr, block_next = latent[:, t:t + b], latent[:, t + b:t + 2 * b]
+
+        embedding = torch.load(os.path.join(self.root, row["embedding_path"]), map_location="cpu")
+        embedding = embedding / (embedding.norm(p=2) + 1e-6)
+
+        return {
+            "image": block_curr.float(),   # condition: [C, T, H, W]
+            "video": block_next.float(),   # target:    [C, T, H, W]
+            "embedding": embedding,        # text embedding: [1, D]
+        }
+
+
 def instantiate_dataset(configs, split=None):
     datasets = []
     for cfg in configs:
@@ -70,6 +148,8 @@ def instantiate_dataset(configs, split=None):
 
         if name == "LatentBlock":
             dataset = LatentBlockDataset(**params)
+        elif name == "MRRateLatentBlock":
+            dataset = MRRateLatentBlockDataset(**params)
         else:
             raise ValueError(f"Unknown dataset name: {name}")
         datasets.append(dataset)

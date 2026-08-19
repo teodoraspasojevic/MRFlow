@@ -1,4 +1,6 @@
-# CTFlow
+# MRFlow
+
+This model is MR extension of:
 
 **CTFlow: Video-Inspired Latent Flow Matching for 3D CT Synthesis**
 > ICCV 2025 Workshop on Vision-Language Models for 3D Understanding (VLM3D)
@@ -13,7 +15,7 @@ This repository implements a Spatial-Temporal DiT (STDiT) trained via flow match
 
 ## Overview
 
-**Training** — Flow matching on pre-encoded latent CT volumes. Each training sample is a pair of consecutive 16-frame latent blocks (current block as condition, next block as target), conditioned on a CT report embedding.
+**Training** — Flow matching on pre-encoded latent MR volumes. Each training sample is a pair of consecutive 16-frame latent blocks (current block as condition, next block as target), conditioned on a MR report embedding.
 
 **Inference** — Auto-regressive generation: starting from a zero-padded initial block, the model iteratively generates the next block until a stop signal or maximum length is reached. Three inference modes are supported:
 - `full-body` — generate the entire volume from scratch
@@ -33,7 +35,7 @@ This repository implements a Spatial-Temporal DiT (STDiT) trained via flow match
 ## Repository Structure
 
 ```
-CTFlow/
+MRFlow/
 ├── echosyn/
 │   └── common/
 │       ├── __init__.py          # Shared utilities (instantiation, training helpers, etc.)
@@ -63,9 +65,9 @@ CTFlow/
 
 ## Data Format
 
-**Latent volumes** (`.pt`): Pre-encoded 3D CT volumes, shape `[C, T, H, W]` where `C=16` (FLUX VAE channels), `T` is the temporal dimension (number of slices), `H=W=32` (spatial latent resolution).
+**Latent volumes** (`.pt`): Pre-encoded 3D MR volumes, shape `[C, T, H, W]` where `C=16` (FLUX VAE channels), `T` is the temporal dimension (number of slices), `H=W=32` (spatial latent resolution).
 
-**Embeddings** (`.pt`): CT report text embeddings, shape `[N, D]` where `D=768`.
+**Embeddings** (`.pt`): MR report text embeddings, shape `[N, D]` where `D=768`.
 
 ---
 
@@ -74,7 +76,7 @@ CTFlow/
 ### Local (single node, 4 GPUs)
 
 ```bash
-cd CTFlow
+cd MRFlow
 
 accelerate launch \
     --num_processes 4 \

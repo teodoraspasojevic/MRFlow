@@ -25,7 +25,6 @@ from einops._torch_specific import allow_ops_in_compiled_graph
 from omegaconf import OmegaConf
 from torchdiffeq import odeint_adjoint as odeint
 from tqdm.auto import tqdm
-import moviepy.editor as mpy
 import imageio
 
 import wandb
@@ -137,22 +136,24 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
         synthetic_video = rearrange(synthetic_video, "b c t h w -> (b t) c h w")
         synthetic_video = unscale_latents(synthetic_video, vae_scaling)
         synthetic_video = val_vae.decode(synthetic_video.float()).sample
-        synthetic_video = synthetic_video * 306
-        synthetic_video = synthetic_video.clamp(0, 255).to(torch.uint8).cpu()
+        synthetic_video = to_uint8_frames(synthetic_video, config).cpu()
         synthetic_video = rearrange(synthetic_video, "(b t) c h w -> b c t h w", b=B)
 
         ref_images = rearrange(ref_images, "b c t h w -> (b t) c h w")
         ref_images = unscale_latents(ref_images, vae_scaling)
         ref_images = val_vae.decode(ref_images.float()).sample
-        ref_images = ref_images * 306
-        ref_images = ref_images.clamp(0, 255).to(torch.uint8).cpu()
+        ref_images = to_uint8_frames(ref_images, config).cpu()
         ref_images = rearrange(ref_images, "(b t) c h w -> b c t h w", b=B)
 
         ref_videos = rearrange(ref_videos, "b c t h w -> (b t) c h w")
         ref_videos = val_vae.decode(ref_videos.float()).sample
-        ref_videos = ref_videos * 306
-        ref_videos = ref_videos.clamp(0, 255).to(torch.uint8).cpu()
+        ref_videos = to_uint8_frames(ref_videos, config).cpu()
         ref_videos = rearrange(ref_videos, "(b t) c h w -> b c t h w", b=B)
+
+        # Paired: the generation and ref_videos are the same block of the same volume, so these are
+        # per-case scores rather than the marginal distribution distances (FVD/FID) reported
+        # separately. They measure structural agreement only, not report-volume semantics.
+        metrics = paired_image_metrics(synthetic_video, ref_videos)
 
         videos = torch.cat([ref_images, ref_videos, synthetic_video], dim=3)
 
@@ -166,7 +167,7 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
         )
     videos = videos.numpy()
 
-    logger.info("Done sampling.")
+    logger.info(f"Done sampling. {metrics}")
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
             tracker.log({
@@ -174,8 +175,9 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
                     videos,
                     caption="Validation samples",
                     fps=config.validation.fps,
-                )
-            })
+                ),
+                **{f"val/{k}": v for k, v in metrics.items()},
+            }, step=step)
             logger.info("Samples sent to wandb.")
 
     del val_denoiser
@@ -202,6 +204,9 @@ def main():
     denoiser = instantiate_class_from_config(config.denoiser).train()
     if not ("UNetSTIC" in config.denoiser.target):
         denoiser.enable_xformers_memory_efficient_attention()
+    # Before the EMA copy and before prepare(), so EMA starts from these weights and a later
+    # resume still wins over them.
+    load_init_weights(config, denoiser, logger)
     vae_scaling = get_vae_scaler(config, accelerator.device)
     clamp_v = config.get("clamp_v", float("inf"))
 

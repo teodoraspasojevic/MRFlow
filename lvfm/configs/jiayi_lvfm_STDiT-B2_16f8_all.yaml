@@ -16,6 +16,16 @@ max_grad_norm: 1.0
 max_grad_value: -1
 sample_latents: true
 
+# Pixel-range constants. CT-RATE volumes are normalized to [0, 1] over an HU window of
+# (-1000, 1400); `decode_scale: 306` rescales that to the challenge's (-1000, 1000), since HU +1000
+# sits at 2000/2400 = 0.8333 of the range and 306 * 0.8333 = 255, so the uint8 clamp lands exactly
+# there. The sequence boundaries -- all-black seed block, all-white stop block -- are the ends of
+# the [0, 1] range.
+decode_scale: 306.0
+decode_shift: 0.0
+black_value: 0.0
+white_value: 1.0
+
 # | Model | Layers N | Hidden size d | Heads | Gflops (I=32, p=4)  | Params |
 # |-------|----------|---------------|-------|---------------------|--------|
 # | DiT-S | 12       | 384           | 6     | 1.4                 | 36M    |

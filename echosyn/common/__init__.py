@@ -140,7 +140,10 @@ def init_trackers(accelerator, config, args):
             init_kwargs={
                 "wandb": {
                     **wandb_args,
-                    "mode": "disabled" if args.no_wandb else "online",
+                    # WANDB_MODE is respected rather than forced to "online": compute nodes with no
+                    # outbound route otherwise hang for 90 s in wandb.init and kill the run. Set
+                    # WANDB_MODE=offline and `wandb sync` the run directory afterwards.
+                    "mode": "disabled" if args.no_wandb else os.environ.get("WANDB_MODE", "online"),
                     "resume": "allow",
                 }
             },
@@ -214,6 +217,30 @@ def load_checkpoint(config, accelerator, num_update_steps_per_epoch, ema_model=N
         initial_global_step = 0
 
     return initial_global_step, first_epoch
+
+
+def load_init_weights(config, model, logger):
+    """Initialize from a released checkpoint's *weights only* -- fresh optimizer, scheduler, EMA
+    and step counter. This is how the MR run starts from the CT-trained CTFlow denoiser.
+
+    Distinct from `resume_from_checkpoint`, which restores a full accelerate state, and from
+    `if_fine_tuned`, which resets the step counter *after* such a restore. Point `init_from` at a
+    diffusers model directory (e.g. `checkpoint-680000/denoiser_ema`); its EMA save keys match the
+    live model exactly, so a non-empty missing/unexpected list means the architectures differ.
+    """
+    path = config.get("init_from", None)
+    if not path:
+        return
+
+    if os.path.isdir(path):
+        path = os.path.join(path, "diffusion_pytorch_model.safetensors")
+    missing, unexpected = model.load_state_dict(load_file(path), strict=False)
+    logger.info(f"Initialized weights from {path}")
+    if missing or unexpected:
+        logger.warning(
+            f"  {len(missing)} missing and {len(unexpected)} unexpected keys — the checkpoint "
+            f"architecture differs from the config. missing={missing[:5]} unexpected={unexpected[:5]}"
+        )
 
 
 def cleanup_checkpoints(config, logger):
@@ -443,6 +470,35 @@ def unscale_latents(latents, vae_scaling=None):
     latents /= vae_scaling["std"]
     latents += vae_scaling["mean"]
     return latents
+
+
+def to_uint8_frames(decoded, config):
+    """Decoded VAE output -> uint8 [0, 255] for logging, by the config's affine map.
+
+    `decode_scale` / `decode_shift` depend on the pixel range the dataset was normalized to, so
+    they are required config keys rather than defaults -- see the comment next to them in the
+    config. MR is [0, 1], so 255 / 0.
+    """
+    return (decoded * config.decode_scale + config.decode_shift).clamp(0, 255).to(torch.uint8)
+
+
+def paired_image_metrics(generated, reference):
+    """Mean SSIM / PSNR between two uint8 `[B, C, T, H, W]` batches, as `{"ssim", "psnr"}`.
+
+    Paired and per-case: the two tensors are the same block of the same volume, so unlike FVD or
+    FID this says whether a generation resembles *that* volume. Averaged over slices, and computed
+    on the first channel because the MR path decodes an RGB-repeated grayscale slice.
+    """
+    from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+    gen = generated[:, 0].float().cpu().numpy()
+    ref = reference[:, 0].float().cpu().numpy()
+    ssim, psnr = [], []
+    for b in range(gen.shape[0]):
+        for t in range(gen.shape[1]):
+            ssim.append(structural_similarity(ref[b, t], gen[b, t], data_range=255))
+            psnr.append(peak_signal_noise_ratio(ref[b, t], gen[b, t], data_range=255))
+    return {"ssim": float(np.mean(ssim)), "psnr": float(np.mean(psnr))}
 
 
 ### EMA ###
