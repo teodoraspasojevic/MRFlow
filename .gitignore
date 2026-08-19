@@ -36,3 +36,6 @@ wandb/
 .vscode/
 .idea/
 *.swp
+
+# Debug scripts
+debug/
