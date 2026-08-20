@@ -27,11 +27,23 @@ Preprocess first (task 0 also writes the boundary latents, so let it finish), th
 ```bash
 sbatch --array=0-3  slurms/mrflow_preprocess_helma.sh val   --zip
 sbatch --array=0-63 slurms/mrflow_preprocess_helma.sh train --zip
+python tools/mrflow_verify.py --config lvfm/configs/mrflow_STDiT-L2_16f8.yaml \
+    --split train --num_shards 64          # gate: exits 1 if anything is missing
 sbatch slurms/mrflow_train_helma.sh
 ```
 
 `--zip` is not optional on this account — see the inode gotcha below. Anything after the split is
 passed through to `preprocess_mrrate.py`, so `--overwrite` and `--limit` work the same way.
+
+**Always run `tools/mrflow_verify.py` between preprocessing and training.** Nothing else notices an
+array task that never finished: the dataset globs `manifest/*.csv` and raises only on *zero* rows,
+so 63 of 64 shards trains quietly on 98% of the data. The verifier recomputes the expected series
+list (deterministic — `list_series` shuffles on a fixed seed, then truncates), compares it against
+the manifests and the zip central directories, and exits non-zero on a missing manifest, an
+artifact a manifest references but no container holds, a volume under `2 * target_nframes` slices,
+a bundle no manifest points at (a task killed between `store.close()` and `write_manifest`), or a
+missing boundary latent. It needs no GPU and decodes no volumes. `--num_shards` is required, not
+inferred: a missing *final* shard is invisible if you only look at the manifests that exist.
 Multi-node needs no second script — `sbatch --nodes=4 slurms/mrflow_train_helma.sh` re-execs under `srun` and derives `machine_rank` from `SLURM_NODEID`.
 
 **This account has h200 GPUs but no h100 allocation.** Always request `--partition=h200 --gres=gpu:h200:N`. An h100 request fails two different ways: `-p h100` is rejected at submit ("Invalid account or account/partition combination"), while `-p preempt --gres=gpu:h100:1` is accepted but pends forever on `AssocGrpGRES` — which reads like a quota problem but is really the wrong GRES type. Everything runs from the workspace venv at `/hnvme/workspace/y100dc19-mrflow/venv` (no container). Unlike the CT configs, `lvfm/configs/mrflow_STDiT-L2_16f8.yaml` carries real paths and needs no `envsubst`.

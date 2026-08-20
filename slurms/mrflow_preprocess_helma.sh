@@ -12,6 +12,9 @@
 # Anything after the split is passed through to the script. `--zip` bundles each shard into one
 # file, which this account needs: 244k loose .pt files is well past its 102k inode quota.
 #
+# When the array finishes, check it before training -- a dead task is otherwise silent:
+#   python tools/mrflow_verify.py --config <config> --split train --num_shards 64
+#
 #SBATCH --gres=gpu:h200:1
 #SBATCH --partition=h200
 #SBATCH --time=20:00:00
