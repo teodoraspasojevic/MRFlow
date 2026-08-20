@@ -1,10 +1,13 @@
 import csv
+import io
 import os
 import random
 from glob import glob
 
 import torch
 from torch.utils.data import Dataset
+
+from echosyn.common.mrrate import read_bundled
 
 
 class LatentBlockDataset(Dataset):
@@ -116,7 +119,7 @@ class MRRateLatentBlockDataset(Dataset):
         # (seed, idx) rather than global RNG state, which varies with worker count.
         rng = random.Random(f"{self.seed}-{idx}") if self.deterministic else random
 
-        latent = torch.load(os.path.join(self.root, row["latent_path"]), map_location="cpu")
+        latent = self._load(row, "latent_path")
         b, T = self.block_size, latent.shape[1]
 
         roll = rng.random()
@@ -128,7 +131,7 @@ class MRRateLatentBlockDataset(Dataset):
             t = rng.randint(0, T - 2 * b)
             block_curr, block_next = latent[:, t:t + b], latent[:, t + b:t + 2 * b]
 
-        embedding = torch.load(os.path.join(self.root, row["embedding_path"]), map_location="cpu")
+        embedding = self._load(row, "embedding_path")
         embedding = embedding / (embedding.norm(p=2) + 1e-6)
 
         return {
@@ -136,6 +139,13 @@ class MRRateLatentBlockDataset(Dataset):
             "video": block_next.float(),   # target:    [C, T, H, W]
             "embedding": embedding,        # text embedding: [1, D]
         }
+
+    def _load(self, row, key):
+        """Artifacts are loose .pt files, or members of a per-shard zip when one was written."""
+        if row.get("zip"):
+            blob = read_bundled(os.path.join(self.root, row["zip"]), row[key])
+            return torch.load(io.BytesIO(blob), map_location="cpu")
+        return torch.load(os.path.join(self.root, row[key]), map_location="cpu")
 
 
 def instantiate_dataset(configs, split=None):

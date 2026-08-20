@@ -16,10 +16,12 @@ and zero-padded and background would otherwise dominate every percentile.
 import csv
 import gzip
 import hashlib
+import io
 import json
 import os
 import random
 import tarfile
+import zipfile
 from collections import OrderedDict
 
 import nibabel as nib
@@ -39,17 +41,17 @@ AP_AXIS = 2  # anterior-posterior is (D, H, W) axis 2
 
 ### Archive access ###
 
-# (pid, path) -> TarFile. Keyed on pid so a forked dataloader worker never inherits the parent's
-# file descriptor and its read position.
+# (pid, path) -> open archive. Keyed on pid so a forked dataloader worker never inherits the
+# parent's file descriptor and its read position.
 _HANDLES = OrderedDict()
 
 
-def _archive(path, max_open=8):
+def _cached(path, opener, max_open=8):
     key = (os.getpid(), path)
     if key in _HANDLES:
         _HANDLES.move_to_end(key)
         return _HANDLES[key]
-    _HANDLES[key] = tarfile.open(path, mode="r:")
+    _HANDLES[key] = opener(path)
     while len(_HANDLES) > max_open:
         _, old = _HANDLES.popitem(last=False)
         old.close()
@@ -58,10 +60,15 @@ def _archive(path, max_open=8):
 
 def read_member(archive_path, member):
     """Raw bytes of one tar member."""
-    fobj = _archive(archive_path).extractfile(member)
+    fobj = _cached(archive_path, lambda p: tarfile.open(p, mode="r:")).extractfile(member)
     if fobj is None:
         raise IOError(f"{member} is not a regular file in {archive_path}")
     return fobj.read()
+
+
+def read_bundled(bundle_path, member):
+    """Raw bytes of one member of a latent bundle. See LatentStore."""
+    return _cached(bundle_path, zipfile.ZipFile).read(member)
 
 
 ### Series index and reports ###
@@ -372,10 +379,68 @@ def encode_report(tokenizer, model, text, max_length=512):
     return tokens[:, 0].float().cpu()
 
 
+### Artifact storage ###
+
+
+class LatentStore:
+    """Where preprocessing puts its .pt artifacts.
+
+    `bundle=False` writes one file per artifact, as CTFlow does. `bundle=True` puts a whole shard
+    into a single zip instead: a full MR-RATE split is ~244k loose files, past the inode quota of a
+    typical cluster account, while one zip per shard is one file and still random-access, because a
+    zip's central directory records every member's offset. Members are stored uncompressed -- fp16
+    latents do not compress, so deflate would only cost CPU.
+
+    The cost is resume granularity: loose artifacts are skipped individually on a re-run, while a
+    bundle is written fresh, so a killed shard re-encodes all of its series.
+    """
+
+    def __init__(self, root, name, bundle=False):
+        self.root = root
+        self.zip_path = os.path.join("latents", f"{name}.zip") if bundle else None
+        if bundle:
+            path = os.path.join(root, self.zip_path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self._tmp = f"{path}.tmp.{os.getpid()}"
+            self._zf = zipfile.ZipFile(self._tmp, "w", zipfile.ZIP_STORED, allowZip64=True)
+
+    def member(self, kind, sid):
+        """Path of one artifact, relative to the bundle or, loose, to the dataset root."""
+        if self.zip_path:
+            return f"{kind}/{sid}.pt"
+        return os.path.join(kind, sid[:2], f"{sid}.pt")  # fanout keeps Lustre directories small
+
+    def write(self, member, tensor):
+        if self.zip_path:
+            buf = io.BytesIO()
+            torch.save(tensor, buf)
+            self._zf.writestr(member, buf.getvalue())
+            return
+        path = os.path.join(self.root, member)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        torch.save(tensor, tmp)
+        os.replace(tmp, path)  # atomic, so a killed task never leaves a half-written artifact
+
+    def done(self, *members):
+        """True if all of these are already written, so their series can be skipped."""
+        return self.zip_path is None and all(
+            os.path.exists(os.path.join(self.root, m)) for m in members)
+
+    def read(self, member):
+        return torch.load(os.path.join(self.root, member), map_location="cpu")
+
+    def close(self):
+        if self.zip_path:
+            self._zf.close()
+            os.replace(self._tmp, os.path.join(self.root, self.zip_path))  # atomic
+
+
 ### Manifest ###
 
+# `zip` is the bundle the two paths are members of, or empty when they are loose files.
 MANIFEST_FIELDS = ("sample_id", "split", "modality", "plane", "n_slices",
-                   "latent_path", "embedding_path")
+                   "latent_path", "embedding_path", "zip")
 
 
 def write_manifest(path, rows):

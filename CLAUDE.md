@@ -25,10 +25,13 @@ Multi-node SLURM: `sbatch slurms/mnode_launcher_helma.sh` → `srun slurms/train
 
 Preprocess first (task 0 also writes the boundary latents, so let it finish), then train:
 ```bash
-sbatch --array=0-3  slurms/mrflow_preprocess_helma.sh val
-sbatch --array=0-63 slurms/mrflow_preprocess_helma.sh train
+sbatch --array=0-3  slurms/mrflow_preprocess_helma.sh val   --zip
+sbatch --array=0-63 slurms/mrflow_preprocess_helma.sh train --zip
 sbatch slurms/mrflow_train_helma.sh
 ```
+
+`--zip` is not optional on this account — see the inode gotcha below. Anything after the split is
+passed through to `preprocess_mrrate.py`, so `--overwrite` and `--limit` work the same way.
 Multi-node needs no second script — `sbatch --nodes=4 slurms/mrflow_train_helma.sh` re-execs under `srun` and derives `machine_rank` from `SLURM_NODEID`.
 
 **This account has h200 GPUs but no h100 allocation.** Always request `--partition=h200 --gres=gpu:h200:N`. An h100 request fails two different ways: `-p h100` is rejected at submit ("Invalid account or account/partition combination"), while `-p preempt --gres=gpu:h100:1` is accepted but pends forever on `AssocGrpGRES` — which reads like a quota problem but is really the wrong GRES type. Everything runs from the workspace venv at `/hnvme/workspace/y100dc19-mrflow/venv` (no container). Unlike the CT configs, `lvfm/configs/mrflow_STDiT-L2_16f8.yaml` carries real paths and needs no `envsubst`.
@@ -74,6 +77,18 @@ At inference, pass the config **saved into the experiment dir** (`save_checkpoin
 - **MR is normalized to `[0, 1]`, and `[-1, 1]` is not an equivalent choice.** Measured with `tools/ctflow_transfer_check.py` (20 val series): the CTFlow checkpoint's zero-shot flow loss relative to the target velocity's own magnitude is `0.106` on `[0, 1]` latents and `2.78` on `[-1, 1]` ones — and `1.0` is the predict-zero baseline, so at `[-1, 1]` the init is *worse than useless*. Standardizing `[-1, 1]` latents to mean 0 / std 1 does **not** help (`2.85`), because the VAE encoder is nonlinear: an affine change in pixel space is not an affine change in latent space, so the two ranges are structurally different representations, not rescalings of each other. VAE reconstruction is a tie (PSNR 39.12 vs 38.92), so `[0, 1]` costs nothing. Re-run that check if the VAE, `init_from`, or preprocessing ever changes.
 - **Do not replace FLUX's `scaling_factor` / `shift_factor` with measured latent statistics** while `init_from` points at a CTFlow checkpoint. `get_vae_scaler` reads `0.3611`/`0.1159` from the VAE's own `config.json`; standardizing on measured moments instead made transfer slightly *worse* in both ranges (`0.106 → 0.116`), because the trunk was trained with exactly those factors. Computing your own statistics is the right move for a scratch run, not for this fine-tune.
 - The four pixel-range constants — `decode_scale`, `decode_shift`, `black_value`, `white_value` — are **required top-level config keys with no defaults in code**, so a config missing them raises instead of silently decoding at the wrong scale. MR uses `255`/`0`/`0.0`/`1.0` (`[0, 1]`, no window to convert); the CT configs carry `306`/`0`/`0.0`/`1.0`, where `306` is **not** a data range: CT pixels are `[0, 1]` over an HU window of `(-1000, 1400)`, and `306` rescales that to the challenge's `(-1000, 1000)` so the uint8 clamp lands exactly on HU +1000 (`306 * 2000/2400 = 255`). Experiment configs saved before this moved out of code (e.g. `experiments/smoke_overfit/config.yaml`) need the keys added by hand before inference.
+- **Preprocessing needs `--zip` on Helma.** One `.pt` per latent plus one per embedding is 2 files
+  per series, so the configured 122k series is ~244k files against this account's **102,400 inode
+  hard limit** on `/hnvme` (a per-*user* limit across the whole filesystem — workspaces have no
+  project quota of their own, and directories and symlinks count too). Without the flag the train
+  array dies ~19k series in, having burned ~200 GPU-hours, and each shard silently writes an
+  under-reporting manifest. `--zip` puts a shard's artifacts in one `ZIP_STORED` archive
+  (`LatentStore` in `mrrate.py`), taking the run to ~140 inodes; a zip's central directory records
+  every member's offset, so `read_bundled` still reads one 5.4 MB member in ~2 ms without
+  unpacking. The manifest's `zip` column says which layout was written and `_load` branches on it,
+  so loose-file datasets — and manifests written before the column existed — keep working
+  untouched. The trade-off: resume is per-shard rather than per-series, so a killed task re-encodes
+  its ~1,875 series (~4 h).
 - MR latents are stored **fp16** and unscaled; `MRRateLatentBlockDataset` casts to float on load. A full MR-RATE split would be ~9 TB in fp32, hence `mri.max_repeats` / `mri.max_series_*` — the defaults keep 120k of 576k eligible train series, still ~30 epochs at a 60k-step fine-tune.
 - `mri.min_slices` must stay at least `2 * block_size`; the dataset assumes every row can produce an interior pair and has no short-volume fallback.
 - `init_from` loads **weights only** (fresh optimizer/scheduler/EMA/step) and is applied before `accelerator.prepare`, so a `resume_from_checkpoint` restore still wins over it. The CTFlow EMA checkpoint key-matches `DiffuserSTDiT` exactly (474/474), so any missing/unexpected keys mean the configs diverged.

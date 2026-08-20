@@ -54,6 +54,7 @@ mri:
   max_repeats: 1
   max_series_train: 120000
   max_series_val: 2000
+  max_series_test: null         # uncapped: the test split is only needed for evaluation, not here
   preprocess:
     target_spacing: [1.0, 1.0, 1.0]
     inplane_size: ${globals.resolution}
