@@ -482,6 +482,21 @@ def to_uint8_frames(decoded, config):
     return (decoded * config.decode_scale + config.decode_shift).clamp(0, 255).to(torch.uint8)
 
 
+def label_frames(frames, text):
+    """Burn `text` into the top-left corner of every frame of a `[B, C, T, H, W]` uint8 tensor.
+
+    Row labels for the stacked condition/ground-truth/generated validation video -- the three
+    blocks are otherwise visually indistinguishable once decoded.
+    """
+    b = frames.shape[0]
+    arr = rearrange(frames, "b c t h w -> (b t) h w c").numpy().copy()
+    for i in range(arr.shape[0]):
+        cv2.putText(
+            arr[i], text, (2, 12), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1, cv2.LINE_AA
+        )
+    return rearrange(torch.from_numpy(arr), "(b t) h w c -> b c t h w", b=b)
+
+
 def paired_image_metrics(generated, reference):
     """Mean SSIM / PSNR between two uint8 `[B, C, T, H, W]` batches, as `{"ssim", "psnr"}`.
 

@@ -155,7 +155,11 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
         # separately. They measure structural agreement only, not report-volume semantics.
         metrics = paired_image_metrics(synthetic_video, ref_videos)
 
-        videos = torch.cat([ref_images, ref_videos, synthetic_video], dim=3)
+        videos = torch.cat([
+            label_frames(ref_images, "condition"),
+            label_frames(ref_videos, "ground truth"),
+            label_frames(synthetic_video, "generated"),
+        ], dim=3)
 
     videos = rearrange(videos, "b c t h w -> t c h (b w)")
     if step is not None:
@@ -175,6 +179,7 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
                     videos,
                     caption="Validation samples",
                     fps=config.validation.fps,
+                    format="mp4",
                 ),
                 **{f"val/{k}": v for k, v in metrics.items()},
             }, step=step)
