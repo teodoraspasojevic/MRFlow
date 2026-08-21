@@ -50,9 +50,10 @@ class LatentAutoregressiveGenerator:
         # tokens to the ones training saw.
         black, white = self.boundary_latents()
 
-        self.zero_latent = black
+        self.zero_latent = black # black token is scaled later, at every generate step
+        
         one_latent = sample_latents(self.config, white)
-        one_latent = scale_latents(one_latent, vae_scaling)
+        one_latent = scale_latents(one_latent, vae_scaling) # white token is scaled now
         self.one_latent = one_latent
 
     def boundary_latents(self):
@@ -148,7 +149,7 @@ class LatentAutoregressiveGenerator:
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=self.dtype):
             while cur_step < max_blocks:
-                cur_latent = torch.cat(blocks, dim=2)
+                cur_latent = torch.cat(blocks, dim=2) # concatenate over T dimension
 
                 z = torch.randn((B, C, T, H, W), device=self.device, dtype=self.dtype)
 
@@ -178,9 +179,9 @@ class LatentAutoregressiveGenerator:
                 cur_step += 1
 
                 if self.overlap > 0:
-                    last_overlap = new_block[:, :, -self.overlap:, :, :]
-                    blocks[-1] = new_block[:, :, :-self.overlap, :, :]
-                    blocks.append(last_overlap)
+                    last_overlap = new_block[:, :, -self.overlap:, :, :] # takes the last `overlap` frames of the new block
+                    blocks[-1] = new_block[:, :, :-self.overlap, :, :] # takes the first `overlap` frames of the new block
+                    blocks.append(last_overlap) # final result that the first and last 8 slices are added as separate chuncks to `blocks`
 
                 if self.is_stop_frame(new_block):
                     print("[Generator] Stop block detected. Ending generation.")

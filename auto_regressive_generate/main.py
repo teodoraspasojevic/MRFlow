@@ -119,7 +119,10 @@ def main():
             gt_latent = gt_latent.unsqueeze(0)
         gt_latent = gt_latent.to(device)
         block_size = generator.block_size
-        gt_first_block = gt_latent[:, :, block_size:2 * block_size, :, :]
+        # Jiayi's code would add black and white tokens to the gt encoded volumes.
+        # That's why she had  the line: gt_first_block = gt_latent[:, :, block_size:2 * block_size, :, :]
+        # My preprocessing code did not add black and white tokens, so I just take the first block_size frames!
+        gt_first_block = gt_latent[:, :, :block_size, :, :]
         gt_first_block = scale_latents(gt_first_block, vae_scaling)
         result_latent = generator.generate(
             prompt_embeds=prompt_embedding,
