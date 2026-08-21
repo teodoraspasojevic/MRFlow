@@ -23,6 +23,7 @@ import random
 import tarfile
 import zipfile
 from collections import OrderedDict
+from glob import glob
 
 import nibabel as nib
 import numpy as np
@@ -69,6 +70,14 @@ def read_member(archive_path, member):
 def read_bundled(bundle_path, member):
     """Raw bytes of one member of a latent bundle. See LatentStore."""
     return _cached(bundle_path, zipfile.ZipFile).read(member)
+
+
+def load_artifact(root, row, key):
+    """One manifest row's latent or embedding, from its bundle or as a loose file."""
+    if row.get("zip"):
+        blob = read_bundled(os.path.join(root, row["zip"]), row[key])
+        return torch.load(io.BytesIO(blob), map_location="cpu")
+    return torch.load(os.path.join(root, row[key]), map_location="cpu")
 
 
 ### Series index and reports ###
@@ -441,6 +450,15 @@ class LatentStore:
 # `zip` is the bundle the two paths are members of, or empty when they are loose files.
 MANIFEST_FIELDS = ("sample_id", "split", "modality", "plane", "n_slices",
                    "latent_path", "embedding_path", "zip")
+
+
+def read_manifest(root, split):
+    """Every row for one split. Shard manifests are globbed, so there is no merge step."""
+    rows = []
+    for path in sorted(glob(os.path.join(root, "manifest", "*.csv"))):
+        with open(path, newline="") as f:
+            rows += [r for r in csv.DictReader(f) if r["split"] == split]
+    return rows
 
 
 def write_manifest(path, rows):

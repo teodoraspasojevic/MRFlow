@@ -99,13 +99,14 @@ def main():
             problems.append(f"shard {shard}: {dict(notes)}")
 
     # Bundles and temp files nothing points at: a job killed between close() and write_manifest.
-    referenced = set(listings) - {""}
-    bundles = {f"latents/{f}" for f in os.listdir(os.path.join(root, "latents"))
-               if f.endswith(".zip")} if os.path.isdir(os.path.join(root, "latents")) else set()
-    for orphan in sorted(bundles - referenced):
-        problems.append(f"{orphan}: bundle no manifest references")
-    for name in sorted(os.listdir(os.path.join(root, "latents")) if bundles else []):
-        if ".tmp." in name:
+    # Only this split's containers -- another split's zips are legitimately unreferenced here.
+    referenced, latents = set(listings) - {""}, os.path.join(root, "latents")
+    for name in sorted(os.listdir(latents)) if os.path.isdir(latents) else []:
+        if not name.startswith(f"{args.split}-"):
+            continue
+        if name.endswith(".zip") and f"latents/{name}" not in referenced:
+            problems.append(f"latents/{name}: bundle no manifest references")
+        elif ".tmp." in name:
             problems.append(f"latents/{name}: leftover temp file from a killed task")
 
     for name in ("black", "white"):
