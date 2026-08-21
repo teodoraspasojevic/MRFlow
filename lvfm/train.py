@@ -379,7 +379,11 @@ def main():
             if accelerator.sync_gradients:
                 global_step += 1
 
-    cleanup_checkpoints(config, logger)
+    # Main process only: every rank reaching shutil.rmtree on the same directory races, and the
+    # loser dies with FileNotFoundError after training has already finished. The in-loop call
+    # above is guarded the same way.
+    if accelerator.is_main_process:
+        cleanup_checkpoints(config, logger)
     accelerator.end_training()
 
 
