@@ -74,7 +74,7 @@ class LatentAutoregressiveGenerator:
     def encode_image(self, img):
         with torch.no_grad():
             img = img.to(self.device).to(self.dtype)
-            img = self.vae.encode(img).latent_dist.sample()
+            img = self.vae.encode(img).latent_dist.mean # in preprocessing of MR-RATE I saved only the mean, and that's why we do the same here
         return img
 
     def decode_latent(self, latents, max_batch_size=64):
