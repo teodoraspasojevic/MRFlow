@@ -26,7 +26,10 @@ unset SLURM_EXPORT_ENV
 
 SPLIT=${1:-train}
 shift 2>/dev/null  # remaining args (e.g. --zip) go straight to the script
-NUM_SHARDS=${SLURM_ARRAY_TASK_COUNT:-1}
+# Sharding is series[SHARD::NUM_SHARDS], so re-running a subset must keep the ORIGINAL divisor:
+# `--array=3,7` would otherwise set it to 2 and silently re-shard the whole split. Override it:
+#   sbatch --export=ALL,MRFLOW_NUM_SHARDS=16 --array=0,1,8-11 ... test --zip
+NUM_SHARDS=${MRFLOW_NUM_SHARDS:-${SLURM_ARRAY_TASK_COUNT:-1}}
 SHARD=${SLURM_ARRAY_TASK_ID:-0}
 
 # sbatch spools the script to /var/tmp, so $0 is not in the repo -- use the submit dir.
