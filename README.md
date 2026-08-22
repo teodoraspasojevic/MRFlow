@@ -51,6 +51,10 @@ MRFlow/
 ├── auto_regressive_generate/
 │   ├── __init__.py              # LatentAutoregressiveGenerator class
 │   └── main.py                  # Inference entry point
+├── evaluation/
+│   ├── challenge.py             # Vendored VLM3D scoring container (MSE/PSNR/SSIM, 2.5D FID)
+│   ├── __init__.py              # ChallengeAccumulator: the official score.py aggregation
+│   └── main.py                  # Rollout + scoring entry point
 ├── slurms/
 │   ├── mnode_launcher_helma.sh  # SLURM multi-node training launcher
 │   ├── trainer_helma.sh         # Per-node training worker
@@ -124,6 +128,32 @@ sbatch slurms/submit_val_infer.sh
 ```
 
 This runs 64 parallel workers (16 nodes × 4 GPUs), each processing a partition of the validation set defined in `$PROJECT_DIR/parts/part_XX`.
+
+---
+
+## Challenge evaluation (MRFlow)
+
+Scores a checkpoint with the official VLM3D `mr-volume-generation` metrics — MSE, PSNR, SSIM and
+2.5D FID (XY/XZ/YZ and their average) — using the vendored evaluation container in
+`evaluation/challenge.py`, so the numbers are the leaderboard's. Ground truth is the released
+MR-RATE volume, RAS-reoriented and otherwise untouched; the metric resamples the generated volume
+onto it, exactly as the platform does to a submission.
+
+```bash
+# one array task per shard, then one pass to pool them
+sbatch --array=0-15 slurms/mrflow_eval_helma.sh <experiment>/config.yaml \
+    <experiment>/checkpoint-N/denoiser_ema --split val
+sbatch slurms/mrflow_eval_helma.sh <config> <ckpt> --split val --combine
+```
+
+Results land in `<output_dir>/eval/<regime>-<split>/metrics.json`, alongside a few
+ground-truth-vs-generated mp4s, and are logged to W&B as a `challenge_metrics` table plus the run
+summary. `--regime` selects the inference mode: `full-body` (report-to-volume, the challenge task,
+default) or `gt-head`. No preprocessed split is needed — cases are read straight from the MR-RATE
+archives — so `--split test` works the same as `--split val`.
+
+See [`evaluation/README.md`](evaluation/README.md) for the preprocessing rules, the prediction
+setup and what each metric means.
 
 ---
 

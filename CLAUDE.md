@@ -55,6 +55,23 @@ python auto_regressive_generate/main.py --config <experiment>/config.yaml \
     --output out_frames/ --type full-body   # or gt-head / block-wise (last two need --gt-latent)
 ```
 
+### Challenge evaluation
+
+`evaluation/` scores a checkpoint with the official VLM3D `mr-volume-generation` metrics. It needs
+no preprocessed split — every case comes out of the raw MR-RATE archives in one read — so `test`
+runs exactly like `val`:
+
+```bash
+sbatch --array=0-15 slurms/mrflow_eval_helma.sh <experiment>/config.yaml \
+    <experiment>/checkpoint-N/denoiser_ema --split val
+sbatch slurms/mrflow_eval_helma.sh <config> <ckpt> --split val --combine   # after the array
+```
+
+The array size is the shard count (`SLURM_ARRAY_TASK_COUNT`), each task writes
+`<out>/shard-NNNN.pt`, and `--combine` pools them into `<out>/metrics.json` and one W&B run.
+Sharding matters: a full-body rollout is 20 blocks of 201 Euler steps, so a 2,000-case val sweep is
+days on one GPU. [`evaluation/README.md`](evaluation/README.md) covers the pipeline and the metrics.
+
 ### Configs are not directly runnable
 
 `lvfm/configs/*.yaml` contain **shell** variables (`${LATTE_TRAIN_DATA_ROOT}`, `${LATTE_EMBEDDING_ROOT}`, `${LATTE_VALID_DATA_ROOT}`, `${LATTE_VALID_EMBEDDING_ROOT}`) that OmegaConf will *not* resolve. `trainer_helma.sh` runs `envsubst` over the config into a per-node temp copy before launching. Running `train.py` on a raw config only works if those four vars are exported in the environment — otherwise OmegaConf raises on interpolation. `vae.pretrained` and `output_dir` are also literal `/path/to/...` placeholders that must be edited. The SLURM scripts likewise carry `YOUR_PROXY` / `YOUR_EMAIL` / `/path/to/tmi_container.sif` placeholders.
@@ -77,6 +94,11 @@ At inference, pass the config **saved into the experiment dir** (`save_checkpoin
 - **Boundaries are learned tokens.** Both are the ends of the pixel range, read from the config's top-level `black_value`/`white_value` — `0.0`/`1.0`, the same values CTFlow used, since MR is normalized to the same `[0, 1]`. Both are VAE-encoded once into `<root>/boundary/{black,white}.pt` and are what `MRRateLatentBlockDataset` uses for its `start`/`end` examples; `LatentAutoregressiveGenerator` reuses that cache when it exists and re-encodes from the config values otherwise.
 - **Text.** Frozen CXR-BERT, CLS-pooled to one 768-d token, loaded as a stock `BertModel` (its `bert.*` weights are plain BERT) rather than with `trust_remote_code`. `encode_conditioning` pools the report and the `[MODALITY]/[PLANE]` markers **separately** and sums them as unit vectors: one MR-RATE report maps to ~12 series of different contrast, and markers left inside the report string move the pooled vector by only ~0.0002 cosine against ~0.03 for report content, so the model would be blind to which contrast to generate. `mri.marker_weight: 0.0` restores report-only conditioning.
 - **Volumes are one series, reports are one study**, so there is one embedding per *series*, not per study — which is why one pass writes both artifacts.
+
+**Evaluation is the official container, not our own metrics.** [`evaluation/challenge.py`](evaluation/challenge.py) is a port of the challenge's `mrgen_evaluation` (`modality_filter.py` + `metrics_basic.py` + `fid_2p5d.py`, comments translated, math untouched); [`evaluation/__init__.py`](evaluation/__init__.py) reproduces its `score.py` aggregation over pairs held in memory; [`evaluation/main.py`](evaluation/main.py) generates the pairs. Two consequences shape the code:
+
+- **The ground truth reaches the metric untouched.** `load_native_volume` RAS-reorients and permutes plane-first — the same axis order the model rolls out in — and does nothing else. The metric percentile-normalizes both volumes itself and `zoom`s the *generated* one onto the ground truth's shape, so resampling or normalizing the reference here would score against a different target than the leaderboard does. `read_canonical` / `plane_order` are shared with `preprocess_volume` so the two orientations cannot drift.
+- **`METRIC_KEYS` is also the reporting order** (FID average, PSNR, SSIM, MSE, per-plane FIDs, then `dice` and the counts), and it drives the W&B table, the summary and the console dump at once. `dice` is a literal copy of `SSIM_mean` — the platform's primary-metric shim, not real Dice.
 
 **Config-driven instantiation.** Nearly every component (denoiser, optimizer, scheduler, VAE, dataloader) is built from a `{target, args}` YAML stanza via `instantiate_class_from_config` / `instantiate` in [echosyn/common/__init__.py](echosyn/common/__init__.py). To swap a model or scheduler, change the config's `target`, not the training script.
 
@@ -109,4 +131,6 @@ At inference, pass the config **saved into the experiment dir** (`save_checkpoin
 - The dataset takes `embedding[0].unsqueeze(0)` → `[1, D]`, but `main.py` only does `.unsqueeze(0)` on the loaded file. If an embedding `.pt` holds more than one token, inference feeds a different token count than training used.
 - Checkpoint retention is via `checkpoints_to_keep` (an explicit step list, plus the latest) — everything else is deleted at each checkpointing step, so raising `checkpointing_steps` frequency without editing that list still discards intermediate checkpoints.
 - Resuming reads `wandb_args.id` back from `<output_dir>/config.yaml`; `if_fine_tuned: true` loads weights but resets `global_step`, optimizer, and scheduler.
+- **Do not "improve" `evaluation/challenge.py`.** It is the leaderboard's own arithmetic, quirks included: `stride=4` slice sampling, squeezenet1_1 rather than InceptionV3, a 0.5/99.5-percentile window recomputed per slice, and a missing case dropped from the MSE/PSNR/SSIM means instead of penalized. The only sanctioned additions are marked in the file — `raw_features`/`finalize_pooled` for cross-shard FID pooling, and `_matrix_sqrt`, which drops the `disp=` kwarg scipy ≥ 1.17 removed (this venv is on 1.18, so the official file cannot run here unpatched). Cross-shard pooling agrees with a single process to ~2e-7 relative, not bit-exactly: `np.cov` over reordered float32 rows accumulates differently.
+- The model can only roll out on **GPU**: `DiffuserSTDiT`'s cross-attention goes through xformers' `memory_efficient_attention`, which has no CPU kernel, so a CPU evaluation run fails per case and scores every one as missing rather than erroring out.
 - `logs/`, `*.pt`, `*.safetensors`, and `checkpoint-*/` are gitignored — checkpoints never belong in a commit.

@@ -264,6 +264,57 @@ def _crop_pad(volume, size, shift_voxels=0, shift_axis=None):
     return np.pad(volume, ((0, 0), pads[0], pads[1]), constant_values=0.0)
 
 
+def read_canonical(nii_bytes):
+    """MR-RATE NIfTI bytes -> (RAS-canonical (S, R, A) float32 array, native (D, H, W) spacing).
+
+    Everything both the training and the evaluation path share, and nothing either of them can
+    skip: the reorientation and the header read. Neither resamples nor rescales anything.
+
+    The volume stays **RAS-oriented** -- no axis is ever flipped. `(S, R, A)` names the array's
+    axis *order*, which is nibabel's canonical `(R, A, S)` transposed once so the slice axis of an
+    axial acquisition (the majority plane) leads; `plane_order` then permutes it per plane.
+    """
+    payload = gzip.decompress(nii_bytes) if nii_bytes[:2] == b"\x1f\x8b" else nii_bytes
+    img = nib.as_closest_canonical(nib.Nifti1Image.from_bytes(payload))
+    zooms = img.header.get_zooms()[:3]
+    spacing = (float(zooms[2]), float(zooms[0]), float(zooms[1]))  # (X, Y, Z) -> (D, H, W)
+
+    data = np.asarray(img.get_fdata(), dtype=np.float32)
+    np.nan_to_num(data, copy=False)
+    return np.ascontiguousarray(data.transpose(2, 0, 1)), spacing  # (R, A, S) -> (S, R, A)
+
+
+def plane_order(plane):
+    """The (S, R, A) axis permutation that puts the acquisition plane's slice axis first, so the
+    leading axis is the one the model rolls out along. Unknown/oblique planes go to axial, the
+    majority plane.
+
+    The resulting order is therefore plane-dependent -- SRA axial, RSA sagittal, ASR coronal -- and
+    is what both a preprocessed volume and a generated one are in, which is why the evaluation can
+    compare them voxel for voxel."""
+    stack_axis = PLANE_TO_STACK_AXIS.get(plane, 0)
+    return (stack_axis,) + tuple(a for a in (0, 1, 2) if a != stack_axis)
+
+
+def load_native_volume(nii_bytes, plane):
+    """MR-RATE NIfTI bytes -> (raw float32 volume in the model's axis order, native spacing).
+
+    The evaluation reference: reoriented to RAS and permuted plane-first so its axes mean the same
+    thing as a generated volume's, and *nothing else*. No resample, no normalization, no crop or
+    pad -- the official challenge metric percentile-normalizes both volumes itself and resamples
+    the generated one onto this shape, so preprocessing the ground truth here would score the
+    model against a different target than the leaderboard does.
+
+    The two return values are in **different frames**, as they are out of `preprocess_volume`: the
+    array is plane-first (SRA axial, RSA sagittal, ASR coronal) while the spacing stays (S, R, A).
+    That is deliberate -- spacing exists only to go into the conditioning text, and
+    `acquisition_prefix` wants (S, R, A), so permuting it to match the array would change the
+    string the model was trained against. Do not index it with an array axis.
+    """
+    data, spacing = read_canonical(nii_bytes)
+    return np.ascontiguousarray(data.transpose(plane_order(plane))), spacing
+
+
 def preprocess_volume(nii_bytes, plane, target_spacing=(1.0, 1.0, 1.0), inplane_size=256,
                       posterior_shift_mm=15.0, max_slices=320, min_slices=32):
     """MR-RATE NIfTI bytes -> ([1, T, S, S] float32 in [0, 1], native (D, H, W) spacing in mm).
@@ -278,14 +329,7 @@ def preprocess_volume(nii_bytes, plane, target_spacing=(1.0, 1.0, 1.0), inplane_
     Over all MR-RATE series ~94% already fit inside a 256 mm frame and are only padded; the rest
     lose a thin rim (median 4 mm).
     """
-    payload = gzip.decompress(nii_bytes) if nii_bytes[:2] == b"\x1f\x8b" else nii_bytes
-    img = nib.as_closest_canonical(nib.Nifti1Image.from_bytes(payload))
-    zooms = img.header.get_zooms()[:3]
-    spacing = (float(zooms[2]), float(zooms[0]), float(zooms[1]))  # (X, Y, Z) -> (D, H, W)
-
-    data = np.asarray(img.get_fdata(), dtype=np.float32)
-    np.nan_to_num(data, copy=False)
-    data = np.ascontiguousarray(data.transpose(2, 0, 1))  # (R, A, S) -> (S, R, A)
+    data, spacing = read_canonical(nii_bytes)
 
     shape = [max(1, round(data.shape[i] * spacing[i] / target_spacing[i])) for i in range(3)]
     if shape != list(data.shape):
@@ -294,12 +338,11 @@ def preprocess_volume(nii_bytes, plane, target_spacing=(1.0, 1.0, 1.0), inplane_
 
     data = _normalize(data)
 
-    stack_axis = PLANE_TO_STACK_AXIS.get(plane, 0)  # unknown/oblique -> axial, the majority plane
-    order = (stack_axis,) + tuple(a for a in (0, 1, 2) if a != stack_axis)
+    order = plane_order(plane)
     data = np.ascontiguousarray(data.transpose(order))
 
     # A-P is in-plane unless it is itself the stacking axis (coronal), where the shift is moot.
-    shift_axis = None if stack_axis == AP_AXIS else order[1:].index(AP_AXIS)
+    shift_axis = None if order[0] == AP_AXIS else order[1:].index(AP_AXIS)
     shift_voxels = round(posterior_shift_mm / target_spacing[AP_AXIS])
     data = _crop_pad(data, inplane_size, shift_voxels, shift_axis)
 
