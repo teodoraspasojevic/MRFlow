@@ -22,11 +22,16 @@ from echosyn.common import get_vae_scaler
 from echosyn.common.mrrate import load_artifact, read_manifest
 
 
-def latent_moments(root, rows):
-    """Per-channel (mean, std) over every latent pixel in `rows`."""
+def latent_moments(root, rows, latent_channels):
+    """Per-channel (mean, std) over every latent pixel in `rows`.
+
+    Stored latents are the posterior's (mean, std) stacked on the channel axis; the moments that
+    matter for scaling are those of the posterior mean, so the std half is dropped rather than
+    averaged in with it.
+    """
     total, total_sq, count = 0.0, 0.0, 0
     for row in rows:
-        x = load_artifact(root, row, "latent_path").float().flatten(1)
+        x = load_artifact(root, row, "latent_path")[:latent_channels].float().flatten(1)
         total = total + x.sum(1).double()
         total_sq = total_sq + x.pow(2).sum(1).double()
         count += x.shape[1]
@@ -51,7 +56,7 @@ def main():
     random.Random(args.seed).shuffle(rows)
     rows = rows[:args.limit]
 
-    mean, std = latent_moments(root, rows)
+    mean, std = latent_moments(root, rows, config.globals.latent_channels)
     scaler = get_vae_scaler(config, "cpu")
     shift, scale = scaler["mean"].item(), scaler["std"].item()
 

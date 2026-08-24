@@ -14,7 +14,7 @@ mixed_precision: bf16
 use_ema: true
 max_grad_norm: 1.0
 max_grad_value: -1
-sample_latents: false
+sample_latents: true
 decode_scale: 255.0
 decode_shift: 0.0
 black_value: 0.0
@@ -24,7 +24,6 @@ mri:
   dataset_root: /hnvme/workspace/y100dc19-mrflow/data/mrflow_flux
   text_checkpoint: /hnvme/workspace/y100dc19-nvidia-mri-brain/pretrained/BiomedVLP-CXR-BERT-specialized
   text_max_length: 512
-  marker_weight: 1.0
   vae_batch_size: 32
   max_repeats: 1
   max_series_train: 120000

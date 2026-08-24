@@ -91,8 +91,7 @@ def main():
                 store.write(latent_path, latent)
                 store.write(embed_path, encode_conditioning(
                     tokenizer, text_encoder, read_report(entry["archive"], entry["study_uid"]),
-                    entry["modality"], entry["plane"], spacing, mri.marker_weight,
-                    mri.text_max_length,
+                    entry["modality"], entry["plane"], spacing, mri.text_max_length,
                 ))
         except VolumeTooShort:
             skipped["too_short"] = skipped.get("too_short", 0) + 1

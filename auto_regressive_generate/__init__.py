@@ -1,4 +1,3 @@
-import os
 import time
 import types
 
@@ -44,37 +43,18 @@ class LatentAutoregressiveGenerator:
         self.dtype = torch.float32
         self.trim = True
 
-        # The black seed and white stop tokens, at the ends of whatever pixel range the dataset
-        # was normalized to (`black_value` / `white_value` in the config). Preprocessing already
-        # cached the MR pair, and reusing it means inference seeds and stops with byte-identical
-        # tokens to the ones training saw.
-        black, white = self.boundary_latents()
+        res = self.config.globals.resolution
+        self.zero_latent = self.encode_image(torch.full((1, 3, res, res), float(self.config.black_value)))
 
-        self.zero_latent = black # black token is scaled later, at every generate step
-        
-        one_latent = sample_latents(self.config, white)
+        one_latent = self.encode_image(torch.full((1, 3, res, res), float(self.config.white_value)))
+        one_latent = sample_latents(self.config, one_latent)
         one_latent = scale_latents(one_latent, vae_scaling) # white token is scaled now
         self.one_latent = one_latent
-
-    def boundary_latents(self):
-        """(black, white) as [1, C, s, s], from the preprocessing cache when there is one."""
-        mri = self.config.get("mri", None)
-        if mri is not None:
-            cache = os.path.join(mri.dataset_root, "boundary")
-            if os.path.exists(os.path.join(cache, "black.pt")):
-                return tuple(
-                    torch.load(os.path.join(cache, f"{n}.pt"), map_location=self.device)
-                    .unsqueeze(0).to(self.dtype)
-                    for n in ("black", "white")
-                )
-        res = self.config.globals.resolution
-        return tuple(self.encode_image(torch.full((1, 3, res, res), float(v)))
-                     for v in (self.config.black_value, self.config.white_value))
 
     def encode_image(self, img):
         with torch.no_grad():
             img = img.to(self.device).to(self.dtype)
-            img = self.vae.encode(img).latent_dist.mean # in preprocessing of MR-RATE I saved only the mean, and that's why we do the same here
+            img = self.vae.encode(img).latent_dist.sample()
         return img
 
     def decode_latent(self, latents, max_batch_size=64):

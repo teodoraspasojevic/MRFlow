@@ -22,9 +22,10 @@ use_ema: true
 max_grad_norm: 1.0
 max_grad_value: -1
 
-# Preprocessing stores the posterior mean, so latents are already 16 channels and there is nothing
-# to sample from; leaving this true would only ever truncate.
-sample_latents: false
+# Preprocessing stores both posterior parameters, so latents are 32 channels and every read draws
+# a fresh sample. Must stay true: false would silently take the first 16 channels -- the mean -- and
+# train on one frozen encoding per volume.
+sample_latents: true
 
 # Pixel-range constants. MR volumes are normalized to [0, 1], matching the range CTFlow's CT was
 # normalized to -- measured, not assumed: the CT checkpoint transfers 27x better to [0, 1] latents
@@ -42,10 +43,6 @@ mri:
   dataset_root: /hnvme/workspace/y100dc19-mrflow/data/mrflow_flux
   text_checkpoint: /hnvme/workspace/y100dc19-nvidia-mri-brain/pretrained/BiomedVLP-CXR-BERT-specialized
   text_max_length: 512          # CXR-BERT's context; longer reports are truncated head-first
-  # Weight of the [MODALITY]/[PLANE] markers, pooled separately from the report and summed as unit
-  # vectors. In-string markers are diluted ~170x by a 2000-character report, which would leave the
-  # model blind to which of a study's ~12 contrasts to generate. 0.0 = report-only conditioning.
-  marker_weight: 1.0
   vae_batch_size: 32            # slices per VAE forward
   # Series selection. All ~576k eligible train series would be ~9 TB of latents and ~1300
   # GPU-hours to encode; a 60k-step fine-tune at an effective batch of 64 sees 3.8M samples, so

@@ -123,6 +123,7 @@ def main():
         # That's why she had  the line: gt_first_block = gt_latent[:, :, block_size:2 * block_size, :, :]
         # My preprocessing code did not add black and white tokens, so I just take the first block_size frames!
         gt_first_block = gt_latent[:, :, :block_size, :, :]
+        gt_first_block = sample_latents(config, gt_first_block)
         gt_first_block = scale_latents(gt_first_block, vae_scaling)
         result_latent = generator.generate(
             prompt_embeds=prompt_embedding,
@@ -135,13 +136,14 @@ def main():
         gt_latent = torch.load(args.gt_latent, map_location=device)
         if gt_latent.dim() == 4:
             gt_latent = gt_latent.unsqueeze(0)
-        B, C, T_total, H, W = gt_latent.shape
+        B, _, T_total, H, W = gt_latent.shape  # dim 1 is 2 * latent_channels, sampled per block below
         block_size = generator.block_size
         num_blocks = T_total // block_size - 1
 
         blocks = []
         for i in range(num_blocks):
             gt_block = gt_latent[:, :, i * block_size:(i + 1) * block_size, :, :]
+            gt_block = sample_latents(config, gt_block)
             gt_block = scale_latents(gt_block, vae_scaling)
             next_block = generator.generate_next_block(gt_block, prompt_embedding)
             if next_block.shape[2] == 0:

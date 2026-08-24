@@ -58,7 +58,9 @@ def full_body(generator, embedding, max_blocks, gt_latent):
 
 def gt_head(generator, embedding, max_blocks, gt_latent):
     """As above, but seeded with the volume's own first block instead of the black token."""
-    first_block = scale_latents(gt_latent()[:, :, :generator.block_size], generator.vae_scaling)
+    # gt_latent() carries both posterior parameters; scaling it whole would scale the stds too.
+    first_block = sample_latents(generator.config, gt_latent()[:, :, :generator.block_size])
+    first_block = scale_latents(first_block, generator.vae_scaling)
     return generator.generate(embedding, max_blocks=max_blocks - 1, gt_first_block=first_block)
 
 
@@ -146,7 +148,7 @@ def run_shard(config, args, out, device):
             real, spacing = load_native_volume(nii_bytes, entry["plane"])
             embedding = encode_conditioning(
                 tokenizer, text_encoder, read_report(entry["archive"], entry["study_uid"]),
-                entry["modality"], entry["plane"], spacing, mri.marker_weight, mri.text_max_length,
+                entry["modality"], entry["plane"], spacing, mri.text_max_length,
             )
             embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
 

@@ -22,7 +22,8 @@ import torch.nn.functional as F
 from omegaconf import OmegaConf
 
 from echosyn.common import (get_noise, get_vae_scaler, instantiate,
-                            instantiate_class_from_config, load_init_weights, scale_latents)
+                            instantiate_class_from_config, load_init_weights, sample_latents,
+                            scale_latents)
 from echosyn.common.mrrate import (_unit, build_text_encoder, encode_conditioning, encode_volume,
                                    list_series, preprocess_volume, read_member, read_report)
 
@@ -69,18 +70,18 @@ def main():
     series = list_series(mri.raw_root, args.split, mri.max_repeats, None, config.seed)[:args.n]
     latents = {name: [] for name in RANGES}
     embeddings = []
+    torch.manual_seed(config.seed)  # the posterior draw below is part of the measurement
     with torch.no_grad():
         for entry in series:
             volume, spacing = preprocess_volume(read_member(entry["archive"], entry["member"]),
                                                 entry["plane"], **preprocess_args)
             embeddings.append(_unit(encode_conditioning(
                 tokenizer, text_encoder, read_report(entry["archive"], entry["study_uid"]),
-                entry["modality"], entry["plane"], spacing, mri.marker_weight,
-                mri.text_max_length,
+                entry["modality"], entry["plane"], spacing, mri.text_max_length,
             )).unsqueeze(0))
             for name, (a, b) in RANGES.items():
                 z = encode_volume(vae, volume * a + b, mri.vae_batch_size, torch.float32)
-                latents[name].append(scale_latents(z[None], vae_scaling))
+                latents[name].append(scale_latents(sample_latents(config, z[None]), vae_scaling))
 
     # One noise draw per volume, shared by every variant, so all comparisons are paired.
     torch.manual_seed(config.seed)

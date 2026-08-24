@@ -22,6 +22,7 @@ import os
 import zipfile
 from collections import Counter
 
+import torch
 from omegaconf import OmegaConf
 
 from echosyn.common.mrrate import list_series, sample_id
@@ -109,9 +110,19 @@ def main():
         elif ".tmp." in name:
             problems.append(f"latents/{name}: leftover temp file from a killed task")
 
+    # A dataset written before (mean, std) storage trains without complaint, on the mean alone at
+    # half the channels the config expects. Catch it here.
+    want_c = 2 * config.globals.latent_channels
     for name in ("black", "white"):
-        if not os.path.exists(os.path.join(root, "boundary", f"{name}.pt")):
+        path = os.path.join(root, "boundary", f"{name}.pt")
+        if not os.path.exists(path):
             problems.append(f"boundary/{name}.pt missing -- shard 0 never finished")
+            continue
+        got_c = torch.load(path, map_location="cpu").shape[0]
+        if got_c != want_c:
+            problems.append(f"boundary/{name}.pt has {got_c} channels, expected {want_c} "
+                            f"(mean and std) -- this dataset predates sample_latents, re-run "
+                            f"preprocessing")
 
     missing = set(owner) - found
     print(f"\nencoded {len(found)}/{len(owner)} expected series ({100*len(found)/max(len(owner),1):.2f}%)")

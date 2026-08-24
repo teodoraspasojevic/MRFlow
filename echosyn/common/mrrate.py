@@ -175,34 +175,23 @@ def acquisition_prefix(modality, plane, spacing=None):
     return " ".join(parts)
 
 
-def encode_conditioning(tokenizer, model, report, modality, plane, spacing=None, marker_weight=1.0,
+def encode_conditioning(tokenizer, model, report, modality, plane, spacing=None,
                         max_length=512, sections=("findings", "impression")):
     """Report + acquisition markers -> one pooled [1, D] conditioning vector.
 
     The string is `acquisition_prefix` followed by the report sections, so conditioning always
-    starts with modality, plane and spacing.
+    starts with modality, plane and spacing, and one CLS pass over that string is the whole
+    embedding.
 
-    MR-RATE reports are study-level but the target is a single series, so one report maps to up to
-    ~12 volumes of wildly different contrast and plane, and the markers are the *only* signal
-    saying which one to generate. Leaving them inside the report string does not survive pooling: a
-    ~60-character prefix inside a ~2000-character report moves the pooled CLS vector by a cosine of
-    0.0002, while report content spans ~0.03 across studies -- roughly 170x weaker, so the model
-    would be conditioned on which study but blind to which contrast.
-
-    So the prefix is *also* pooled on its own and added back as a unit vector. At
-    `marker_weight=1.0`, contrast/plane separates same-study series about as strongly as report
-    content separates studies (measured cosine 0.976 vs 0.972). Set 0.0 to keep only the plain
-    prefix-then-report string.
+    Markers are faint at this length (~0.0002 cosine against ~0.03 for report content), but the
+    prefix is no longer pooled separately and added back -- this is one encode of one string.
 
     Stays a single 768-d token, so STDiT's caption path and the released checkpoint's weights are
     untouched.
     """
     prefix = acquisition_prefix(modality, plane, spacing)
-    full = encode_report(tokenizer, model, f"{prefix}\n{format_report(report, sections)}", max_length)
-    if not marker_weight:
-        return full
-    return _unit(full) + marker_weight * _unit(
-        encode_report(tokenizer, model, prefix, max_length))
+    return encode_report(tokenizer, model, f"{prefix}\n{format_report(report, sections)}",
+                         max_length)
 
 
 def _unit(x):
@@ -360,30 +349,26 @@ def preprocess_volume(nii_bytes, plane, target_spacing=(1.0, 1.0, 1.0), inplane_
 
 
 def encode_volume(vae, volume, batch_size=32, dtype=torch.float16):
-    """[1, T, S, S] in [0, 1] -> [C, T, S/8, S/8], unscaled.
+    """[1, T, S, S] in [0, 1] -> [2C, T, S/8, S/8], unscaled (mean and std, in that order).
 
     FLUX's VAE is 2D, so slices become the batch axis and the single MR channel is repeated to RGB
     here -- the only place that happens. There is no compression along the slice axis, so
     T_latent == T_image and the released CTFlow STDiT stays shape-compatible.
 
-    The posterior mean is stored, not a sample, so a config sets `sample_latents: false` and the
-    stored latents are already `latent_channels` wide. Latents are stored *unscaled*: train.py
-    applies `scale_latents` itself, exactly as it does for CT.
-
-    Stored as fp16 by default: a full split is ~9 TB in fp32, the model trains in bf16 anyway, and
-    the dataset casts back to float on load.
+    Both posterior parameters are stored, so every read draws a fresh sample via `sample_latents`
+    -- hence the 2C width and `sample_latents: true`. Stored unscaled and fp16, as CT does.
     """
     slices = volume[0].unsqueeze(1).repeat(1, 3, 1, 1)  # (T, 3, S, S)
     out = []
     with torch.no_grad():
         for chunk in slices.split(batch_size):
             dist = vae.encode(chunk.to(vae.device, vae.dtype)).latent_dist
-            out.append(dist.mean.to(dtype).cpu())
+            out.append(torch.cat([dist.mean, dist.std], dim=1).to(dtype).cpu())
     return torch.cat(out).permute(1, 0, 2, 3).contiguous()
 
 
 def encode_boundary(vae, value, inplane_size=256):
-    """A constant-valued image through the identical encode path -> [C, s, s].
+    """A constant-valued image through the identical encode path -> [2C, s, s].
 
     Sequence boundaries are learned tokens, not a length head: generation seeds with an all-black
     block and stops when a produced block matches all-white. Both must therefore live in exactly

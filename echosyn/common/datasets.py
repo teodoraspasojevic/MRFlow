@@ -80,6 +80,9 @@ class MRRateLatentBlockDataset(Dataset):
 
     Preprocessing keeps only volumes with at least 2 * block_size slices, so every row can produce
     any of the three kinds and there is no short-volume special case.
+
+    Latents and boundary tokens are stored as the posterior's (mean, std) on the channel axis, so
+    everything returned is 2C wide and train.py samples it. Slicing is on time, so it is unaffected.
     """
 
     def __init__(self, root, split, block_size=16, p_start=0.3, p_end=0.2,
@@ -99,8 +102,8 @@ class MRRateLatentBlockDataset(Dataset):
             torch.load(os.path.join(root, "boundary", f"{name}.pt"), map_location="cpu")
             for name in ("black", "white")
         )
-        # (C, s, s) -> (C, B, s, s) by repeating along the block axis, which is what the generator
-        # does for its seed block -- so a trained start example and an inference seed are identical.
+        # (2C, s, s) -> (2C, B, s, s), matching what the generator does for its seed block.
+        # Repeat before sampling, so every frame gets its own draw.
         self.black = black.unsqueeze(1).repeat(1, block_size, 1, 1)
         self.white = white.unsqueeze(1).repeat(1, block_size, 1, 1)
 
@@ -129,8 +132,9 @@ class MRRateLatentBlockDataset(Dataset):
         embedding = embedding / (embedding.norm(p=2) + 1e-6)
 
         return {
-            "image": block_curr.float(),   # condition: [C, T, H, W]
-            "video": block_next.float(),   # target:    [C, T, H, W]
+            # Posterior parameters, not latents -- train.py samples these before scaling.
+            "image": block_curr.float(),   # condition: [2C, T, H, W]
+            "video": block_next.float(),   # target:    [2C, T, H, W]
             "embedding": embedding,        # text embedding: [1, D]
         }
 
