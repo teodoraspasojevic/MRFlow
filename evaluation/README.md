@@ -8,19 +8,51 @@ definitions.
 No preprocessed split is needed — every case is read straight out of the raw MR-RATE tars — so
 `--split test` runs exactly like `--split val`.
 
-```bash
-# one array task per shard, then one pass to pool them
-sbatch --array=0-15 slurms/mrflow_eval_helma.sh <experiment>/config.yaml \
-    <experiment>/checkpoint-N/denoiser_ema --split val
-sbatch slurms/mrflow_eval_helma.sh <config> <ckpt> --split val --combine
+## How to evaluate one model
 
-# quick local check, one GPU, 8 cases
+Start with a quick check on one GPU, so a broken path or config fails in minutes instead of hours:
+
+```bash
 python evaluation/main.py --config <experiment>/config.yaml \
     --ckpt <experiment>/checkpoint-N/denoiser_ema --split val --limit 8
 ```
 
+Then the real run — two commands. The first generates and scores, spread over many GPUs; the
+second adds the pieces up. Submitting them together with `--dependency` means you type both once
+and walk away:
+
+```bash
+CONFIG=<experiment>/config.yaml
+CKPT=<experiment>/checkpoint-N/denoiser_ema
+OUT=/hnvme/workspace/y100dc19-mrflow/eval/my_run
+
+# 1. generate + score: 32 tasks in parallel, 32 cases each = 1024 cases
+JOB=$(sbatch --parsable --array=0-31 slurms/mrflow_eval_helma.sh \
+    $CONFIG $CKPT --split val --limit 32 --out $OUT)
+
+# 2. pool the pieces into metrics.json and log to W&B, after step 1 has finished
+sbatch --dependency=afterany:$JOB slurms/mrflow_eval_helma.sh \
+    $CONFIG $CKPT --split val --combine --out $OUT
+```
+
+**`--limit` is per task**, so cases = array size × limit. Drop it to run the whole split.
+
+**Why two commands.** Each array task scores its own slice and writes `shard-NNNN.pt`. None of them
+knows it is the last to finish, so the totalling has to be a separate job that starts afterwards.
+FID also cannot be averaged per shard — `combine` pools the raw features across all of them.
+
+**Only `--combine` logs to W&B.** The array tasks write files and nothing else. The W&B run is named
+after the config's `wandb_args.name`, so give a config copy its own name when the checkpoint is not
+from that experiment, or the run borrows a training run's name.
+
 Pass the config **saved into the experiment dir**, next to the checkpoints — it has the paths and
-the architecture the checkpoint was trained with.
+the architecture the checkpoint was trained with. `--out` defaults to `<output_dir>/eval/<regime>-<split>`;
+pass it explicitly for a checkpoint that is not from a finished experiment, so the run does not
+create that experiment's directory.
+
+Everything lands in `$OUT`: one `shard-NNNN.pt` per task, `examples/*.mp4`, and `metrics.json`.
+**Check `n_total_files` in `metrics.json` matches the case count you asked for** — `combine` pools
+whatever shards it finds, so a task that died leaves a quietly smaller evaluation.
 
 | file | what |
 |---|---|
