@@ -1,5 +1,4 @@
 import time
-import types
 
 import numpy as np
 import torch
@@ -8,6 +7,7 @@ from tqdm import tqdm
 from torchdiffeq import odeint_adjoint as odeint
 
 from echosyn.common import *
+from echosyn.common.mrrate import CFG_NULL_MODALITY_ID
 
 
 class LatentAutoregressiveGenerator:
@@ -17,6 +17,7 @@ class LatentAutoregressiveGenerator:
     Generates a sequence of latent blocks conditioned on:
     - A text/CT embedding (prompt_embeds)
     - The previously generated block (cond_image)
+    - Modality and plane class ids
 
     Uses flow matching (Euler ODE) for denoising.
     """
@@ -31,6 +32,8 @@ class LatentAutoregressiveGenerator:
         block_size: int = 16,
         overlap: int = 8,
         eps: float = 0.1,
+        modality_cfg_scale: float = 1.0,
+        report_cfg_scale: float = 1.0,
     ):
         self.denoiser = denoiser
         self.vae = vae
@@ -40,6 +43,8 @@ class LatentAutoregressiveGenerator:
         self.block_size = block_size
         self.overlap = overlap
         self.eps = eps
+        self.modality_cfg_scale = modality_cfg_scale
+        self.report_cfg_scale = report_cfg_scale
         self.dtype = torch.float32
         self.trim = True
 
@@ -75,6 +80,46 @@ class LatentAutoregressiveGenerator:
 
         return latents
 
+    def velocity(self, t, y, prompt_embeds, cond_image, modality_id, plane_id):
+        """One velocity for the ODE right-hand side, guided over modality and report.
+
+        Three branches, batched into a single denoiser call:
+
+            BASE      modality CFG_NULL, null report
+            MODALITY  real modality,     null report
+            FULL      real modality,     real report
+
+            v = v_base + s_mod * (v_modality - v_base) + s_rep * (v_full - v_modality)
+
+        Everything non-semantic is the same tensor repeated -- the noisy latent, the timestep, the
+        previous block and the plane -- so each difference isolates one condition. Plane is never
+        nulled: it is geometry, not semantics.
+
+        At both scales exactly 1 the sum collapses to v_full, so the single conditional call is
+        taken instead of paying for three.
+        """
+        s_mod, s_rep = self.modality_cfg_scale, self.report_cfg_scale
+        if s_mod == 1.0 and s_rep == 1.0:
+            return self.denoiser(
+                y, t, encoder_hidden_states=prompt_embeds, cond_image=cond_image,
+                modality_id=modality_id, plane_id=plane_id,
+            ).sample
+
+        K = 3
+        null_modality = torch.full_like(modality_id, CFG_NULL_MODALITY_ID)
+        drop = torch.tensor([True, True, False], device=y.device)
+        v = self.denoiser(
+            y.repeat(K, 1, 1, 1, 1), t,
+            encoder_hidden_states=prompt_embeds.repeat(K, 1, 1),
+            cond_image=cond_image.repeat(K, 1, 1, 1, 1),
+            modality_id=torch.cat([null_modality, modality_id, modality_id]),
+            plane_id=plane_id.repeat(K),
+            force_drop_ids=drop.repeat_interleave(modality_id.shape[0]),
+        ).sample
+
+        v_base, v_modality, v_full = v.chunk(K)
+        return v_base + s_mod * (v_modality - v_base) + s_rep * (v_full - v_modality)
+
     def is_stop_frame(self, latent: torch.Tensor):
         """Check if the last block is all-white (stop signal)."""
         last_frame = latent[:, :, 0, :, :]
@@ -97,12 +142,14 @@ class LatentAutoregressiveGenerator:
 
         return latent[:, :, :keep_until, :, :]
 
-    def generate(self, prompt_embeds, max_blocks=30, gt_first_block=None):
+    def generate(self, prompt_embeds, modality_id, plane_id, max_blocks=30, gt_first_block=None):
         """
         Generate a full latent volume auto-regressively.
 
         Args:
             prompt_embeds: Text/CT embedding [B, 1, D].
+            modality_id: Modality class ids [B], dtype long.
+            plane_id: Plane class ids [B], dtype long.
             max_blocks: Maximum number of blocks to generate.
             gt_first_block: Optional ground-truth first block for gt-head inference mode.
 
@@ -137,9 +184,8 @@ class LatentAutoregressiveGenerator:
                 cond_image_latent = sample_latents(self.config, cond_image_latent)
 
                 def rhs(t, y):
-                    return self.denoiser(
-                        y, t, encoder_hidden_states=prompt_embeds, cond_image=cond_image_latent
-                    ).sample
+                    return self.velocity(t, y, prompt_embeds, cond_image_latent,
+                                         modality_id, plane_id)
 
                 timesteps = torch.linspace(1.0, 0.0, steps=201, device=self.device, dtype=self.dtype)
                 start_time = time.time()
@@ -183,13 +229,15 @@ class LatentAutoregressiveGenerator:
 
         return full_latent
 
-    def generate_next_block(self, prev_latent, prompt_embeds):
+    def generate_next_block(self, prev_latent, prompt_embeds, modality_id, plane_id):
         """
         Generate a single next block (used in block-wise inference mode).
 
         Args:
             prev_latent: Previous block latent [B, C, T, H, W].
             prompt_embeds: Text/CT embedding [B, 1, D].
+            modality_id: Modality class ids [B], dtype long.
+            plane_id: Plane class ids [B], dtype long.
 
         Returns:
             Next block latent [B, C, T', H, W] with stop frames trimmed.
@@ -201,30 +249,22 @@ class LatentAutoregressiveGenerator:
 
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=self.dtype):
             z = torch.randn((B, C, T, H, W), device=self.device, dtype=self.dtype)
-            cond_image_latent = prev_latent
 
-            if not hasattr(self.denoiser, "forward_original"):
-                self.denoiser.forward_original = self.denoiser.forward
+            def rhs(t, y):
+                return self.velocity(t, y, prompt_embeds, prev_latent, modality_id, plane_id)
 
-            def new_forward(self, t, y, *args, **kwargs):
-                kwargs = {
-                    **kwargs,
-                    "encoder_hidden_states": prompt_embeds,
-                    "cond_image": cond_image_latent,
-                }
-                return self.forward_original(y, t, *args, **kwargs).sample
-
-            self.denoiser.forward = types.MethodType(new_forward, self.denoiser)
-
-            timesteps = torch.tensor([1.0, 0.0], dtype=self.dtype, device=self.device)
+            # Same euler/201 schedule as `generate`, so block-wise numbers stay comparable to a
+            # full rollout -- an adaptive solver's step count depends on the guided field.
+            timesteps = torch.linspace(1.0, 0.0, steps=201, device=self.device, dtype=self.dtype)
             start_time = time.time()
             new_block = odeint(
-                self.denoiser,
+                rhs,
                 z,
                 timesteps,
                 atol=1e-5,
                 rtol=1e-5,
                 adjoint_params=self.denoiser.parameters(),
+                method="euler",
             )[-1]
             elapsed = time.time() - start_time
             print(f"[Timing] Single block generation time: {elapsed:.3f}s")

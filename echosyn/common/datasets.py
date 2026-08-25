@@ -4,7 +4,8 @@ import random
 import torch
 from torch.utils.data import Dataset
 
-from echosyn.common.mrrate import load_artifact, read_manifest
+from echosyn.common.mrrate import (label_counts, load_artifact, modality_to_id, plane_to_id,
+                                   read_manifest)
 
 
 class LatentBlockDataset(Dataset):
@@ -83,6 +84,9 @@ class MRRateLatentBlockDataset(Dataset):
 
     Latents and boundary tokens are stored as the posterior's (mean, std) on the channel axis, so
     everything returned is 2C wide and train.py samples it. Slicing is on time, so it is unaffected.
+
+    Modality and plane are resolved to integer class ids at construction, so an unmapped label
+    fails here rather than 40 minutes into a run.
     """
 
     def __init__(self, root, split, block_size=16, p_start=0.3, p_end=0.2,
@@ -97,6 +101,15 @@ class MRRateLatentBlockDataset(Dataset):
         self.rows = read_manifest(root, split)
         if not self.rows:
             raise RuntimeError(f"no {split!r} rows found in {root}/manifest/*.csv")
+
+        # Resolve every label up front: the whole manifest is validated once, in the main process.
+        self.labels = [(modality_to_id(r["modality"]), plane_to_id(r["plane"])) for r in self.rows]
+        modality, plane, pair = label_counts(self.rows)
+        print(f"[{split}] {len(self.rows)} series")
+        print(f"[{split}] modality: {dict(sorted(modality.items()))}")
+        print(f"[{split}] plane:    {dict(sorted(plane.items()))}")
+        print(f"[{split}] pairs:    "
+              f"{ {f'{m}/{p}': n for (m, p), n in sorted(pair.items())} }")
 
         black, white = (
             torch.load(os.path.join(root, "boundary", f"{name}.pt"), map_location="cpu")
@@ -131,11 +144,16 @@ class MRRateLatentBlockDataset(Dataset):
         embedding = load_artifact(self.root, row, "embedding_path")
         embedding = embedding / (embedding.norm(p=2) + 1e-6)
 
+        modality_id, plane_id = self.labels[idx]
+
         return {
             # Posterior parameters, not latents -- train.py samples these before scaling.
             "image": block_curr.float(),   # condition: [2C, T, H, W]
             "video": block_next.float(),   # target:    [2C, T, H, W]
             "embedding": embedding,        # text embedding: [1, D]
+            # Scalars, so the default collator stacks them into [B] class-label tensors.
+            "modality_id": torch.tensor(modality_id, dtype=torch.long),
+            "plane_id": torch.tensor(plane_id, dtype=torch.long),
         }
 
 

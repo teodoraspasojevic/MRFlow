@@ -38,8 +38,8 @@ from tqdm import tqdm
 import wandb
 from echosyn.common import *
 from echosyn.common.mrrate import (build_text_encoder, encode_conditioning, encode_volume,
-                                   list_series, load_native_volume, preprocess_volume,
-                                   read_member, read_report, sample_id)
+                                   list_series, load_native_volume, modality_to_id, plane_to_id,
+                                   preprocess_volume, read_member, read_report, sample_id)
 from auto_regressive_generate import LatentAutoregressiveGenerator
 from evaluation import METRIC_KEYS, ChallengeAccumulator, combine, comparison_frames
 
@@ -51,17 +51,18 @@ from evaluation import METRIC_KEYS, ChallengeAccumulator, combine, comparison_fr
 # needs no ground truth never pays for one. Adding a regime is adding an entry here.
 
 
-def full_body(generator, embedding, max_blocks, gt_latent):
+def full_body(generator, embedding, labels, max_blocks, gt_latent):
     """Report-to-volume: seed from the black boundary token, roll out until the white one."""
-    return generator.generate(embedding, max_blocks=max_blocks)
+    return generator.generate(embedding, *labels, max_blocks=max_blocks)
 
 
-def gt_head(generator, embedding, max_blocks, gt_latent):
+def gt_head(generator, embedding, labels, max_blocks, gt_latent):
     """As above, but seeded with the volume's own first block instead of the black token."""
     # gt_latent() carries both posterior parameters; scaling it whole would scale the stds too.
     first_block = sample_latents(generator.config, gt_latent()[:, :, :generator.block_size])
     first_block = scale_latents(first_block, generator.vae_scaling)
-    return generator.generate(embedding, max_blocks=max_blocks - 1, gt_first_block=first_block)
+    return generator.generate(embedding, *labels, max_blocks=max_blocks - 1,
+                              gt_first_block=first_block)
 
 
 REGIMES = {"full-body": full_body, "gt-head": gt_head}
@@ -96,6 +97,10 @@ def parse_args():
     parser.add_argument("--combine", action="store_true",
                         help="Pool the shards already in --out into metrics.json and log to W&B.")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging.")
+    parser.add_argument("--modality_cfg_scale", type=float, default=None,
+                        help="Overrides config.guidance.modality_cfg_scale.")
+    parser.add_argument("--report_cfg_scale", type=float, default=None,
+                        help="Overrides config.guidance.report_cfg_scale.")
 
     args = parser.parse_args()
     if not args.combine and not args.ckpt:
@@ -112,6 +117,8 @@ def build_generator(config, ckpt, device):
         denoiser=denoiser, vae=vae, device=device,
         vae_scaling=get_vae_scaler(config, device), config=config,
         block_size=config.globals.target_nframes,
+        modality_cfg_scale=config.guidance.modality_cfg_scale,
+        report_cfg_scale=config.guidance.report_cfg_scale,
     )
 
 
@@ -145,14 +152,16 @@ def run_shard(config, args, out, device):
         torch.manual_seed(config.seed + int(case_id, 16) % 2 ** 31)
         try:
             nii_bytes = read_member(entry["archive"], entry["member"])
-            real, spacing = load_native_volume(nii_bytes, entry["plane"])
+            real, _ = load_native_volume(nii_bytes, entry["plane"])
             embedding = encode_conditioning(
                 tokenizer, text_encoder, read_report(entry["archive"], entry["study_uid"]),
-                entry["modality"], entry["plane"], spacing, mri.text_max_length,
+                entry["modality"], entry["plane"], max_length=mri.text_max_length,
             )
             embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
 
-            latent = generate(generator, embedding, args.max_blocks,
+            labels = (torch.tensor([modality_to_id(entry["modality"])], device=device),
+                      torch.tensor([plane_to_id(entry["plane"])], device=device))
+            latent = generate(generator, embedding, labels, args.max_blocks,
                               lambda: gt_latent(generator, config, nii_bytes, entry))
             if latent.shape[2] == 0:
                 raise RuntimeError("every generated slice was a stop frame")
@@ -217,6 +226,12 @@ def main():
     os.makedirs(out, exist_ok=True)
     if args.max_blocks is None:
         args.max_blocks = config.mri.preprocess.max_slices // config.globals.target_nframes
+
+    # CLI guidance scales override the config, so a sweep is one sbatch argument.
+    check_label_mapping(config)
+    for name in ("modality_cfg_scale", "report_cfg_scale"):
+        if getattr(args, name) is not None:
+            config.guidance[name] = getattr(args, name)
 
     if not args.combine:
         shard_path = os.path.join(out, f"shard-{args.shard:04d}.pt")

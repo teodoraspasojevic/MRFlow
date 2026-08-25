@@ -83,7 +83,7 @@ def main():
             if not args.overwrite and store.done(latent_path, embed_path):
                 latent = store.read(latent_path)
             else:
-                volume, spacing = preprocess_volume(
+                volume, _ = preprocess_volume(
                     read_member(entry["archive"], entry["member"]), entry["plane"],
                     **preprocess_args,
                 )
@@ -91,7 +91,7 @@ def main():
                 store.write(latent_path, latent)
                 store.write(embed_path, encode_conditioning(
                     tokenizer, text_encoder, read_report(entry["archive"], entry["study_uid"]),
-                    entry["modality"], entry["plane"], spacing, mri.text_max_length,
+                    entry["modality"], entry["plane"], max_length=mri.text_max_length,
                 ))
         except VolumeTooShort:
             skipped["too_short"] = skipped.get("too_short", 0) + 1

@@ -959,9 +959,11 @@ class CaptionEmbedder(nn.Module):
             act_layer=act_layer,
             drop=0,
         )
-        self.register_buffer(
-            "y_embedding",
-            nn.Parameter(torch.randn(token_num, in_channels) / in_channels**0.5),
+        # A real Parameter, not a buffer: a buffer is invisible to the optimizer and to EMA, and
+        # EMAModel.save_pretrained re-randomizes buffers at every save. The state-dict key is the
+        # same either way, so released checkpoints still match.
+        self.y_embedding = nn.Parameter(
+            torch.randn(token_num, in_channels) / in_channels**0.5
         )
         self.uncond_prob = uncond_prob
 
@@ -970,9 +972,9 @@ class CaptionEmbedder(nn.Module):
         Drops labels to enable classifier-free guidance.
         """
         if force_drop_ids is None:
-            drop_ids = torch.rand(caption.shape[0]).cuda() < self.uncond_prob
+            drop_ids = torch.rand(caption.shape[0], device=caption.device) < self.uncond_prob
         else:
-            drop_ids = force_drop_ids == 1
+            drop_ids = force_drop_ids.to(caption.device).bool()
         caption = torch.where(drop_ids[:, None, None, None], self.y_embedding, caption)
         return caption
 
@@ -1139,6 +1141,8 @@ class STDiT(nn.Module):
         space_scale=1.0,
         time_scale=1.0,
         enable_flashattn=False,
+        num_modality_classes=0,  # 0 to disable
+        num_plane_classes=0,  # 0 to disable
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1181,6 +1185,19 @@ class STDiT(nn.Module):
             else None
         )
 
+        # Modality and plane class conditioning, NVIDIA MAISI's pattern: one nn.Embedding per
+        # attribute at the timestep-embedding width, summed into the timestep embedding. Kept
+        # separate rather than merged into joint classes, so they share statistics across
+        # combinations that are rare in MR-RATE (SWI is 99.98% axial).
+        self.modality_embedder = (
+            nn.Embedding(num_modality_classes, hidden_size)
+            if num_modality_classes > 0
+            else None
+        )
+        self.plane_embedder = (
+            nn.Embedding(num_plane_classes, hidden_size) if num_plane_classes > 0 else None
+        )
+
         drop_path = [x.item() for x in torch.linspace(0, drop_path, depth)]
         self.blocks = nn.ModuleList(
             [
@@ -1208,7 +1225,8 @@ class STDiT(nn.Module):
         # sequence parallel related configs
         self.sp_rank = None
 
-    def forward(self, x, timestep, y=None, mask=None, cond_image=None):
+    def forward(self, x, timestep, y=None, mask=None, modality_id=None, plane_id=None,
+                force_drop_ids=None):
         """
         Forward pass of STDiT.
         Args:
@@ -1216,6 +1234,9 @@ class STDiT(nn.Module):
             timestep (torch.Tensor): diffusion time steps; of shape [B]
             y (torch.Tensor): representation of prompts; of shape [B, 1, N_token, C]
             mask (torch.Tensor): mask for selecting prompt tokens; of shape [B, N_token]
+            modality_id (torch.Tensor): modality class ids; of shape [B], dtype long
+            plane_id (torch.Tensor): plane class ids; of shape [B], dtype long
+            force_drop_ids (torch.Tensor): per-sample null-report mask; of shape [B], bool
 
         Returns:
             x (torch.Tensor): output latent representation; of shape [B, C, T, H, W]
@@ -1239,9 +1260,23 @@ class STDiT(nn.Module):
         #     x = split_forward_gather_backward(x, get_sequence_parallel_group(), dim=1, grad_scale="down")
 
         t = self.t_embedder(timestep, dtype=x.dtype)  # [B, C]
+
+        # Class conditioning is added to the timestep embedding, so it reaches the AdaLN modulation
+        # in every block (through t_block) and the output modulation (through final_layer).
+        B = x.shape[0]
+        for embedder, ids, name in (
+            (self.modality_embedder, modality_id, "modality_id"),
+            (self.plane_embedder, plane_id, "plane_id"),
+        ):
+            if embedder is None:
+                continue
+            assert ids is not None, f"{name} is required by this config"
+            assert ids.shape == (B,), f"{name} must be [{B}], got {tuple(ids.shape)}"
+            t = t + embedder(ids).to(t.dtype)
+
         t0 = self.t_block(t)  # [B, C]
         if self.y_embedder is not None and y is not None:
-            y = self.y_embedder(y, self.training)  # [B, 1, N_token, C]
+            y = self.y_embedder(y, self.training, force_drop_ids)  # [B, 1, N_token, C]
 
             if mask is not None:
                 if mask.shape[0] != y.shape[0]:
@@ -1409,6 +1444,12 @@ class STDiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+        # Zero-out the class embeddings, so a checkpoint that predates them predicts exactly as it
+        # did (t is unchanged) while every row still receives gradients and can diverge.
+        for embedder in (self.modality_embedder, self.plane_embedder):
+            if embedder is not None:
+                nn.init.constant_(embedder.weight, 0)
+
 
 @dataclass
 class DiffuserSTDiTModelOutput(BaseOutput):
@@ -1466,6 +1507,8 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
         space_scale=1.0,
         time_scale=1.0,
         enable_flashattn=False,
+        num_modality_classes=0,
+        num_plane_classes=0,
     ):
 
         super().__init__()
@@ -1487,6 +1530,8 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
             space_scale=space_scale,
             time_scale=time_scale,
             enable_flashattn=enable_flashattn,
+            num_modality_classes=num_modality_classes,
+            num_plane_classes=num_plane_classes,
         )
 
     def forward(
@@ -1497,6 +1542,9 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
         cond_image=None,
         mask=None,
         return_dict=True,
+        modality_id=None,
+        plane_id=None,
+        force_drop_ids=None,
         *args,
         **kwargs,
     ):
@@ -1507,6 +1555,9 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
             y (torch.Tensor): representation of prompts; of shape [B, 1, N_token, C]
             mask (torch.Tensor): mask for selecting prompt tokens; of shape [B, N_token]
             return_dict (bool): return a dictionary or not. Default: True.
+            modality_id (torch.Tensor): modality class ids; of shape [B], dtype long
+            plane_id (torch.Tensor): plane class ids; of shape [B], dtype long
+            force_drop_ids (torch.Tensor): per-sample null-report mask; of shape [B], bool
         """
         if type(timestep) == int or timestep.ndim == 0:
             timestep = torch.ones(x.shape[0], device=x.device) * timestep
@@ -1523,7 +1574,15 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
             ), "x and cond_image must have the same shape"
             x = torch.cat([x, cond_image], dim=1)  # B x 2C x T x H x W
 
-        output = self.model(x, timestep, encoder_hidden_states, mask)
+        output = self.model(
+            x,
+            timestep,
+            y=encoder_hidden_states,
+            mask=mask,
+            modality_id=modality_id,
+            plane_id=plane_id,
+            force_drop_ids=force_drop_ids,
+        )
         if not return_dict:
             return (output,)
 

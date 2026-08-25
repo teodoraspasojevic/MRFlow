@@ -31,6 +31,7 @@ import wandb
 from echosyn.common import *
 from echosyn.common.schedulers import StepBasedLearningRateScheduleWithWarmup
 from echosyn.common.datasets import instantiate_dataset
+from echosyn.common.mrrate import CFG_NULL_MODALITY_ID
 
 
 allow_ops_in_compiled_graph()
@@ -100,6 +101,10 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
     text_embeddings = torch.stack([e["embedding"] for e in ref_elements], dim=0)
     text_embeddings = text_embeddings.to(accelerator.device, dtype=weight_dtype)
 
+    # Validation is fully conditioned: real modality, real plane, no report dropout.
+    modality_id = torch.stack([e["modality_id"] for e in ref_elements]).to(accelerator.device)
+    plane_id = torch.stack([e["plane_id"] for e in ref_elements]).to(accelerator.device)
+
     logger.info("Sampling... ")
     with torch.no_grad(), accelerator.autocast():
         z_1 = torch.randn(
@@ -118,6 +123,8 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
                 **kwargs,
                 "encoder_hidden_states": text_embeddings,
                 "cond_image": ref_images,
+                "modality_id": modality_id,
+                "plane_id": plane_id,
             }
             return self.forward_original(y, t, *args, **kwargs).sample
 
@@ -256,6 +263,7 @@ def main():
     if global_step == 0:
         set_seed(config.seed)
 
+    stamp_label_mapping(config)
     init_trackers(accelerator, config, args)
     log_training_info(config, accelerator, denoiser, train_dataset, logger)
 
@@ -289,6 +297,15 @@ def main():
 
             text_embeddings = batch["embedding"]
             forward_kwargs["encoder_hidden_states"] = text_embeddings
+
+            # Semantic conditioning: modality may be nulled, the report may be dropped, and plane is
+            # always the real plane. Class ids stay long -- never cast to the model dtype.
+            modality_id = batch["modality_id"].to(accelerator.device)
+            plane_id = batch["plane_id"].to(accelerator.device)
+            modality_id, report_drop = sample_condition_states(config, modality_id)
+            forward_kwargs["modality_id"] = modality_id
+            forward_kwargs["plane_id"] = plane_id
+            forward_kwargs["force_drop_ids"] = report_drop
 
             # Condition image: current block with optional noise and dropout
             if config.get("noise_cond_image", 0.0) > 0.0:
@@ -347,6 +364,9 @@ def main():
                         "grad_norm": grad_norm.item(),
                         "mean_latent": videos.mean().item(),
                         "std_latent": videos.std().item(),
+                        # Realized rates, so a mis-specified condition_states block is visible.
+                        "report_drop_rate": report_drop.float().mean().item(),
+                        "modality_null_rate": (modality_id == CFG_NULL_MODALITY_ID).float().mean().item(),
                     },
                     step=global_step,
                 )

@@ -26,6 +26,7 @@ from PIL import Image
 from torchvision import transforms
 
 from echosyn.common import *
+from echosyn.common.mrrate import modality_to_id, plane_to_id
 from auto_regressive_generate import LatentAutoregressiveGenerator
 
 
@@ -68,6 +69,10 @@ def parse_args():
     parser.add_argument("--config", type=str, required=True, help="Path to training config file")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint (denoiser_ema)")
     parser.add_argument("--output", type=str, default="output_frames", help="Output directory for generated frames")
+    parser.add_argument("--modality", type=str, required=True, help="T1w | T2w | FLAIR | SWI | MRA")
+    parser.add_argument("--plane", type=str, required=True, help="AXIAL | SAGITTAL | CORONAL")
+    parser.add_argument("--modality-cfg-scale", type=float, default=None, help="Overrides config.guidance")
+    parser.add_argument("--report-cfg-scale", type=float, default=None, help="Overrides config.guidance")
     parser.add_argument(
         "--type",
         type=str,
@@ -96,6 +101,16 @@ def main():
     prompt_embedding = prompt_embedding.unsqueeze(0)
     prompt_embedding = prompt_embedding / (prompt_embedding.norm(p=2) + 1e-6)
 
+    # Class labels. Resolved through the shared tables, so an id means the same thing here as it
+    # did in training, and the checkpoint's own mapping is checked against them.
+    check_label_mapping(config)
+    modality_id = torch.tensor([modality_to_id(args.modality)], device=device)
+    plane_id = torch.tensor([plane_to_id(args.plane)], device=device)
+
+    guidance = config.get("guidance", {})
+    modality_cfg_scale = args.modality_cfg_scale or guidance.get("modality_cfg_scale", 1.0)
+    report_cfg_scale = args.report_cfg_scale or guidance.get("report_cfg_scale", 1.0)
+
     # Init generator
     generator = LatentAutoregressiveGenerator(
         denoiser=denoiser,
@@ -103,12 +118,16 @@ def main():
         device=device,
         vae_scaling=vae_scaling,
         config=config,
+        modality_cfg_scale=modality_cfg_scale,
+        report_cfg_scale=report_cfg_scale,
     )
 
     # Run inference
     if args.type == "full-body":
         result_latent = generator.generate(
             prompt_embeds=prompt_embedding,
+            modality_id=modality_id,
+            plane_id=plane_id,
             max_blocks=20,
         )
 
@@ -127,6 +146,8 @@ def main():
         gt_first_block = scale_latents(gt_first_block, vae_scaling)
         result_latent = generator.generate(
             prompt_embeds=prompt_embedding,
+            modality_id=modality_id,
+            plane_id=plane_id,
             max_blocks=19,
             gt_first_block=gt_first_block,
         )
@@ -145,7 +166,8 @@ def main():
             gt_block = gt_latent[:, :, i * block_size:(i + 1) * block_size, :, :]
             gt_block = sample_latents(config, gt_block)
             gt_block = scale_latents(gt_block, vae_scaling)
-            next_block = generator.generate_next_block(gt_block, prompt_embedding)
+            next_block = generator.generate_next_block(gt_block, prompt_embedding,
+                                                       modality_id, plane_id)
             if next_block.shape[2] == 0:
                 print(f"[Block-wise] Stop at block {i} (all frames trimmed).")
                 break

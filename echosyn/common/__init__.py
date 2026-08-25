@@ -29,6 +29,9 @@ from tqdm.auto import tqdm as tqdm_std
 
 import wandb
 
+from echosyn.common.mrrate import (CFG_NULL_MODALITY_ID, MODALITY_ALIASES, MODALITY_TO_ID,
+                                   NUM_MODALITY_CLASSES, NUM_PLANE_CLASSES, PLANE_TO_ID)
+
 
 class Scheduler(Enum):
     EDM = 0
@@ -236,10 +239,19 @@ def load_init_weights(config, model, logger):
         path = os.path.join(path, "diffusion_pytorch_model.safetensors")
     missing, unexpected = model.load_state_dict(load_file(path), strict=False)
     logger.info(f"Initialized weights from {path}")
-    if missing or unexpected:
-        logger.warning(
-            f"  {len(missing)} missing and {len(unexpected)} unexpected keys — the checkpoint "
-            f"architecture differs from the config. missing={missing[:5]} unexpected={unexpected[:5]}"
+
+    # Only the class-conditioning tensors may be absent -- they postdate the CTFlow checkpoint and
+    # are zero-initialized, so the model still predicts exactly what it did. Anything else missing,
+    # or anything unexpected, means the config and the checkpoint disagree: that must fail loudly
+    # rather than train a partly random model for hours.
+    allowed = {n for n in missing if n.split(".")[-2] in ("modality_embedder", "plane_embedder")}
+    if allowed:
+        logger.info(f"  new class-conditioning tensors left zero-initialized: {sorted(allowed)}")
+    surprises, extras = sorted(set(missing) - allowed), sorted(unexpected)
+    if surprises or extras:
+        raise RuntimeError(
+            f"init_from does not match the config: {len(surprises)} unexpected-missing "
+            f"{surprises[:5]}, {len(extras)} unexpected {extras[:5]}"
         )
 
 
@@ -448,6 +460,65 @@ def get_noise(latents, noise_scheduler=None, noise_offset=0.0):
             noise_offset_shape, device=latents.device
         )
     return noise
+
+
+def stamp_label_mapping(config):
+    """Record the class-label tables in the config, which `save_checkpoint` writes next to the
+    weights. A checkpoint therefore carries the mapping it was trained with."""
+    config.labels = {
+        "modality_to_id": dict(MODALITY_TO_ID),
+        "modality_aliases": dict(MODALITY_ALIASES),
+        "num_modality_classes": NUM_MODALITY_CLASSES,
+        "cfg_null_modality_id": CFG_NULL_MODALITY_ID,
+        "plane_to_id": dict(PLANE_TO_ID),
+        "num_plane_classes": NUM_PLANE_CLASSES,
+    }
+
+
+def check_label_mapping(config):
+    """Fail if a checkpoint's saved mapping disagrees with the tables in mrrate.py. An id that moved
+    since training would silently condition on the wrong sequence, which is invisible otherwise."""
+    saved = config.get("labels", None)
+    if saved is None:
+        print("WARNING: this config carries no label mapping; assuming mrrate.py's tables.")
+        return
+    saved = omegaconf.OmegaConf.to_container(saved, resolve=True)
+    current = {"modality_to_id": dict(MODALITY_TO_ID), "plane_to_id": dict(PLANE_TO_ID),
+               "cfg_null_modality_id": CFG_NULL_MODALITY_ID}
+    for key, value in current.items():
+        was = saved.get(key)
+        if was != value:
+            raise RuntimeError(
+                f"label mapping changed since this checkpoint was trained: {key} was {was}, "
+                f"now {value}. The class ids in mrrate.py must never move."
+            )
+    args = config.denoiser.args
+    assert args.get("num_modality_classes", 0) == NUM_MODALITY_CLASSES
+    assert args.get("num_plane_classes", 0) == NUM_PLANE_CLASSES
+
+
+def sample_condition_states(config, modality_id, generator=None):
+    """Per-sample semantic condition state -> (modality_id, report_drop).
+
+    Three explicit states, not two independent Bernoulli draws. Independent dropout at 0.1/0.1
+    would put only 1% of samples in the fully-null state, and that state is the *base* of the
+    guidance expansion in section 8 -- its error is multiplied by modality_cfg_scale.
+
+        FULL           real modality, real report      (0.80)
+        MODALITY_ONLY  real modality, null report      (0.10)
+        SEMANTIC_NULL  CFG_NULL modality, null report  (0.10)
+
+    Plane is never touched: it is a geometry condition, always real, never guided.
+    """
+    p = config.condition_states
+    probs = torch.tensor([p.full, p.modality_only, p.semantic_null], dtype=torch.float32,
+                         device=modality_id.device)
+    assert abs(float(probs.sum()) - 1.0) < 1e-6, f"condition_states must sum to 1, got {probs.sum()}"
+
+    state = torch.multinomial(probs, modality_id.shape[0], replacement=True, generator=generator)
+    report_drop = state > 0                                    # both null-report states
+    modality_id = torch.where(state == 2, CFG_NULL_MODALITY_ID, modality_id)
+    return modality_id, report_drop
 
 
 def sample_latents(config, latents):

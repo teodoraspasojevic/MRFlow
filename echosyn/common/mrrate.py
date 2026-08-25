@@ -40,6 +40,86 @@ SPLIT_DIRS = {"train": "train", "val": "validation", "test": "test"}
 AP_AXIS = 2  # anterior-posterior is (D, H, W) axis 2
 
 
+### Class labels ###
+
+# Modality and plane reach the model as integer class ids, the way NVIDIA's
+# `configs/modality_mapping.json` feeds `class_labels` into MAISI. These tables are the single
+# source of truth: they are literals, so an id means the same thing in every split, every worker,
+# every run and every checkpoint. Never sort, enumerate or hash at runtime.
+#
+# Id 0 is the classifier-free-guidance null, as NVIDIA's `unknown: 0` is. UNKNOWN is a *real*
+# category -- `list_series` emits it when the series index has no modality -- so it gets its own id.
+MODALITY_TO_ID = {
+    "CFG_NULL": 0,
+    "T1w": 1,
+    "T2w": 2,
+    "FLAIR": 3,
+    "SWI": 4,
+    "MRA": 5,
+    "UNKNOWN": 6,
+}
+CFG_NULL_MODALITY_ID = MODALITY_TO_ID["CFG_NULL"]
+NUM_MODALITY_CLASSES = len(MODALITY_TO_ID)
+
+# Every spelling the pipeline can hand us: MR-RATE's own column values, and the lowercase codes
+# the challenge's `{study}_{modality}-raw-{plane}` case ids use.
+MODALITY_ALIASES = {
+    "t1w": "T1w", "t1": "T1w",
+    "t2w": "T2w", "t2": "T2w",
+    "flair": "FLAIR",
+    "swi": "SWI", "swan": "SWI",
+    "mra": "MRA",
+    "unknown": "UNKNOWN",
+}
+
+# Deliberately its own table, not derived from PLANE_TO_STACK_AXIS: that one is a preprocessing
+# detail (which array axis to lead with) and may change, while a class id may never move.
+PLANE_TO_ID = {"AXIAL": 0, "SAGITTAL": 1, "CORONAL": 2}
+NUM_PLANE_CLASSES = len(PLANE_TO_ID)
+
+# Plane is a geometry condition with no null and no unknown class. Both spellings below fall back
+# to axial because that is what `plane_order` itself does with them, so the label and the array
+# layout always agree.
+PLANE_ALIASES = {
+    "axi": "AXIAL", "sag": "SAGITTAL", "cor": "CORONAL",
+    "obl": "AXIAL", "OBLIQUE": "AXIAL", "UNKNOWN": "AXIAL",
+}
+
+
+def modality_to_id(modality):
+    """Modality string -> class id. Raises on anything not in the tables above."""
+    name = MODALITY_ALIASES.get(str(modality).strip().lower(), str(modality).strip())
+    if name not in MODALITY_TO_ID:
+        raise KeyError(
+            f"unmapped modality {modality!r}: add it to MODALITY_TO_ID or MODALITY_ALIASES in "
+            f"echosyn/common/mrrate.py. Known: {sorted(MODALITY_TO_ID)}"
+        )
+    return MODALITY_TO_ID[name]
+
+
+def plane_to_id(plane):
+    """Plane string -> class id. Raises on anything not in the tables above."""
+    name = str(plane).strip()
+    name = PLANE_ALIASES.get(name, PLANE_ALIASES.get(name.lower(), name))
+    if name not in PLANE_TO_ID:
+        raise KeyError(
+            f"unmapped plane {plane!r}: add it to PLANE_TO_ID or PLANE_ALIASES in "
+            f"echosyn/common/mrrate.py. Known: {sorted(PLANE_TO_ID)}"
+        )
+    return PLANE_TO_ID[name]
+
+
+def label_counts(rows):
+    """Manifest rows -> (per-modality, per-plane, per-pair) counts, for the dataset's startup log."""
+    modality, plane, pair = {}, {}, {}
+    for row in rows:
+        m, p = row["modality"], row["plane"]
+        modality[m] = modality.get(m, 0) + 1
+        plane[p] = plane.get(p, 0) + 1
+        pair[(m, p)] = pair.get((m, p), 0) + 1
+    return modality, plane, pair
+
+
 ### Archive access ###
 
 # (pid, path) -> open archive. Keyed on pid so a forked dataloader worker never inherits the
@@ -185,6 +265,12 @@ def encode_conditioning(tokenizer, model, report, modality, plane, spacing=None,
 
     Markers are faint at this length (~0.0002 cosine against ~0.03 for report content), but the
     prefix is no longer pooled separately and added back -- this is one encode of one string.
+
+    No caller passes `spacing` any more, so `[SPACING]` is omitted: it described the *native*
+    geometry while the stored latents are all 1 mm isotropic, its (S, R, A) frame disagreed with the
+    plane-permuted array, and the challenge cannot supply it at inference. It was also measurably
+    inert -- an 8x wrong value moved the normalized embedding by 7e-5 cosine, against ~0.09 for a
+    different patient's report. Pass a spacing here to put it back.
 
     Stays a single 768-d token, so STDiT's caption path and the released checkpoint's weights are
     untouched.
