@@ -39,3 +39,7 @@ wandb/
 
 # Debug scripts
 debug/
+
+# Tests
+
+tests/
