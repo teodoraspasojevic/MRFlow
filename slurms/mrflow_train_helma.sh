@@ -60,7 +60,11 @@ from omegaconf import OmegaConf; print(OmegaConf.load('$CONFIG').output_dir)")
     export MRFLOW_UNDER_SRUN=1
     export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
     export MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
-    exec srun --ntasks-per-node=1 "$0" "$CONFIG"
+    # Re-exec by repo path, not "$0": sbatch spools the script to /var/tmp, which is node-local,
+    # so on a second node srun fails with execve(): No such file. Launched through `bash -l` rather
+    # than directly, so a missing exec bit cannot kill the job two seconds in with execve():
+    # Permission denied -- sbatch makes its own spooled copy executable, a repo checkout may not be.
+    exec srun --ntasks-per-node=1 bash -l "$PWD/slurms/mrflow_train_helma.sh" "$CONFIG"
 fi
 
 echo "Node $SLURM_NODEID/$NODES on $(hostname), master $MASTER_ADDR:$MASTER_PORT"
