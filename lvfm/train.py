@@ -393,7 +393,7 @@ def main():
                 cleanup_checkpoints(config, logger)
                 save_checkpoint(config, accelerator, logger, global_step, ema_denoiser)
 
-            if global_step >= config.max_train_steps:
+            if accelerator.sync_gradients and global_step >= config.max_train_steps:
                 break
 
             if accelerator.sync_gradients:
