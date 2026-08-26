@@ -107,9 +107,13 @@ def main():
     modality_id = torch.tensor([modality_to_id(args.modality)], device=device)
     plane_id = torch.tensor([plane_to_id(args.plane)], device=device)
 
+    # `is not None`, not `or`: a scale of 0.0 is falsy but meaningful -- it drops that guidance term
+    # entirely (s_rep=0 generates from modality alone), and `or` silently fell back to the config.
     guidance = config.get("guidance", {})
-    modality_cfg_scale = args.modality_cfg_scale or guidance.get("modality_cfg_scale", 1.0)
-    report_cfg_scale = args.report_cfg_scale or guidance.get("report_cfg_scale", 1.0)
+    modality_cfg_scale = (args.modality_cfg_scale if args.modality_cfg_scale is not None
+                          else guidance.get("modality_cfg_scale", 1.0))
+    report_cfg_scale = (args.report_cfg_scale if args.report_cfg_scale is not None
+                        else guidance.get("report_cfg_scale", 1.0))
 
     # Init generator
     generator = LatentAutoregressiveGenerator(

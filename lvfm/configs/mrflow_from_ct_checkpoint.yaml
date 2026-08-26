@@ -1,0 +1,234 @@
+# MRFlow from the CT checkpoint: MR-RATE report-to-volume, STDiT-L (512M) fine-tuned from the
+# released CTFlow weights. This is the run whose hyperparameters were measured rather than guessed.
+#
+# Every path is a real path on Helma -- no shell variables, so this file runs as-is, no envsubst.
+#
+#   sbatch --nodes=2 slurms/mrflow_train_helma.sh lvfm/configs/mrflow_from_ct_checkpoint.yaml
+#
+# 2 nodes x 4 h200, batch 16/GPU, accum 1 -> effective batch 128, ~0.58 s/step, so 60k steps is
+# ~9.7 h and fits one 24 h allocation. Measured, not estimated:
+#
+#   * batch 16/GPU is the ceiling -- 32 OOMs at 137 of 140 GiB, and 16 already uses 84.4 GiB
+#   * training is compute-bound at 96% GPU utilization, flat over 400 steps; reads are not a factor
+#   * multi-node scales at 97.9%, so node count is a wall-clock dial. Reach a larger effective batch
+#     by adding nodes, never by raising accum: accum only serializes microbatches on fewer GPUs
+#   * accum 1 also makes sync_gradients always true, so the final-checkpoint bug cannot arise at all
+#
+# lr 1e-4 comes from a 5-arm sweep at this exact effective batch, scored on held-out val at a fixed
+# timestep grid, relative flow loss where 1.0 is predict-zero:
+#
+#   CT init 0.1070 | 2e-5 0.0936 | 5e-5 0.0924 | 1e-4 0.0918 | 2e-4 0.0927 | 4e-4 diverged
+#
+# So 1e-4 is bracketed on both sides, and 4e-4 went NaN at step 4472 -- the cliff is only 4x above
+# the chosen lr, over a run 12x longer than the probe, so watch grad_norm early. Raising the
+# effective batch would invalidate this number: linear scaling puts the optimum near 2e-4, which
+# measured *worse* here. Change batch and lr together, or neither.
+#
+# Budget, measured on the 2-node probe and the sweep runs rather than estimated:
+#
+#   60000 steps x 0.580 s/step            9.7 h
+#   13 validations (every 5000 steps)     ~0.2 h   builds a VAE + a second denoiser, runs odeint
+#   13 checkpoints x 7.7 GB               ~0.1 h   100 GB written, 8 kept (62 GB)
+#   startup (init_from, 64 manifests)     ~3 min
+#   -------------------------------------------
+#   ~10 h against the partition's 24 h cap
+#
+# If it ever does overrun: `resume_from_checkpoint: latest` restores model, optimizer, scheduler,
+# EMA and global_step, and wandb rejoins the same run id, so a resubmission continues rather than
+# restarting. Nothing resubmits automatically -- this site sets Requeue=0 and --requeue would not
+# cover TIMEOUT anyway -- so chain a standby at submit time:
+#
+#   J=$(sbatch --parsable --nodes=2 slurms/mrflow_train_helma.sh <this config>)
+#   sbatch --nodes=2 --dependency=afternotok:$J slurms/mrflow_train_helma.sh <this config>
+#
+# afternotok fires only on timeout/failure/node-death; SLURM cancels the standby if J succeeds.
+
+globals:
+  target_fps: 32                # only the mp4/gif writer reads this; MR slices are not a time axis
+  target_nframes: 16            # latent slices per block == STDiT input_size[0]
+  outputs: ["video", "image"]   # unused: read by no interpolation and no Python (EchoSyn legacy)
+  resolution: 256               # in-plane image size fed to the VAE
+  latent_res: 32                # 256 / 8, the FLUX f8 in-plane latent size
+  latent_channels: 16
+  max_steps: 60_000
+
+max_train_steps: ${globals.max_steps}
+gradient_accumulation_steps: 1   # effective batch comes from 8 GPUs, not from accumulation
+mixed_precision: "bf16"
+use_ema: true
+max_grad_norm: 1.0
+max_grad_value: -1
+
+# Preprocessing stores both posterior parameters, so latents are 32 channels and every read draws
+# a fresh sample. Must stay true: false would silently take the first 16 channels -- the mean -- and
+# train on one frozen encoding per volume.
+sample_latents: true
+
+# Pixel-range constants. MR volumes are normalized to [0, 1], matching the range CTFlow's CT was
+# normalized to -- measured, not assumed: the CT checkpoint transfers 27x better to [0, 1] latents
+# than to [-1, 1] ones even after standardizing (tools/ctflow_transfer_check.py), while VAE
+# reconstruction is a tie between the two. The sequence boundaries -- an all-black seed block and an
+# all-white stop block -- are the ends of that range.
+decode_scale: 255.0
+decode_shift: 0.0
+black_value: 0.0
+white_value: 1.0
+
+# --- MR-RATE specific. Read by lvfm/preprocess_mrrate.py; the dataset reads dataset_root. ---
+mri:
+  raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
+  dataset_root: /hnvme/workspace/y100dc19-mrflow/data/mrflow_flux
+  text_checkpoint: /hnvme/workspace/y100dc19-nvidia-mri-brain/pretrained/BiomedVLP-CXR-BERT-specialized
+  text_max_length: 512          # CXR-BERT's context; longer reports are truncated head-first
+  vae_batch_size: 32            # slices per VAE forward
+  # Series selection. All ~576k eligible train series would be ~9 TB of latents and ~1300
+  # GPU-hours to encode; a 60k-step fine-tune at an effective batch of 64 sees 3.8M samples, so
+  # 120k series is already ~30 epochs. max_repeats drops MR-RATE's duplicate acquisitions
+  # (`t1w-raw-axi-2`, `-3`, ...). Raise or null these out to use more of the dataset.
+  max_repeats: 1
+  max_series_train: 120000
+  max_series_val: 2000
+  max_series_test: null         # uncapped: the test split is only needed for evaluation, not here
+  preprocess:
+    target_spacing: [1.0, 1.0, 1.0]
+    inplane_size: ${globals.resolution}
+    posterior_shift_mm: 15.0    # MR-RATE is defaced; a plain center crop would lose posterior brain
+    max_slices: 320
+    # 2 * target_nframes, so every kept volume can produce a start, interior and end example and
+    # the dataset needs no short-volume special case.
+    min_slices: 32
+
+denoiser:
+    target: echosyn.common.models.DiffuserSTDiT
+    args: # DiT-L, identical to the released checkpoint's config so init_from keys match exactly
+        input_size:
+          - ${globals.target_nframes}
+          - ${globals.latent_res}
+          - ${globals.latent_res}
+        in_channels: 32           # 16 target + 16 condition, concatenated on the channel dim
+        out_channels: ${globals.latent_channels}
+        patch_size: [2, 2, 2]
+        hidden_size: 1024
+        depth: 24
+        num_heads: 16
+        mlp_ratio: 4.0
+        class_dropout_prob: 0.0
+        drop_path: 0.0
+        no_temporal_pos_emb: false
+        caption_channels: 768     # one pooled CXR-BERT CLS vector
+        model_max_length: 1
+        space_scale: 1.0
+        time_scale: 1.0
+        enable_flashattn: false
+        num_modality_classes: 7   # CFG_NULL, T1w, T2w, FLAIR, SWI, MRA, UNKNOWN
+        num_plane_classes: 3      # AXIAL, SAGITTAL, CORONAL -- no null, plane is never guided
+
+optimizer:
+  target: torch.optim.AdamW
+  args:
+    lr: 1e-4                     # swept at effective batch 128; see the header
+    betas: [0.9, 0.999]
+    weight_decay: 1e-2
+    eps: 1e-08
+
+scheduler:
+  target: echosyn.common.schedulers.StepBasedLearningRateScheduleWithWarmup
+  args:
+    warmup_steps: 500            # short: the trunk is pretrained, not random
+    ref_steps: ${globals.max_steps}   # linked, not hardcoded: the CT config's own
+                                     # "remenber change ref_steps" footgun
+    eta_min: 1e-6
+    decay_rate: 2.0
+
+vae:
+  # Must be the checkpoint the latents were encoded with; get_vae_scaler reads scaling_factor and
+  # shift_factor out of its config.json.
+  target: diffusers.AutoencoderKL
+  pretrained: /hnvme/workspace/y100dc19-mrflow/models/flux-vae-f8-16ch
+
+datasets:
+    - name: MRRateLatentBlock
+      active: true
+      params:
+        root: ${mri.dataset_root}
+        split: train
+        block_size: ${globals.target_nframes}
+        p_start: 0.3             # matches the released checkpoint's own `black_rate_0.3`
+        p_end: 0.2
+
+val_datasets:
+    - name: MRRateLatentBlock
+      active: true
+      params:
+        root: ${mri.dataset_root}
+        split: val
+        block_size: ${globals.target_nframes}
+        p_start: 0.0             # validation compares real -> real blocks
+        p_end: 0.0
+        deterministic: true      # same examples at every validation step
+        seed: ${seed}
+
+dataloader:
+  target: torch.utils.data.DataLoader
+  args:
+    shuffle: true
+    batch_size: 16               # the OOM ceiling: 32 needs 137 of 140 GiB
+    num_workers: 16              # compute-bound at this rate, so this is headroom, not a limit
+    pin_memory: true
+    drop_last: true
+    persistent_workers: true
+
+noise_offset: 0.05
+noise_cond_image: 0.05
+no_conditionning: False
+p_drop_conditionning: 0.0        # previous-block dropout: an autoregressive trick, not semantic CFG
+
+# Semantic condition states, sampled per sample. Explicit rather than two independent Bernoulli
+# draws: independent dropout at 0.1/0.1 would leave only 1% fully-null, and that branch is the base
+# of the guidance expansion. Must sum to 1.
+condition_states:
+  full: 0.80                     # real modality, real report
+  modality_only: 0.10            # real modality, null report
+  semantic_null: 0.10            # CFG_NULL modality, null report
+
+# Inference guidance. 1.0/1.0 is exactly the fully conditional prediction, so these defaults
+# reproduce single-branch behaviour and cost one denoiser call instead of three.
+guidance:
+  modality_cfg_scale: 1.0
+  report_cfg_scale: 1.0
+
+output_dir: /hnvme/workspace/y100dc19-mrflow/experiments/${wandb_args.name}
+logging_dir: logs
+
+report_to: wandb
+wandb_args:
+  project: MRFlow
+  name: mrflow_from_ct_checkpoint
+  group: mrflow
+  id: mrflow_from_ct_checkpoint
+
+checkpointing_steps: 5_000
+# Eight retained checkpoints, 62 GB. Every entry must be a multiple of checkpointing_steps or it
+# is silently never created -- at checkpointing_steps: 2000 the 5000 and 55000 here would not have
+# existed. Saves happen every checkpointing_steps regardless; retention only controls deletion, and
+# cleanup_checkpoints always keeps `last_checkpoint` on top of this list, so crash recovery tracks
+# checkpointing_steps (5000 steps, ~48 min) however sparse the list is.
+# Step 0 is excluded: it is the unmodified CT init, already under models/ctflow.
+checkpoints_to_keep: [5000, 10000, 20000, 30000, 40000, 50000, 55000, 60000]
+
+# Weights only -> fresh optimizer, scheduler, EMA and step counter. A `resume_from_checkpoint`
+# restore still wins over this, so a requeued job continues rather than restarting the fine-tune.
+init_from: /hnvme/workspace/y100dc19-mrflow/models/ctflow/checkpoint-680000/denoiser_ema
+resume_from_checkpoint: latest
+if_fine_tuned: false
+
+validation:
+  samples: 4
+  steps: 5_000                   # ~60 s a fire (builds a VAE and a second denoiser, runs odeint),
+                                 # so 13 fires not 31. Divergence shows in the 10-step loss trace,
+                                 # not here, so this is monitoring cadence only.
+  timesteps: 25
+  frames: ${globals.target_nframes}
+  fps: ${globals.target_fps}
+
+seed: 42
