@@ -21,8 +21,8 @@ black_value: 0.0
 white_value: 1.0
 mri:
   raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
-  dataset_root: /hnvme/workspace/y100dc19-mrflow/data/mrflow_flux
-  text_checkpoint: /hnvme/workspace/y100dc19-nvidia-mri-brain/pretrained/BiomedVLP-CXR-BERT-specialized
+  dataset_root: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_flux
+  text_checkpoint: /hnvme/workspace/y100dc19-mrflow-final/models/BiomedVLP-CXR-BERT-specialized
   text_max_length: 512
   vae_batch_size: 32
   max_repeats: 1
@@ -83,7 +83,7 @@ scheduler:
     decay_rate: 2.0
 vae:
   target: diffusers.AutoencoderKL
-  pretrained: /hnvme/workspace/y100dc19-mrflow/models/flux-vae-f8-16ch
+  pretrained: /hnvme/workspace/y100dc19-mrflow-final/models/flux-vae-f8-16ch
 datasets:
 - name: MRRateLatentBlock
   active: true
@@ -124,7 +124,7 @@ condition_states:
 guidance:
   modality_cfg_scale: 1.0
   report_cfg_scale: 1.0
-output_dir: /hnvme/workspace/y100dc19-mrflow/experiments/${wandb_args.name}
+output_dir: /hnvme/workspace/y100dc19-mrflow-final/experiments/${wandb_args.name}
 logging_dir: logs
 report_to: wandb
 wandb_args:
@@ -135,7 +135,7 @@ wandb_args:
 checkpointing_steps: 10
 checkpoints_to_keep:
 - 20
-init_from: /hnvme/workspace/y100dc19-mrflow/models/ctflow/checkpoint-680000/denoiser_ema
+init_from: /hnvme/workspace/y100dc19-mrflow-final/models/ctflow/checkpoint-680000/denoiser_ema
 resume_from_checkpoint: latest
 if_fine_tuned: false
 validation:

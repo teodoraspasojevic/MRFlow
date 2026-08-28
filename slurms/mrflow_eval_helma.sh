@@ -7,10 +7,10 @@
 #   # ~1000 val cases, CT checkpoint with no fine-tuning at all (the zero-shot baseline row)
 #   sbatch --array=0-31 slurms/mrflow_eval_helma.sh \
 #       lvfm/configs/mrflow_STDiT-L2_16f8.yaml \
-#       /hnvme/workspace/y100dc19-mrflow/models/ctflow/checkpoint-680000/denoiser_ema \
-#       --split val --limit 32 --out /hnvme/workspace/y100dc19-mrflow/eval/ctflow_zeroshot
+#       /hnvme/workspace/y100dc19-mrflow-final/models/ctflow/checkpoint-680000/denoiser_ema \
+#       --split val --limit 32 --out /hnvme/workspace/y100dc19-mrflow-final/eval/ctflow_zeroshot
 #   sbatch slurms/mrflow_eval_helma.sh <same config> <same ckpt> \
-#       --split val --combine --out /hnvme/workspace/y100dc19-mrflow/eval/ctflow_zeroshot
+#       --split val --combine --out /hnvme/workspace/y100dc19-mrflow-final/eval/ctflow_zeroshot
 #
 # --limit is PER SHARD, so cases = array size * limit. --shard/--num_shards are derived from the
 # array here; everything after the ckpt is passed through to evaluation/main.py.
@@ -38,7 +38,7 @@ CONFIG=$1
 CKPT=$2
 shift 2
 
-VENV=/hnvme/workspace/y100dc19-mrflow/venv
+VENV=/hnvme/workspace/y100dc19-mrflow-final/venv
 
 export PYTHONPATH=$PWD:$PYTHONPATH
 export PYTHONFAULTHANDLER=1

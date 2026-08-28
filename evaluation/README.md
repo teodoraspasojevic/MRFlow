@@ -24,7 +24,7 @@ and walk away:
 ```bash
 CONFIG=<experiment>/config.yaml
 CKPT=<experiment>/checkpoint-N/denoiser_ema
-OUT=/hnvme/workspace/y100dc19-mrflow/eval/my_run
+OUT=/hnvme/workspace/y100dc19-mrflow-final/eval/my_run
 
 # 1. generate + score: 32 tasks in parallel, 32 cases each = 1024 cases
 JOB=$(sbatch --parsable --array=0-31 slurms/mrflow_eval_helma.sh \

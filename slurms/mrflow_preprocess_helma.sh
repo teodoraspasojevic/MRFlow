@@ -42,7 +42,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 # oversubscribe the node.
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-VENV=/hnvme/workspace/y100dc19-mrflow/venv
+VENV=/hnvme/workspace/y100dc19-mrflow-final/venv
 CONFIG=lvfm/configs/mrflow_STDiT-L2_16f8.yaml
 
 echo "[$(date)] shard $SHARD/$NUM_SHARDS split=$SPLIT"

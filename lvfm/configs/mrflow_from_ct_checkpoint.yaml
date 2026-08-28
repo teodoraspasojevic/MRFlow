@@ -77,8 +77,8 @@ white_value: 1.0
 # --- MR-RATE specific. Read by lvfm/preprocess_mrrate.py; the dataset reads dataset_root. ---
 mri:
   raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
-  dataset_root: /hnvme/workspace/y100dc19-mrflow/data/mrflow_flux
-  text_checkpoint: /hnvme/workspace/y100dc19-nvidia-mri-brain/pretrained/BiomedVLP-CXR-BERT-specialized
+  dataset_root: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_flux
+  text_checkpoint: /hnvme/workspace/y100dc19-mrflow-final/models/BiomedVLP-CXR-BERT-specialized
   text_max_length: 512          # CXR-BERT's context; longer reports are truncated head-first
   vae_batch_size: 32            # slices per VAE forward
   # Series selection. All ~576k eligible train series would be ~9 TB of latents and ~1300
@@ -86,8 +86,8 @@ mri:
   # 120k series is already ~30 epochs. max_repeats drops MR-RATE's duplicate acquisitions
   # (`t1w-raw-axi-2`, `-3`, ...). Raise or null these out to use more of the dataset.
   max_repeats: 1
-  max_series_train: 120000
-  max_series_val: 2000
+  max_series_train: null       # full split, as the final build was made
+  max_series_val: null
   max_series_test: null         # uncapped: the test split is only needed for evaluation, not here
   preprocess:
     target_spacing: [1.0, 1.0, 1.0]
@@ -144,7 +144,7 @@ vae:
   # Must be the checkpoint the latents were encoded with; get_vae_scaler reads scaling_factor and
   # shift_factor out of its config.json.
   target: diffusers.AutoencoderKL
-  pretrained: /hnvme/workspace/y100dc19-mrflow/models/flux-vae-f8-16ch
+  pretrained: /hnvme/workspace/y100dc19-mrflow-final/models/flux-vae-f8-16ch
 
 datasets:
     - name: MRRateLatentBlock
@@ -197,7 +197,7 @@ guidance:
   modality_cfg_scale: 1.0
   report_cfg_scale: 1.0
 
-output_dir: /hnvme/workspace/y100dc19-mrflow/experiments/${wandb_args.name}
+output_dir: /hnvme/workspace/y100dc19-mrflow-final/experiments/${wandb_args.name}
 logging_dir: logs
 
 report_to: wandb
@@ -218,7 +218,7 @@ checkpoints_to_keep: [5000, 10000, 20000, 30000, 40000, 50000, 55000, 60000]
 
 # Weights only -> fresh optimizer, scheduler, EMA and step counter. A `resume_from_checkpoint`
 # restore still wins over this, so a requeued job continues rather than restarting the fine-tune.
-init_from: /hnvme/workspace/y100dc19-mrflow/models/ctflow/checkpoint-680000/denoiser_ema
+init_from: /hnvme/workspace/y100dc19-mrflow-final/models/ctflow/checkpoint-680000/denoiser_ema
 resume_from_checkpoint: latest
 if_fine_tuned: false
 

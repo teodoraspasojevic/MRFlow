@@ -30,7 +30,7 @@ cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 mkdir -p logs
 
 CONFIG=${1:-lvfm/configs/mrflow_STDiT-L2_16f8.yaml}
-VENV=/hnvme/workspace/y100dc19-mrflow/venv
+VENV=/hnvme/workspace/y100dc19-mrflow-final/venv
 
 export PYTHONPATH=$PWD:$PYTHONPATH
 # No PYTHONNOUSERSITE: this venv layers on ~/.local, where diffusers/transformers/tqdm live.
