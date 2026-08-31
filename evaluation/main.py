@@ -77,6 +77,35 @@ def gt_latent(generator, config, nii_bytes, entry):
     return latent.unsqueeze(0).float().to(generator.device)
 
 
+### Case selection ###
+
+
+def select_cases(series, n_per_bucket):
+    """The first `n_per_bucket` cases of every (modality, plane) bucket, each bucket ordered by
+    `(study_uid, series_id)`.
+
+    `list_series` shuffles on a fixed seed, so its order is reproducible but not balanced: an
+    interleaved slice of it is whatever the split's modality mix happens to be. This instead
+    matches `R2V-MR-Generation`'s `select_eval_cases` -- ordered by a property of the data rather
+    than of the parquet rows, so no RNG is involved at all, and every prefix is bucket-balanced.
+    On MR-RATE's test split 10 of the 12 buckets hold a scored modality, so 100 per bucket is
+    1,000 scored cases: the population every R2V number was produced on.
+
+    Out-of-scope modalities (MRA) are capped like any other bucket rather than dropped, so
+    `n_excluded_out_of_scope_modality` still reports them. They cost nothing -- `is_scored` skips
+    them before the rollout.
+    """
+    buckets = {}
+    for entry in series:
+        buckets.setdefault((entry["modality"], entry["plane"]), []).append(entry)
+
+    selected = []
+    for key in sorted(buckets):
+        ordered = sorted(buckets[key], key=lambda e: (str(e["study_uid"]), str(e["series_id"])))
+        selected.extend(ordered[:n_per_bucket])
+    return selected
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate MRFlow on the VLM3D challenge metrics")
     parser.add_argument("--config", type=str, required=True,
@@ -89,6 +118,10 @@ def parse_args():
     parser.add_argument("--shard", type=int, default=0, help="This task's index.")
     parser.add_argument("--num_shards", type=int, default=1, help="Total number of tasks.")
     parser.add_argument("--limit", type=int, default=None, help="Stop after N cases of this shard.")
+    parser.add_argument("--n_per_bucket", type=int, default=None,
+                        help="Cases per (modality, plane) bucket, applied before sharding. "
+                             "100 reproduces the R2V-MR-Generation population (1,000 scored "
+                             "cases). Default: the whole split.")
     parser.add_argument("--max_blocks", type=int, default=None,
                         help="Rollout budget. Default: max_slices / target_nframes.")
     parser.add_argument("--examples", type=int, default=2,
@@ -127,9 +160,13 @@ def run_shard(config, args, out, device):
     mri = config.mri
     series = list_series(mri.raw_root, args.split, mri.max_repeats,
                          mri.get(f"max_series_{args.split}"), config.seed)
+    # Before the shard slice, so every task carves its cases out of the same selected population.
+    if args.n_per_bucket:
+        series = select_cases(series, args.n_per_bucket)
     series = series[args.shard::args.num_shards][:args.limit]
     print(f"[shard {args.shard}/{args.num_shards}] {len(series)} {args.split} cases, "
-          f"regime {args.regime}, max_blocks {args.max_blocks}")
+          f"regime {args.regime}, max_blocks {args.max_blocks}, "
+          f"n_per_bucket {args.n_per_bucket}")
 
     generator = build_generator(config, args.ckpt, device)
     tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
@@ -203,7 +240,7 @@ def log_wandb(config, args, metrics, out):
         group=config.wandb_args.group,
         mode="disabled" if args.no_wandb else os.environ.get("WANDB_MODE", "online"),
         config={"regime": args.regime, "split": args.split, "ckpt": args.ckpt,
-                "max_blocks": args.max_blocks},
+                "max_blocks": args.max_blocks, "n_per_bucket": args.n_per_bucket},
     )
     examples = sorted(glob(os.path.join(out, "examples", "*.mp4")))
     run.log({

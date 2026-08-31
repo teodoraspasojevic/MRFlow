@@ -12,8 +12,15 @@
 #   sbatch slurms/mrflow_eval_helma.sh <same config> <same ckpt> \
 #       --split val --combine --out /hnvme/workspace/y100dc19-mrflow-final/eval/ctflow_zeroshot
 #
-# --limit is PER SHARD, so cases = array size * limit. --shard/--num_shards are derived from the
-# array here; everything after the ckpt is passed through to evaluation/main.py.
+#   # the 1,000-scored-case comparison population, matching R2V-MR-Generation's N_PER_BUCKET=100
+#   sbatch --array=0-31 slurms/mrflow_eval_helma.sh \
+#       <experiment>/config.yaml <experiment>/checkpoint-60000/denoiser_ema \
+#       --split test --n_per_bucket 100 --out <out>
+#
+# --limit is PER SHARD, so cases = array size * limit. --n_per_bucket is NOT: it caps each
+# (modality, plane) bucket before the shards are cut, so the case list is the same at any array
+# size. --shard/--num_shards are derived from the array here; everything after the ckpt is passed
+# through to evaluation/main.py.
 #
 # Pass --out explicitly when the checkpoint is not from a finished experiment: the default is
 # <config output_dir>/eval/..., which for an un-run config would create the experiment directory.

@@ -37,6 +37,25 @@ sbatch --dependency=afterany:$JOB slurms/mrflow_eval_helma.sh \
 
 **`--limit` is per task**, so cases = array size × limit. Drop it to run the whole split.
 
+### Which cases: `--n_per_bucket`
+
+`--limit` slices `list_series`, which is shuffled on a fixed seed — reproducible, but whatever the
+split's modality mix happens to be. `--n_per_bucket N` instead takes the first `N` cases of every
+`(modality, plane)` bucket, each bucket ordered by `(study_uid, series_id)`. No RNG is involved at
+all, every prefix is bucket-balanced, and the cap is applied **before** sharding, so the shard count
+does not change which cases run.
+
+**`--n_per_bucket 100` is the comparison population.** It is what `R2V-MR-Generation`'s
+`select_eval_cases` does, at the `N_PER_BUCKET=100` every number in that repo was produced at. On
+MR-RATE's `test` split it selects 1,010 cases, of which **1,000 are scored** — 10 of the 12 buckets
+hold an in-scope modality, and the 10 MRA cases are counted as
+`n_excluded_out_of_scope_modality` rather than dropped. Its per-bucket caveat carries over too: the
+2.5D FID compares 512-d covariances, so at 100 per bucket only the pooled numbers are trustworthy.
+
+Sampler noise is seeded per case (`config.seed + case_id`), not per position, so a rerun — or the
+same case under a different shard count — draws the same noise and scores the same. `config.seed`
+is 42, the same base seed the R2V runs used.
+
 **Why two commands.** Each array task scores its own slice and writes `shard-NNNN.pt`. None of them
 knows it is the last to finish, so the totalling has to be a separate job that starts afterwards.
 FID also cannot be averaged per shard — `combine` pools the raw features across all of them.
