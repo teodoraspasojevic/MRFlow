@@ -38,8 +38,9 @@ from tqdm import tqdm
 import wandb
 from echosyn.common import *
 from echosyn.common.mrrate import (build_text_encoder, encode_conditioning, encode_volume,
-                                   list_series, load_native_volume, modality_to_id, plane_to_id,
-                                   preprocess_volume, read_member, read_report, sample_id)
+                                   list_series, load_native_volume, modality_to_id, plane_order,
+                                   plane_to_id, preprocess_volume, read_member, read_report,
+                                   sample_id)
 from auto_regressive_generate import LatentAutoregressiveGenerator
 from evaluation import METRIC_KEYS, ChallengeAccumulator, combine, comparison_frames
 
@@ -106,6 +107,37 @@ def select_cases(series, n_per_bucket):
     return selected
 
 
+def save_case(root, bucket, case_id, real, produced, report, entry, spacing):
+    """One case's ground truth, generated volume and report, for offline inspection.
+
+    Both volumes are written in the plane-first axis order the metric compares them in, with a
+    diagonal affine built from `plane_order`-permuted spacing -- `read_canonical` returns spacing
+    in `(S, R, A)` while `load_native_volume` permutes only the array, so the two have to be
+    realigned here or a viewer shows the wrong aspect ratio. The generated volume is 1 mm isotropic
+    by construction.
+
+    **The shapes differ on purpose.** `compute_basic_metrics` zooms the generated volume onto the
+    ground truth's shape rather than resampling the reference, so what is written here is what each
+    side actually was, not a registered pair.
+    """
+    import nibabel as nib
+
+    directory = os.path.join(root, f"{bucket}-{case_id}")
+    os.makedirs(directory, exist_ok=True)
+    gt_spacing = [spacing[i] for i in plane_order(entry["plane"])]
+    nib.save(nib.Nifti1Image(real, np.diag(gt_spacing + [1.0])),
+             os.path.join(directory, "ground_truth.nii.gz"))
+    nib.save(nib.Nifti1Image(produced, np.eye(4)),
+             os.path.join(directory, "generated.nii.gz"))
+    with open(os.path.join(directory, "case.json"), "w") as handle:
+        json.dump({"case_id": case_id, "bucket": bucket, "modality": entry["modality"],
+                   "plane": entry["plane"], "study_uid": entry["study_uid"],
+                   "series_id": entry["series_id"],
+                   "gt_shape": list(real.shape), "gt_spacing_mm": gt_spacing,
+                   "generated_shape": list(produced.shape), "generated_spacing_mm": [1.0, 1.0, 1.0],
+                   "report": report}, handle, indent=2)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate MRFlow on the VLM3D challenge metrics")
     parser.add_argument("--config", type=str, required=True,
@@ -126,6 +158,10 @@ def parse_args():
                         help="Rollout budget. Default: max_slices / target_nframes.")
     parser.add_argument("--examples", type=int, default=2,
                         help="Ground-truth-vs-generated mp4s this shard keeps, for W&B.")
+    parser.add_argument("--save_volumes", type=int, default=0,
+                        help="Cases of this shard to write to <out>/volumes/ as ground_truth."
+                             "nii.gz + generated.nii.gz + case.json (report included). Off by "
+                             "default: a native-geometry volume is ~150 MB before compression.")
     parser.add_argument("--overwrite", action="store_true", help="Re-run an existing shard.")
     parser.add_argument("--combine", action="store_true",
                         help="Pool the shards already in --out into metrics.json and log to W&B.")
@@ -175,6 +211,7 @@ def run_shard(config, args, out, device):
     examples_left = args.examples
     if examples_left:
         os.makedirs(os.path.join(out, "examples"), exist_ok=True)
+    volumes_left = args.save_volumes
 
     for entry in tqdm(series, disable=None):
         case_id = sample_id(entry["study_uid"], entry["series_id"])
@@ -189,9 +226,10 @@ def run_shard(config, args, out, device):
         torch.manual_seed(config.seed + int(case_id, 16) % 2 ** 31)
         try:
             nii_bytes = read_member(entry["archive"], entry["member"])
-            real, _ = load_native_volume(nii_bytes, entry["plane"])
+            real, spacing = load_native_volume(nii_bytes, entry["plane"])
+            report = read_report(entry["archive"], entry["study_uid"])
             embedding = encode_conditioning(
-                tokenizer, text_encoder, read_report(entry["archive"], entry["study_uid"]),
+                tokenizer, text_encoder, report,
                 entry["modality"], entry["plane"], max_length=mri.text_max_length,
             )
             embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
@@ -211,6 +249,11 @@ def run_shard(config, args, out, device):
             continue
 
         accumulator.add(case_id, bucket, entry["modality"], real, produced)
+
+        if volumes_left > 0:
+            volumes_left -= 1
+            save_case(os.path.join(out, "volumes"), bucket, case_id, real, produced, report,
+                      entry, spacing)
 
         if examples_left > 0:
             examples_left -= 1
@@ -233,14 +276,24 @@ def log_wandb(config, args, metrics, out):
     """The metrics table, the run summary and the scalars, plus whatever example mp4s the shards
     kept. Table row order is METRIC_KEYS -- FID average first, then PSNR/SSIM/MSE, then the
     per-plane FIDs -- which is the order the R2V-MR-Generation baseline logs, so the two models'
-    runs read side by side."""
+    runs read side by side.
+
+    The guidance scales go in the run *name* as well as the config. A cfg sweep is several runs
+    over one checkpoint that differ in nothing else, so without them in the label the run table is
+    a column of identical names -- and at 1.0/1.0 the sampler takes its single-conditional
+    short-circuit, i.e. no guidance at all, which is worth being able to see at a glance."""
+    guidance = config.guidance
     run = wandb.init(
         project=config.wandb_args.project,
-        name=f"eval-{args.regime}-{args.split}-{config.wandb_args.name}",
+        name=f"eval-{args.regime}-{args.split}"
+             f"-mod{guidance.modality_cfg_scale:g}-rep{guidance.report_cfg_scale:g}"
+             f"-{config.wandb_args.name}",
         group=config.wandb_args.group,
         mode="disabled" if args.no_wandb else os.environ.get("WANDB_MODE", "online"),
         config={"regime": args.regime, "split": args.split, "ckpt": args.ckpt,
-                "max_blocks": args.max_blocks, "n_per_bucket": args.n_per_bucket},
+                "max_blocks": args.max_blocks, "n_per_bucket": args.n_per_bucket,
+                "modality_cfg_scale": guidance.modality_cfg_scale,
+                "report_cfg_scale": guidance.report_cfg_scale},
     )
     examples = sorted(glob(os.path.join(out, "examples", "*.mp4")))
     run.log({
