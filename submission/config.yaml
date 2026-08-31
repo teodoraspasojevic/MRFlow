@@ -1,0 +1,181 @@
+globals:
+  target_fps: 32
+  target_nframes: 16
+  outputs:
+  - video
+  - image
+  resolution: 256
+  latent_res: 32
+  latent_channels: 16
+  max_steps: 60000
+max_train_steps: ${globals.max_steps}
+gradient_accumulation_steps: 1
+mixed_precision: bf16
+use_ema: true
+max_grad_norm: 1.0
+max_grad_value: -1
+sample_latents: true
+decode_scale: 255.0
+decode_shift: 0.0
+black_value: 0.0
+white_value: 1.0
+mri:
+  raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
+  dataset_root: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_flux
+  text_checkpoint: /hnvme/workspace/y100dc19-mrflow-final/models/BiomedVLP-CXR-BERT-specialized
+  text_max_length: 512
+  vae_batch_size: 32
+  max_repeats: 1
+  max_series_train: null
+  max_series_val: null
+  max_series_test: null
+  preprocess:
+    target_spacing:
+    - 1.0
+    - 1.0
+    - 1.0
+    inplane_size: ${globals.resolution}
+    posterior_shift_mm: 15.0
+    max_slices: 320
+    min_slices: 32
+denoiser:
+  target: echosyn.common.models.DiffuserSTDiT
+  args:
+    input_size:
+    - ${globals.target_nframes}
+    - ${globals.latent_res}
+    - ${globals.latent_res}
+    in_channels: 32
+    out_channels: ${globals.latent_channels}
+    patch_size:
+    - 2
+    - 2
+    - 2
+    hidden_size: 1024
+    depth: 24
+    num_heads: 16
+    mlp_ratio: 4.0
+    class_dropout_prob: 0.0
+    drop_path: 0.0
+    no_temporal_pos_emb: false
+    caption_channels: 768
+    model_max_length: 1
+    space_scale: 1.0
+    time_scale: 1.0
+    enable_flashattn: false
+    num_modality_classes: 7
+    num_plane_classes: 3
+optimizer:
+  target: torch.optim.AdamW
+  args:
+    lr: 0.0001
+    betas:
+    - 0.9
+    - 0.999
+    weight_decay: 0.01
+    eps: 1.0e-08
+scheduler:
+  target: echosyn.common.schedulers.StepBasedLearningRateScheduleWithWarmup
+  args:
+    warmup_steps: 500
+    ref_steps: ${globals.max_steps}
+    eta_min: 1.0e-06
+    decay_rate: 2.0
+vae:
+  target: diffusers.AutoencoderKL
+  pretrained: /hnvme/workspace/y100dc19-mrflow-final/models/flux-vae-f8-16ch
+datasets:
+- name: MRRateLatentBlock
+  active: true
+  params:
+    root: ${mri.dataset_root}
+    split: train
+    block_size: ${globals.target_nframes}
+    p_start: 0.3
+    p_end: 0.2
+val_datasets:
+- name: MRRateLatentBlock
+  active: true
+  params:
+    root: ${mri.dataset_root}
+    split: val
+    block_size: ${globals.target_nframes}
+    p_start: 0.0
+    p_end: 0.0
+    deterministic: true
+    seed: ${seed}
+dataloader:
+  target: torch.utils.data.DataLoader
+  args:
+    shuffle: true
+    batch_size: 16
+    num_workers: 16
+    pin_memory: true
+    drop_last: true
+    persistent_workers: true
+noise_offset: 0.05
+noise_cond_image: 0.05
+no_conditionning: false
+p_drop_conditionning: 0.0
+condition_states:
+  full: 0.8
+  modality_only: 0.1
+  semantic_null: 0.1
+guidance:
+  modality_cfg_scale: 1.0
+  report_cfg_scale: 1.0
+output_dir: /hnvme/workspace/y100dc19-mrflow-final/experiments/${wandb_args.name}
+logging_dir: logs
+report_to: wandb
+wandb_args:
+  project: MRFlow
+  name: mrflow_from_ct_checkpoint
+  group: mrflow
+  id: mrflow_from_ct_checkpoint
+checkpointing_steps: 5000
+checkpoints_to_keep:
+- 5000
+- 10000
+- 20000
+- 30000
+- 40000
+- 50000
+- 55000
+- 60000
+init_from: /hnvme/workspace/y100dc19-mrflow-final/models/ctflow/checkpoint-680000/denoiser_ema
+resume_from_checkpoint: null
+if_fine_tuned: false
+validation:
+  samples: 4
+  steps: 5000
+  timesteps: 25
+  frames: ${globals.target_nframes}
+  fps: ${globals.target_fps}
+seed: 42
+num_train_epochs: 14
+labels:
+  modality_to_id:
+    CFG_NULL: 0
+    T1w: 1
+    T2w: 2
+    FLAIR: 3
+    SWI: 4
+    MRA: 5
+    UNKNOWN: 6
+  modality_aliases:
+    t1w: T1w
+    t1: T1w
+    t2w: T2w
+    t2: T2w
+    flair: FLAIR
+    swi: SWI
+    swan: SWI
+    mra: MRA
+    unknown: UNKNOWN
+  num_modality_classes: 7
+  cfg_null_modality_id: 0
+  plane_to_id:
+    AXIAL: 0
+    SAGITTAL: 1
+    CORONAL: 2
+  num_plane_classes: 3

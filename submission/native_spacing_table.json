@@ -1,0 +1,837 @@
+{
+ "schema": "mrrate-native-spacing/2",
+ "source": {
+  "shards_root": "/hnvme/workspace/y100dc19-MR-Rate-raw",
+  "split": "train",
+  "n_series": 575536,
+  "n_shards": 3407,
+  "n_skipped": 2339,
+  "plane_codes_seen": {
+   "axi": 302355,
+   "sag": 167124,
+   "cor": 108537
+  },
+  "fields_read": [
+   "modality",
+   "plane",
+   "shape",
+   "spacing"
+  ],
+  "orientation_field_read": false,
+  "thickness_step_mm": 0.5
+ },
+ "buckets": {
+  "FLAIR|axi": {
+   "n_series": 54964,
+   "median_native_fov_mm_sorted": [
+    162,
+    230,
+    230
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.43079,
+     "count": 23678
+    },
+    {
+     "value": 6.0,
+     "share": 0.22304,
+     "count": 12259
+    },
+    {
+     "value": 5.0,
+     "share": 0.17479,
+     "count": 9607
+    },
+    {
+     "value": 6.5,
+     "share": 0.08688,
+     "count": 4775
+    },
+    {
+     "value": 7.0,
+     "share": 0.04043,
+     "count": 2222
+    },
+    {
+     "value": 4.5,
+     "share": 0.02005,
+     "count": 1102
+    },
+    {
+     "value": 5.5,
+     "share": 0.01414,
+     "count": 777
+    },
+    {
+     "value": 0.5,
+     "share": 0.00511,
+     "count": 281
+    }
+   ],
+   "coverage_top3": 0.8286
+  },
+  "FLAIR|cor": {
+   "n_series": 26793,
+   "median_native_fov_mm_sorted": [
+    210,
+    250,
+    250
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.86437,
+     "count": 23159
+    },
+    {
+     "value": 6.5,
+     "share": 0.02616,
+     "count": 701
+    },
+    {
+     "value": 6.0,
+     "share": 0.02463,
+     "count": 660
+    },
+    {
+     "value": 5.5,
+     "share": 0.0218,
+     "count": 584
+    },
+    {
+     "value": 4.0,
+     "share": 0.01911,
+     "count": 512
+    },
+    {
+     "value": 1.5,
+     "share": 0.01306,
+     "count": 350
+    },
+    {
+     "value": 7.0,
+     "share": 0.00967,
+     "count": 259
+    },
+    {
+     "value": 0.5,
+     "share": 0.00728,
+     "count": 195
+    }
+   ],
+   "coverage_top3": 0.9152
+  },
+  "FLAIR|sag": {
+   "n_series": 62825,
+   "median_native_fov_mm_sorted": [
+    176,
+    250,
+    250
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.388,
+     "count": 24376
+    },
+    {
+     "value": 0.5,
+     "share": 0.38306,
+     "count": 24066
+    },
+    {
+     "value": 6.0,
+     "share": 0.15233,
+     "count": 9570
+    },
+    {
+     "value": 1.5,
+     "share": 0.05867,
+     "count": 3686
+    },
+    {
+     "value": 6.5,
+     "share": 0.01248,
+     "count": 784
+    },
+    {
+     "value": 7.0,
+     "share": 0.00153,
+     "count": 96
+    },
+    {
+     "value": 5.0,
+     "share": 0.00131,
+     "count": 82
+    },
+    {
+     "value": 3.5,
+     "share": 0.00083,
+     "count": 52
+    }
+   ],
+   "coverage_top3": 0.9234
+  },
+  "SWI|axi": {
+   "n_series": 61763,
+   "median_native_fov_mm_sorted": [
+    144,
+    230,
+    230
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.31768,
+     "count": 19621
+    },
+    {
+     "value": 2.0,
+     "share": 0.2398,
+     "count": 14811
+    },
+    {
+     "value": 1.5,
+     "share": 0.14781,
+     "count": 9129
+    },
+    {
+     "value": 3.5,
+     "share": 0.1402,
+     "count": 8659
+    },
+    {
+     "value": 3.0,
+     "share": 0.08529,
+     "count": 5268
+    },
+    {
+     "value": 5.0,
+     "share": 0.05877,
+     "count": 3630
+    },
+    {
+     "value": 4.0,
+     "share": 0.0056,
+     "count": 346
+    },
+    {
+     "value": 2.5,
+     "share": 0.00465,
+     "count": 287
+    }
+   ],
+   "coverage_top3": 0.7053
+  },
+  "SWI|cor": {
+   "n_series": 4,
+   "median_native_fov_mm_sorted": [
+    160,
+    230,
+    230
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.5,
+     "count": 2
+    },
+    {
+     "value": 5.0,
+     "share": 0.25,
+     "count": 1
+    },
+    {
+     "value": 2.0,
+     "share": 0.25,
+     "count": 1
+    }
+   ],
+   "coverage_top3": 1.0
+  },
+  "SWI|sag": {
+   "n_series": 2,
+   "median_native_fov_mm_sorted": [
+    141,
+    230,
+    230
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.5,
+     "share": 0.5,
+     "count": 1
+    },
+    {
+     "value": 1.0,
+     "share": 0.5,
+     "count": 1
+    }
+   ],
+   "coverage_top3": 1.0
+  },
+  "T1w|axi": {
+   "n_series": 92866,
+   "median_native_fov_mm_sorted": [
+    174,
+    240,
+    240
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.42642,
+     "count": 39600
+    },
+    {
+     "value": 6.0,
+     "share": 0.22643,
+     "count": 21028
+    },
+    {
+     "value": 5.0,
+     "share": 0.11746,
+     "count": 10908
+    },
+    {
+     "value": 6.5,
+     "share": 0.09783,
+     "count": 9085
+    },
+    {
+     "value": 4.0,
+     "share": 0.03367,
+     "count": 3127
+    },
+    {
+     "value": 7.0,
+     "share": 0.02548,
+     "count": 2366
+    },
+    {
+     "value": 4.5,
+     "share": 0.02121,
+     "count": 1970
+    },
+    {
+     "value": 3.5,
+     "share": 0.01847,
+     "count": 1715
+    }
+   ],
+   "coverage_top3": 0.7703
+  },
+  "T1w|cor": {
+   "n_series": 39414,
+   "median_native_fov_mm_sorted": [
+    212,
+    240,
+    240
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.82628,
+     "count": 32567
+    },
+    {
+     "value": 6.5,
+     "share": 0.0515,
+     "count": 2030
+    },
+    {
+     "value": 6.0,
+     "share": 0.04965,
+     "count": 1957
+    },
+    {
+     "value": 5.0,
+     "share": 0.02032,
+     "count": 801
+    },
+    {
+     "value": 1.5,
+     "share": 0.01735,
+     "count": 684
+    },
+    {
+     "value": 5.5,
+     "share": 0.01322,
+     "count": 521
+    },
+    {
+     "value": 0.5,
+     "share": 0.00721,
+     "count": 284
+    },
+    {
+     "value": 4.5,
+     "share": 0.0054,
+     "count": 213
+    }
+   ],
+   "coverage_top3": 0.9274
+  },
+  "T1w|sag": {
+   "n_series": 77773,
+   "median_native_fov_mm_sorted": [
+    180,
+    250,
+    250
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.74753,
+     "count": 58138
+    },
+    {
+     "value": 6.0,
+     "share": 0.08655,
+     "count": 6731
+    },
+    {
+     "value": 6.5,
+     "share": 0.07631,
+     "count": 5935
+    },
+    {
+     "value": 0.5,
+     "share": 0.04027,
+     "count": 3132
+    },
+    {
+     "value": 3.5,
+     "share": 0.01634,
+     "count": 1271
+    },
+    {
+     "value": 1.5,
+     "share": 0.00939,
+     "count": 730
+    },
+    {
+     "value": 7.0,
+     "share": 0.00903,
+     "count": 702
+    },
+    {
+     "value": 4.5,
+     "share": 0.00652,
+     "count": 507
+    }
+   ],
+   "coverage_top3": 0.9104
+  },
+  "T2w|axi": {
+   "n_series": 91569,
+   "median_native_fov_mm_sorted": [
+    158,
+    220,
+    230
+   ],
+   "thickness_mm": [
+    {
+     "value": 6.0,
+     "share": 0.25915,
+     "count": 23730
+    },
+    {
+     "value": 5.0,
+     "share": 0.23892,
+     "count": 21878
+    },
+    {
+     "value": 4.5,
+     "share": 0.22757,
+     "count": 20838
+    },
+    {
+     "value": 6.5,
+     "share": 0.11567,
+     "count": 10592
+    },
+    {
+     "value": 4.0,
+     "share": 0.05811,
+     "count": 5321
+    },
+    {
+     "value": 3.0,
+     "share": 0.03747,
+     "count": 3431
+    },
+    {
+     "value": 7.0,
+     "share": 0.02666,
+     "count": 2441
+    },
+    {
+     "value": 3.5,
+     "share": 0.01663,
+     "count": 1523
+    }
+   ],
+   "coverage_top3": 0.7256
+  },
+  "T2w|cor": {
+   "n_series": 41712,
+   "median_native_fov_mm_sorted": [
+    175,
+    214,
+    220
+   ],
+   "thickness_mm": [
+    {
+     "value": 6.0,
+     "share": 0.3722,
+     "count": 15525
+    },
+    {
+     "value": 5.5,
+     "share": 0.22881,
+     "count": 9544
+    },
+    {
+     "value": 5.0,
+     "share": 0.15701,
+     "count": 6549
+    },
+    {
+     "value": 6.5,
+     "share": 0.11074,
+     "count": 4619
+    },
+    {
+     "value": 4.0,
+     "share": 0.06113,
+     "count": 2550
+    },
+    {
+     "value": 4.5,
+     "share": 0.03481,
+     "count": 1452
+    },
+    {
+     "value": 3.5,
+     "share": 0.01484,
+     "count": 619
+    },
+    {
+     "value": 7.0,
+     "share": 0.01482,
+     "count": 618
+    }
+   ],
+   "coverage_top3": 0.758
+  },
+  "T2w|sag": {
+   "n_series": 25851,
+   "median_native_fov_mm_sorted": [
+    152,
+    234,
+    250
+   ],
+   "thickness_mm": [
+    {
+     "value": 6.0,
+     "share": 0.43546,
+     "count": 11257
+    },
+    {
+     "value": 6.5,
+     "share": 0.22409,
+     "count": 5793
+    },
+    {
+     "value": 5.0,
+     "share": 0.10247,
+     "count": 2649
+    },
+    {
+     "value": 4.0,
+     "share": 0.08479,
+     "count": 2192
+    },
+    {
+     "value": 5.5,
+     "share": 0.05508,
+     "count": 1424
+    },
+    {
+     "value": 3.5,
+     "share": 0.02592,
+     "count": 670
+    },
+    {
+     "value": 4.5,
+     "share": 0.02271,
+     "count": 587
+    },
+    {
+     "value": 7.0,
+     "share": 0.01903,
+     "count": 492
+    }
+   ],
+   "coverage_top3": 0.762
+  },
+  "T1w|__pooled__": {
+   "n_series": 210053,
+   "median_native_fov_mm_sorted": [
+    182,
+    240,
+    250
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.62034,
+     "count": 130305
+    },
+    {
+     "value": 6.0,
+     "share": 0.14147,
+     "count": 29716
+    },
+    {
+     "value": 6.5,
+     "share": 0.08117,
+     "count": 17050
+    },
+    {
+     "value": 5.0,
+     "share": 0.05708,
+     "count": 11990
+    },
+    {
+     "value": 0.5,
+     "share": 0.01888,
+     "count": 3965
+    },
+    {
+     "value": 4.0,
+     "share": 0.01557,
+     "count": 3270
+    },
+    {
+     "value": 7.0,
+     "share": 0.01511,
+     "count": 3173
+    },
+    {
+     "value": 3.5,
+     "share": 0.01438,
+     "count": 3020
+    }
+   ],
+   "coverage_top3": 0.843
+  },
+  "T2w|__pooled__": {
+   "n_series": 159132,
+   "median_native_fov_mm_sorted": [
+    160,
+    220,
+    230
+   ],
+   "thickness_mm": [
+    {
+     "value": 6.0,
+     "share": 0.31742,
+     "count": 50512
+    },
+    {
+     "value": 5.0,
+     "share": 0.19528,
+     "count": 31076
+    },
+    {
+     "value": 4.5,
+     "share": 0.14376,
+     "count": 22877
+    },
+    {
+     "value": 6.5,
+     "share": 0.13199,
+     "count": 21004
+    },
+    {
+     "value": 5.5,
+     "share": 0.07694,
+     "count": 12243
+    },
+    {
+     "value": 4.0,
+     "share": 0.06324,
+     "count": 10063
+    },
+    {
+     "value": 3.0,
+     "share": 0.02265,
+     "count": 3604
+    },
+    {
+     "value": 7.0,
+     "share": 0.02231,
+     "count": 3551
+    }
+   ],
+   "coverage_top3": 0.6565
+  },
+  "FLAIR|__pooled__": {
+   "n_series": 144582,
+   "median_native_fov_mm_sorted": [
+    180,
+    250,
+    250
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.49254,
+     "count": 71213
+    },
+    {
+     "value": 0.5,
+     "share": 0.16974,
+     "count": 24542
+    },
+    {
+     "value": 6.0,
+     "share": 0.15554,
+     "count": 22489
+    },
+    {
+     "value": 5.0,
+     "share": 0.06804,
+     "count": 9838
+    },
+    {
+     "value": 6.5,
+     "share": 0.0433,
+     "count": 6260
+    },
+    {
+     "value": 1.5,
+     "share": 0.02834,
+     "count": 4098
+    },
+    {
+     "value": 7.0,
+     "share": 0.01782,
+     "count": 2577
+    },
+    {
+     "value": 5.5,
+     "share": 0.00949,
+     "count": 1372
+    }
+   ],
+   "coverage_top3": 0.8178
+  },
+  "SWI|__pooled__": {
+   "n_series": 61769,
+   "median_native_fov_mm_sorted": [
+    144,
+    230,
+    230
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.3177,
+     "count": 19624
+    },
+    {
+     "value": 2.0,
+     "share": 0.2398,
+     "count": 14812
+    },
+    {
+     "value": 1.5,
+     "share": 0.14781,
+     "count": 9130
+    },
+    {
+     "value": 3.5,
+     "share": 0.14018,
+     "count": 8659
+    },
+    {
+     "value": 3.0,
+     "share": 0.08529,
+     "count": 5268
+    },
+    {
+     "value": 5.0,
+     "share": 0.05878,
+     "count": 3631
+    },
+    {
+     "value": 4.0,
+     "share": 0.0056,
+     "count": 346
+    },
+    {
+     "value": 2.5,
+     "share": 0.00465,
+     "count": 287
+    }
+   ],
+   "coverage_top3": 0.7053
+  },
+  "__pooled__|__pooled__": {
+   "n_series": 575536,
+   "median_native_fov_mm_sorted": [
+    174,
+    240,
+    240
+   ],
+   "thickness_mm": [
+    {
+     "value": 1.0,
+     "share": 0.385,
+     "count": 221582
+    },
+    {
+     "value": 6.0,
+     "share": 0.17849,
+     "count": 102728
+    },
+    {
+     "value": 5.0,
+     "share": 0.09823,
+     "count": 56535
+    },
+    {
+     "value": 6.5,
+     "share": 0.077,
+     "count": 44314
+    },
+    {
+     "value": 0.5,
+     "share": 0.04955,
+     "count": 28517
+    },
+    {
+     "value": 4.5,
+     "share": 0.04648,
+     "count": 26749
+    },
+    {
+     "value": 1.5,
+     "share": 0.02783,
+     "count": 16020
+    },
+    {
+     "value": 2.0,
+     "share": 0.02648,
+     "count": 15239
+    }
+   ],
+   "coverage_top3": 0.6617
+  }
+ }
+}

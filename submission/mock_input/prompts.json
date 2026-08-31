@@ -1,0 +1,26 @@
+[
+  {
+    "input_image_name": "TESTSTUDY01_t1w-raw-sag",
+    "report": "44-year-old female: Findings: Supratentorial and infratentorial parenchymal structures show normal signal intensity. No diffusion restriction suggesting acute infarction. Ventricular system and cortical sulci are within normal limits for age. No extra-axial collection. Impression: Normal brain MRI."
+  },
+  {
+    "input_image_name": "TESTSTUDY01_t1w-raw-sag-2",
+    "report": "44-year-old female: Findings: Supratentorial and infratentorial parenchymal structures show normal signal intensity. No diffusion restriction suggesting acute infarction. Ventricular system and cortical sulci are within normal limits for age. No extra-axial collection. Impression: Normal brain MRI."
+  },
+  {
+    "input_image_name": "TESTSTUDY01_flair-raw-sag",
+    "report": "44-year-old female: Findings: Supratentorial and infratentorial parenchymal structures show normal signal intensity. No diffusion restriction suggesting acute infarction. Ventricular system and cortical sulci are within normal limits for age. No extra-axial collection. Impression: Normal brain MRI."
+  },
+  {
+    "input_image_name": "TESTSTUDY01_swi-raw-axi",
+    "report": "44-year-old female: Findings: Supratentorial and infratentorial parenchymal structures show normal signal intensity. No diffusion restriction suggesting acute infarction. Ventricular system and cortical sulci are within normal limits for age. No extra-axial collection. Impression: Normal brain MRI."
+  },
+  {
+    "input_image_name": "TESTSTUDY02_t2w-raw-cor",
+    "report": "67-year-old male: Findings: Multiple T2 and FLAIR hyperintense foci are seen in the bilateral periventricular and deep white matter, consistent with chronic ischemic gliotic changes. Mild cortical atrophy with widening of the cortical sulci. No acute diffusion restriction. Impression: Chronic ischemic white matter disease. Age-related cortical atrophy."
+  },
+  {
+    "input_image_name": "TESTSTUDY02_t1w-raw-obl",
+    "report": "67-year-old male: Findings: Multiple T2 and FLAIR hyperintense foci are seen in the bilateral periventricular and deep white matter, consistent with chronic ischemic gliotic changes. Mild cortical atrophy with widening of the cortical sulci. No acute diffusion restriction. Impression: Chronic ischemic white matter disease. Age-related cortical atrophy."
+  }
+]
