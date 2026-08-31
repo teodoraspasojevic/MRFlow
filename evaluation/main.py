@@ -10,9 +10,10 @@ needed and `test` works the same as `val`:
                    volume. NOT resampled, normalized or cropped: the official metric normalizes
                    both volumes itself and resamples the *generated* one onto this shape, which is
                    exactly what the leaderboard does to a submission.
-    cases          `list_series`, the same deterministic, deduplicated series list preprocessing
-                   uses -- so `n_total_files` counts eligible MR-RATE series rather than the files
-                   in the platform's ground-truth directory.
+    cases          `list_series` at `max_repeats=1` -- eligible MR-RATE series, one acquisition
+                   per contrast and plane, so `n_total_files` counts series rather than the files
+                   in the platform's ground-truth directory. Deduplicating here and not from
+                   `mri.max_repeats` is deliberate; see `run_shard`.
     conditioning   CXR-BERT over the study's report plus the series' acquisition markers -- the
                    same `encode_conditioning` call preprocessing makes, so the embedding the model
                    sees here is the one it trained against.
@@ -90,7 +91,8 @@ def select_cases(series, n_per_bucket):
     matches `R2V-MR-Generation`'s `select_eval_cases` -- ordered by a property of the data rather
     than of the parquet rows, so no RNG is involved at all, and every prefix is bucket-balanced.
     On MR-RATE's test split 10 of the 12 buckets hold a scored modality, so 100 per bucket is
-    1,000 scored cases: the population every R2V number was produced on.
+    1,000 scored cases -- measured to be R2V's set exactly, case for case, and its full-split
+    population likewise (29,016 scored series both sides).
 
     Out-of-scope modalities (MRA) are capped like any other bucket rather than dropped, so
     `n_excluded_out_of_scope_modality` still reports them. They cost nothing -- `is_scored` skips
@@ -194,7 +196,7 @@ def build_generator(config, ckpt, device):
 def run_shard(config, args, out, device):
     """Generate and score this shard's slice of the split; write its state for `--combine`."""
     mri = config.mri
-    series = list_series(mri.raw_root, args.split, mri.max_repeats,
+    series = list_series(mri.raw_root, args.split, 1,
                          mri.get(f"max_series_{args.split}"), config.seed)
     # Before the shard slice, so every task carves its cases out of the same selected population.
     if args.n_per_bucket:

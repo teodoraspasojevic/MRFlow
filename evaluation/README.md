@@ -49,8 +49,14 @@ does not change which cases run.
 `select_eval_cases` does, at the `N_PER_BUCKET=100` every number in that repo was produced at. On
 MR-RATE's `test` split it selects 1,010 cases, of which **1,000 are scored** — 10 of the 12 buckets
 hold an in-scope modality, and the 10 MRA cases are counted as
-`n_excluded_out_of_scope_modality` rather than dropped. Its per-bucket caveat carries over too: the
-2.5D FID compares 512-d covariances, so at 100 per bucket only the pooled numbers are trustworthy.
+`n_excluded_out_of_scope_modality` rather than dropped. Those 1,000 are R2V's 1,000, case for case:
+`run_shard` calls `list_series` with `max_repeats=1` rather than the config's `mri.max_repeats`, so
+one acquisition per (study, contrast, plane) is eligible — the same cohort R2V's
+`series_selection="one_per_study_per_bucket"` builds, on the full split too (29,016 scored series
+either way). With the config's `max_repeats: null` the duplicate acquisitions
+(`t1w-raw-axi-2`, `-3`, …) crowd out other studies and only 868 of the 1,000 match. Its per-bucket
+caveat carries over too: the 2.5D FID compares 512-d covariances, so at 100 per bucket only the
+pooled numbers are trustworthy.
 
 Sampler noise is seeded per case (`config.seed + case_id`), not per position, so a rerun — or the
 same case under a different shard count — draws the same noise and scores the same. `config.seed`
