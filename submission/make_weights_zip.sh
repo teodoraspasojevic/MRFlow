@@ -46,6 +46,15 @@ if ! ls "$STAGE/BiomedVLP-CXR-BERT-specialized"/*.safetensors >/dev/null 2>&1; t
     exit 1
 fi
 
+# rsync from Helma preserves the source's own mode bits, and checkpoint-60000/denoiser_ema's
+# safetensors file came across as `-rw-------` (owner-only) -- fine on this host, but the platform
+# (and this script's own docker-run test) runs the container as a non-root `appuser` that doesn't
+# match whichever uid unzips /weights, so an owner-only file inside the zip is unreadable there.
+# Confirmed reproducible: `PermissionError` loading denoiser_ema/diffusion_pytorch_model.safetensors
+# under `docker run` before this normalization was added.
+find "$STAGE" -type f -exec chmod 644 {} +
+find "$STAGE" -type d -exec chmod 755 {} +
+
 mkdir -p "$OUT_DIR"
 ZIP="${OUT_DIR}/mrflow_weights.zip"
 rm -f "$ZIP"

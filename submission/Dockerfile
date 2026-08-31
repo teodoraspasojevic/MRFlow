@@ -104,8 +104,16 @@ ENV PYTHONPATH=/opt/app \
 # large FID win, for the same reason it applies here: FID_2p5D never resamples, so a generated
 # volume's always-~1mm slice grid is otherwise scored against native 4-6.5mm 2D acquisitions on a
 # mismatched grid. Set to "off" to write the generated grid unchanged (the A/B control).
-ENV MRFLOW_MODALITY_CFG_SCALE=1.0 \
-    MRFLOW_REPORT_CFG_SCALE=1.0 \
+#
+# The two cfg scales are build ARGs, not hardcoded, so a cfg sweep is `--build-arg
+# MODALITY_CFG_SCALE=.. --build-arg REPORT_CFG_SCALE=..` per combination rather than a hand-edited
+# Dockerfile per image -- and because they're declared this late, every layer above (apt, conda,
+# the whole pip install) stays cache-hit across the whole sweep; only this ENV layer and the COPY
+# layers below it rebuild per combination.
+ARG MODALITY_CFG_SCALE=1.0
+ARG REPORT_CFG_SCALE=1.0
+ENV MRFLOW_MODALITY_CFG_SCALE=${MODALITY_CFG_SCALE} \
+    MRFLOW_REPORT_CFG_SCALE=${REPORT_CFG_SCALE} \
     MRFLOW_NATIVE_SPACING_MODE=sample \
     MRFLOW_NATIVE_SPACING_TOPK=8 \
     MRFLOW_OUTPUT_DTYPE=float32
