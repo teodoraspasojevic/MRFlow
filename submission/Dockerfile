@@ -11,7 +11,22 @@
 # torch.cuda.is_available() silently returns False and the run burns its whole time budget on CPU.
 # MRFlow's cross-attention (xformers' memory_efficient_attention) has no CPU kernel either way, so
 # this must fail loudly instead -- see entrypoint.sh's sanity check.
-FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
+#
+# CUDA 12.1.1, not 12.8 -- confirmed the hard way (mrflow_submission_mod1-rep1's first submission,
+# 2026-08-31): a cu128 image (nvidia/cuda:12.8.1-runtime-ubuntu22.04) produced exactly this
+# entrypoint FATAL on the real platform, twice, while an R2V-MR-Generation submission running
+# concurrently on the same platform -- same driver-detection mechanism, same immediate
+# torch.cuda.is_available() check, no retry in either -- succeeded. The one confirmed difference
+# between the two images' base layers: each nvidia/cuda tag declares (`NVIDIA_REQUIRE_CUDA` in the
+# base image's own ENV) which host driver *bands* its CUDA runtime accepts, and they are discrete
+# bands, not a simple floor -- 12.8.1-runtime lists driver 470.x, 535.x, 550.x, 560.x, 565.x;
+# 12.1.1-cudnn8-runtime lists 470.x and 525.x. If the platform's nodes run driver 525.x (a common,
+# stable cloud choice, and the version R2V's proven-working image explicitly targets), that band is
+# simply absent from the 12.8 image's list -- nvidia-container-cli then declines to expose the GPU,
+# which surfaces to PyTorch as a clean, silent `torch.cuda.is_available() == False`, independent of
+# GPU count. Matching R2V's exact base tag (and, below, its exact torch/torchvision/cudnn pins) is
+# the safest fix: it is the version already proven to negotiate this platform's driver.
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -31,32 +46,57 @@ RUN curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-py312_25.1.1-2-Lin
     && rm /tmp/conda.sh
 ENV PATH="/opt/conda/bin:${PATH}"
 
-# Versions pinned to the exact set MRFlow's own dev environment resolved (MRFlow/.venv, python
-# 3.12.3, cu128) -- see the CLAUDE.md gotcha on VAE/init_from sensitivity: floating any of these
-# is a different environment than the one the checkpoint was produced and locally evaluated under.
-# torch/torchvision/xformers must come from the same cu128 build line, hence one --index-url call.
-RUN pip install --no-cache-dir \
-        torch==2.10.0 torchvision==0.25.0 xformers==0.0.35 \
-        --index-url https://download.pytorch.org/whl/cu128 \
+# torch/torchvision/cudnn pins copied verbatim from R2V-MR-Generation/submission/dockerfiles/
+# Dockerfile (its own comment there explains the --no-deps + explicit nvidia-cudnn-cu12==9.1.1.17:
+# torch==2.5.1+cu121's wheel metadata pins nvidia-cudnn-cu12==9.1.0.70 exactly, and that patch
+# build has been pulled from the index -- 9.1.1.17 is the same 9.1.x line, one patch up, otherwise
+# byte-identical). This is the proven-on-this-platform combination (see the FROM comment above),
+# so it is reused exactly rather than re-derived. xformers is NOT part of R2V's own stack (it uses
+# monai, not xformers), so its pin below is new: 0.0.28.post3 is the xformers release built
+# against torch 2.5.1, per its own published torch/xformers compatibility matrix, installed from
+# the same cu121 index as torch so the CUDA build lines cannot mismatch.
+RUN pip install --no-cache-dir --no-deps \
+        torch==2.5.1 torchvision==0.20.1 \
+        --index-url https://download.pytorch.org/whl/cu121 \
     && pip install --no-cache-dir \
-        diffusers==0.39.0 \
-        transformers==5.15.1 \
+        filelock typing-extensions networkx jinja2 fsspec pillow setuptools \
+        sympy==1.13.1 \
+        triton==3.1.0 \
+        nvidia-cuda-nvrtc-cu12==12.1.105 \
+        nvidia-cuda-runtime-cu12==12.1.105 \
+        nvidia-cuda-cupti-cu12==12.1.105 \
+        nvidia-cudnn-cu12==9.1.1.17 \
+        nvidia-cublas-cu12==12.1.3.1 \
+        nvidia-cufft-cu12==11.0.2.54 \
+        nvidia-curand-cu12==10.3.2.106 \
+        nvidia-cusolver-cu12==11.4.5.107 \
+        nvidia-cusparse-cu12==12.1.0.106 \
+        nvidia-nccl-cu12==2.21.5 \
+        nvidia-nvtx-cu12==12.1.105 \
+        --index-url https://download.pytorch.org/whl/cu121 \
+    && pip install --no-cache-dir \
+        xformers==0.0.28.post3 \
+        --index-url https://download.pytorch.org/whl/cu121 \
+    && pip install --no-cache-dir \
+        diffusers==0.31.0 \
+        transformers==5.14.1 \
         tokenizers==0.22.2 \
         safetensors==0.8.0 \
-        huggingface-hub==1.28.0 \
-        accelerate==1.14.0 \
-        wandb==0.28.2 \
+        huggingface-hub==1.23.0 \
+        accelerate==1.1.1 \
+        wandb==0.18.5 \
         torchdiffeq==0.2.5 \
         einops==0.8.2 \
-        timm==1.0.28 \
+        timm==0.9.16 \
         omegaconf==2.3.1 \
         nibabel==5.4.2 \
-        numpy==2.5.2 \
+        numpy==2.5.1 \
         scipy==1.18.0 \
-        opencv-python-headless==5.0.0.93 \
+        scikit-image==0.26.0 \
+        opencv-python-headless \
         imageio==2.37.4 \
         imageio-ffmpeg==0.6.0 \
-        Pillow==11.3.0 \
+        Pillow \
         pyarrow \
         tqdm \
     && conda clean -afy \
