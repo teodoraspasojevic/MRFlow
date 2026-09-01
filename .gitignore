@@ -45,3 +45,6 @@ debug/
 tests/
 
 .forithmus
+
+/submission/submit_persistent.sh
+/submission/submit_with_retry.sh
