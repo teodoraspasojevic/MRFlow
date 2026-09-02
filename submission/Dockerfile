@@ -150,14 +150,33 @@ ENV PYTHONPATH=/opt/app \
 # Dockerfile per image -- and because they're declared this late, every layer above (apt, conda,
 # the whole pip install) stays cache-hit across the whole sweep; only this ENV layer and the COPY
 # layers below it rebuild per combination.
+# MRFLOW_BATCH_SIZE: how many volumes predict.py's main loop batches into one shared
+# generate_rollout() call (one Euler integration per block, covering every member at once) --
+# see auto_regressive_generate.LatentAutoregressiveGenerator.generate_rollout and the batch-size
+# sweep in submission/README.md for the measured throughput-vs-batch-size curve this value was
+# picked from. A build ARG like the two cfg scales, so it can be swept via --build-arg without
+# hand-editing the Dockerfile, and declared late enough that the whole pip-install layer above
+# stays cache-hit across the sweep.
+#
+# MRFLOW_USE_BF16=1: run the denoiser in bfloat16 autocast rather than fp32 -- the same
+# --mixed_precision bf16 regime training itself uses (see CLAUDE.md), so this is not a new
+# numerical regime for the checkpoint, just skipped at inference until now.
+#
+# MRFLOW_USE_COMPILE=1: torch.compile(dynamic=True) on the denoiser via
+# auto_regressive_generate.safe_compile, which suppresses dynamo errors and falls back to eager on
+# any compile failure -- safe to enable unconditionally, worst case is no speedup.
 ARG MODALITY_CFG_SCALE=1.0
 ARG REPORT_CFG_SCALE=1.0
+ARG BATCH_SIZE=16
 ENV MRFLOW_MODALITY_CFG_SCALE=${MODALITY_CFG_SCALE} \
     MRFLOW_REPORT_CFG_SCALE=${REPORT_CFG_SCALE} \
+    MRFLOW_BATCH_SIZE=${BATCH_SIZE} \
     MRFLOW_MAX_BLOCKS=16 \
     MRFLOW_NATIVE_SPACING_MODE=sample \
     MRFLOW_NATIVE_SPACING_TOPK=8 \
-    MRFLOW_OUTPUT_DTYPE=float32
+    MRFLOW_OUTPUT_DTYPE=float32 \
+    MRFLOW_USE_BF16=1 \
+    MRFLOW_USE_COMPILE=1
 
 WORKDIR /opt/app
 RUN mkdir -p /opt/app/models /input /output /checkpoint \

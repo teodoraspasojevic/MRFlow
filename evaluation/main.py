@@ -55,7 +55,8 @@ from evaluation import METRIC_KEYS, ChallengeAccumulator, combine, comparison_fr
 
 def full_body(generator, embedding, labels, max_blocks, gt_latent):
     """Report-to-volume: seed from the black boundary token, roll out until the white one."""
-    return generator.generate(embedding, *labels, max_blocks=max_blocks)
+    latent, _lengths = generator.generate(embedding, *labels, max_blocks=max_blocks)
+    return latent
 
 
 def gt_head(generator, embedding, labels, max_blocks, gt_latent):
@@ -63,8 +64,9 @@ def gt_head(generator, embedding, labels, max_blocks, gt_latent):
     # gt_latent() carries both posterior parameters; scaling it whole would scale the stds too.
     first_block = sample_latents(generator.config, gt_latent()[:, :, :generator.block_size])
     first_block = scale_latents(first_block, generator.vae_scaling)
-    return generator.generate(embedding, *labels, max_blocks=max_blocks - 1,
-                              gt_first_block=first_block)
+    latent, _lengths = generator.generate(embedding, *labels, max_blocks=max_blocks - 1,
+                                          gt_first_block=first_block)
+    return latent
 
 
 REGIMES = {"full-body": full_body, "gt-head": gt_head}

@@ -308,6 +308,9 @@ def build_generator(config, device: str):
         block_size=config.globals.target_nframes,
         modality_cfg_scale=env_float("MRFLOW_MODALITY_CFG_SCALE", config.guidance.modality_cfg_scale),
         report_cfg_scale=env_float("MRFLOW_REPORT_CFG_SCALE", config.guidance.report_cfg_scale),
+        ode_steps=env_int("MRFLOW_ODE_STEPS", 201),
+        use_bf16=env_str("MRFLOW_USE_BF16", "1") == "1",
+        use_compile=env_str("MRFLOW_USE_COMPILE", "1") == "1",
     )
     return generator, tokenizer, text_encoder
 
@@ -390,52 +393,88 @@ def main() -> int:
                          config.mri.preprocess.max_slices // config.globals.target_nframes)
     base_seed = env_int("MRFLOW_SEED", config.seed)
     dtype = np.dtype(env_str("MRFLOW_OUTPUT_DTYPE", "float32"))
+    batch_size = env_int("MRFLOW_BATCH_SIZE", 1)
 
     device = f"cuda:{local_rank}" if is_ddp else env_str("MRFLOW_DEVICE", "cuda")
     generator, tokenizer, text_encoder = build_generator(config, device)
     print(f"[rank {rank}] modality_cfg_scale={generator.modality_cfg_scale} "
-          f"report_cfg_scale={generator.report_cfg_scale} max_blocks={max_blocks}")
+          f"report_cfg_scale={generator.report_cfg_scale} max_blocks={max_blocks} "
+          f"batch_size={batch_size}")
 
-    # Striped, disjoint slice of the (1-indexed) prompt list -- rank 0 gets prompts 1, 1+N, ...
+    # Striped, disjoint slice of the (1-indexed) prompt list -- rank 0 gets prompts 1, 1+N, ...,
+    # then chunked into groups of batch_size (batch_size=1 is the original one-case-at-a-time
+    # loop, unchanged). A batch shares one Euler integration per block across every member --
+    # the expensive part -- but everything after generation (decode, native-spacing, save) stays
+    # a per-volume inner loop: native_spacing.to_native_grid takes one 3D array and one thickness
+    # target, and different volumes in a batch generally need different targets (different
+    # bucket, different per-case draw, different natural length), so it can't be vectorized
+    # across the batch -- see submission/README.md.
     my_prompts = list(enumerate(prompts, start=1))[rank::world_size]
-    for index, (case_id, report) in my_prompts:
-        filename = f"{case_id}.nii.gz"
-        if filename in done:
+    for batch_start in range(0, len(my_prompts), batch_size):
+        chunk = my_prompts[batch_start:batch_start + batch_size]
+        chunk = [(idx, cid, rpt) for idx, (cid, rpt) in chunk if f"{cid}.nii.gz" not in done]
+        if not chunk:
             continue
 
-        modality, plane = modality_plane_for(case_id)
-        sections = split_sections(report)
+        embeds, mod_ids, plane_ids, modalities, planes = [], [], [], [], []
+        for _, case_id, report in chunk:
+            modality, plane = modality_plane_for(case_id)
+            sections = split_sections(report)
+            embedding = encode_conditioning(tokenizer, text_encoder, sections, modality, plane,
+                                            max_length=config.mri.text_max_length)
+            embedding = embedding / (embedding.norm(p=2) + 1e-6)
+            embeds.append(embedding)
+            mod_ids.append(modality_to_id(modality))
+            plane_ids.append(plane_to_id(plane))
+            modalities.append(modality)
+            planes.append(plane)
 
-        torch.manual_seed(seed_for_case(case_id, base_seed))
-        embedding = encode_conditioning(tokenizer, text_encoder, sections, modality, plane,
-                                        max_length=config.mri.text_max_length)
-        embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
-        modality_id = torch.tensor([modality_to_id(modality)], device=device)
-        plane_id = torch.tensor([plane_to_id(plane)], device=device)
+        # encode_conditioning already returns [1, D] (the tokenizer's own batch-of-1 leading dim),
+        # so stacking N of them along a new leading dim gives exactly [N, 1, D] -- no extra
+        # unsqueeze needed (that would wrongly produce [N, 1, 1, D]).
+        embeds_batch = torch.stack(embeds).to(device)  # [N, 1, D]
+        mod_batch = torch.tensor(mod_ids, device=device)
+        plane_batch = torch.tensor(plane_ids, device=device)
 
-        case_started = time.time()
-        latent = generator.generate(embedding, modality_id, plane_id, max_blocks=max_blocks)
-        if latent.shape[2] == 0:
-            raise RuntimeError(f"{case_id}: every generated slice was a stop frame")
-        volume = generator.decode_latent(latent)[0, 0].numpy().astype(np.float32)  # (T, H, W)
+        # One shared seed for the whole batch -- a single torch.randn draw covers every member
+        # of a batched block, so per-case seeding (the batch_size=1 behaviour) isn't possible
+        # once N > 1. Deterministic in the batch's own case ids, so a resumed run with the same
+        # batch grouping reproduces the same noise; a different batch_size draws different noise
+        # for the same case, an inherent (and documented) trade-off of batching, not a bug.
+        batch_seed_key = "|".join(cid for _, cid, _ in chunk)
+        torch.manual_seed(seed_for_case(batch_seed_key, base_seed))
 
-        spacing_by_axis = (1.0, 1.0, 1.0)
-        note = f"grid={volume.shape} slice_spacing=1.00mm"
-        if native_table is not None:
-            target = native_table.draw(modality, plane, case_id)
-            volume, slice_spacing, info = to_native_grid(volume, target["thickness_mm"])
-            spacing_by_axis = (slice_spacing, 1.0, 1.0)
-            note = (f"grid {info['source_slices']}->{info['target_slices']} "
-                    f"drew {target['thickness_mm']:.1f}mm got {info['slice_spacing_mm']:.2f}mm "
-                    f"bucket={target['bucket']}")
+        batch_started = time.time()
+        # padded_latents is [N, C, T, H, W], T padded to the longest sample in this chunk;
+        # lengths[i] is sample i's own valid frame count (see generate()/trim_stop_frames).
+        padded_latents, lengths = generator.generate(embeds_batch, mod_batch, plane_batch,
+                                                      max_blocks=max_blocks)
 
-        affine = build_affine(plane, spacing_by_axis, volume.shape)
-        nib.save(nib.Nifti1Image(volume.astype(dtype, copy=False), affine), OUTPUT_DIR / filename)
-        mark_done(filename, done, done_file, backup_dir)
+        for i, ((index, case_id, _), modality, plane) in enumerate(zip(chunk, modalities, planes)):
+            filename = f"{case_id}.nii.gz"
+            if lengths[i] == 0:
+                raise RuntimeError(f"{case_id}: every generated slice was a stop frame")
+            latent = padded_latents[i:i + 1, :, :lengths[i]]
+            volume = generator.decode_latent(latent)[0, 0].numpy().astype(np.float32)  # (T, H, W)
 
-        elapsed = time.time() - case_started
-        print(f"[rank {rank}][{index}/{len(prompts)}] {case_id} {modality} {plane} "
-              f"{note} {elapsed:.1f}s")
+            spacing_by_axis = (1.0, 1.0, 1.0)
+            note = f"grid={volume.shape} slice_spacing=1.00mm"
+            if native_table is not None:
+                target = native_table.draw(modality, plane, case_id)
+                volume, slice_spacing, info = to_native_grid(volume, target["thickness_mm"])
+                spacing_by_axis = (slice_spacing, 1.0, 1.0)
+                note = (f"grid {info['source_slices']}->{info['target_slices']} "
+                        f"drew {target['thickness_mm']:.1f}mm got {info['slice_spacing_mm']:.2f}mm "
+                        f"bucket={target['bucket']}")
+
+            affine = build_affine(plane, spacing_by_axis, volume.shape)
+            nib.save(nib.Nifti1Image(volume.astype(dtype, copy=False), affine), OUTPUT_DIR / filename)
+            mark_done(filename, done, done_file, backup_dir)
+            print(f"[rank {rank}][{index}/{len(prompts)}] {case_id} {modality} {plane} {note}")
+
+        elapsed = time.time() - batch_started
+        print(f"[rank {rank}] batch of {len(chunk)} finished in {elapsed:.1f}s "
+              f"({elapsed / len(chunk):.1f}s/volume)")
 
     if is_ddp:
         import torch.distributed as dist
