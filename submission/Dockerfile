@@ -31,6 +31,7 @@ FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl bzip2 ca-certificates \
+        gcc g++ \
         libsm6 libxext6 libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -167,7 +168,7 @@ ENV PYTHONPATH=/opt/app \
 # any compile failure -- safe to enable unconditionally, worst case is no speedup.
 ARG MODALITY_CFG_SCALE=1.0
 ARG REPORT_CFG_SCALE=1.0
-ARG BATCH_SIZE=16
+ARG BATCH_SIZE=2
 ENV MRFLOW_MODALITY_CFG_SCALE=${MODALITY_CFG_SCALE} \
     MRFLOW_REPORT_CFG_SCALE=${REPORT_CFG_SCALE} \
     MRFLOW_BATCH_SIZE=${BATCH_SIZE} \

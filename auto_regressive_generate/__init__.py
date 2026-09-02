@@ -210,7 +210,7 @@ class LatentAutoregressiveGenerator:
             def rhs(t, y):
                 return self.velocity(t, y, prompt_embeds, prev_latent, modality_id, plane_id)
 
-            timesteps = torch.linspace(1.0, 0.0, steps=self.ode_steps, device=self.device, dtype=self.dtype)
+            timesteps = torch.linspace(1.0, 0.0, steps=self.ode_steps, device=self.device, dtype=torch.float32)
             start_time = time.time()
             new_block = odeint(
                 rhs,
