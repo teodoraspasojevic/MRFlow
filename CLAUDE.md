@@ -72,6 +72,19 @@ The array size is the shard count (`SLURM_ARRAY_TASK_COUNT`), each task writes
 Sharding matters: a full-body rollout is 20 blocks of 201 Euler steps, so a 2,000-case val sweep is
 days on one GPU. [`evaluation/README.md`](evaluation/README.md) covers the pipeline and the metrics.
 
+**The rollout is one case at a time, fp32, 201 Euler steps — everywhere.** `evaluation/main.py`,
+`auto_regressive_generate/main.py` and `submission/predict.py` all drive
+`LatentAutoregressiveGenerator` the same way, and the only speed switches are `use_compile`
+(`--compile`, on in evaluation, off in the debug script, `MRFLOW_USE_COMPILE` in the container) and
+`use_bf16` (`--bf16`, off in both scripts, `MRFLOW_USE_BF16` in the container). The asymmetry is
+deliberate: measured, `torch.compile` adds nothing to the numerical drift (`1.91e-2` relative
+velocity difference with bf16 on, against `1.90e-2` for bf16 alone), while bf16 puts a rollout
+`23.6 dB` from its fp32 counterpart — same distribution, different draw. Batched rollouts were
+tried (another ~1.7x per volume, saturating by batch 2) and **removed**, because a batch draws all
+of its noise in one call: noise can then only be seeded per batch, so a rerun under a different
+grouping generates different volumes. bf16 applies to the denoiser only; the VAE encode/decode
+stays fp32 in every path.
+
 ### Configs are not directly runnable
 
 `lvfm/configs/*.yaml` contain **shell** variables (`${LATTE_TRAIN_DATA_ROOT}`, `${LATTE_EMBEDDING_ROOT}`, `${LATTE_VALID_DATA_ROOT}`, `${LATTE_VALID_EMBEDDING_ROOT}`) that OmegaConf will *not* resolve. `trainer_helma.sh` runs `envsubst` over the config into a per-node temp copy before launching. Running `train.py` on a raw config only works if those four vars are exported in the environment — otherwise OmegaConf raises on interpolation. `vae.pretrained` and `output_dir` are also literal `/path/to/...` placeholders that must be edited. The SLURM scripts likewise carry `YOUR_PROXY` / `YOUR_EMAIL` / `/path/to/tmi_container.sif` placeholders.

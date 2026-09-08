@@ -26,7 +26,8 @@ from pathlib import Path
 import numpy as np
 
 _HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(_HERE))  # native_spacing.py lives alongside this file
+HELPERS_DIR = _HERE / "helpers"  # the grid-rewriting helpers and their survey tables
+sys.path.insert(0, str(_HERE))  # so `helpers.*` imports below resolve next to this file
 
 # ---- container layout (FORITHMUS_* env vars are authoritative when the platform sets them) ----
 INPUT_DIR = Path(os.environ.get("FORITHMUS_INPUT", "/input"))
@@ -268,11 +269,13 @@ def resolve_dir(name_env: str, default_name: str) -> Path:
 
 
 def resolve_baked(name_env: str, default_name: str) -> Path:
-    """A small file baked into the image (config.yaml, native_spacing_table.json), overridable
-    through /weights or /opt/app/models the same way a checkpoint is."""
+    """A small file baked into the image -- config.yaml next to this script, the two spacing
+    tables in helpers/ -- overridable through /weights or /opt/app/models the same way a checkpoint
+    is. Both directories are searched under the bare name, so the env overrides take the same value
+    they did when the tables sat next to predict.py."""
     name = env_str(name_env, default_name)
     candidates = ([Path(name)] if Path(name).is_absolute()
-                  else [_HERE / name, MODELS_DIR / name, WEIGHTS_DIR / name])
+                  else [_HERE / name, HELPERS_DIR / name, MODELS_DIR / name, WEIGHTS_DIR / name])
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -308,7 +311,6 @@ def build_generator(config, device: str):
         block_size=config.globals.target_nframes,
         modality_cfg_scale=env_float("MRFLOW_MODALITY_CFG_SCALE", config.guidance.modality_cfg_scale),
         report_cfg_scale=env_float("MRFLOW_REPORT_CFG_SCALE", config.guidance.report_cfg_scale),
-        ode_steps=env_int("MRFLOW_ODE_STEPS", 201),
         use_bf16=env_str("MRFLOW_USE_BF16", "1") == "1",
         use_compile=env_str("MRFLOW_USE_COMPILE", "1") == "1",
     )
@@ -337,9 +339,9 @@ _PLANE_DIRECTION = {
 
 def build_affine(plane: str, spacing_by_axis: tuple[float, float, float], shape: tuple[int, ...]):
     """4x4 NIfTI affine for a `(T, H, W)` array in the axis order `plane` implies, mapping voxel
-    indices to RAS mm with the volume centered on the origin. `spacing_by_axis` is per array axis
-    (axis0 may differ from 1.0 mm after native-spacing slab-averaging; axes 1/2 are always the
-    model's native 1 mm)."""
+    indices to RAS mm with the volume centered on the origin. `spacing_by_axis` is per array axis:
+    axis0 may differ from the model's native 1 mm after native-spacing slab-averaging, and axes 1/2
+    after in-plane spline upsampling."""
     directions = _PLANE_DIRECTION[plane]
     affine = np.eye(4)
     for axis in range(3):
@@ -363,7 +365,9 @@ def main() -> int:
 
     from echosyn.common import check_label_mapping
     from echosyn.common.mrrate import encode_conditioning, modality_to_id, plane_to_id
-    from native_spacing import DEFAULT_MODE, DEFAULT_TOP_K, MODES, NativeSpacingTable, to_native_grid
+    from helpers.inplane_resample import InplaneSpacingTable, to_inplane_grid
+    from helpers.native_spacing import (DEFAULT_MODE, DEFAULT_TOP_K, MODES, NativeSpacingTable,
+                                        to_native_grid)
 
     prompts = read_prompts(INPUT_DIR)  # same file, same parse, identical on every rank
     done_file, backup_dir = checkpoint_paths(rank, world_size)
@@ -389,92 +393,91 @@ def main() -> int:
     else:
         print(f"[rank {rank}] native-spacing mode=off -- writing the generated 1mm grid unchanged")
 
+    # A separate axis from the slice-axis rewrite above, with its own on/off switch rather than
+    # being bundled into MRFLOW_NATIVE_SPACING_MODE -- see inplane_resample.py. Both tables are
+    # loaded here, before the model, so a missing or malformed one fails in the first seconds
+    # rather than after the first volumes are already written.
+    inplane_mode = env_str("MRFLOW_INPLANE_MODE", DEFAULT_MODE)
+    if inplane_mode not in MODES:
+        raise SystemExit(f"MRFLOW_INPLANE_MODE={inplane_mode!r} must be one of {MODES}")
+    inplane_table = None
+    if inplane_mode != "off":
+        inplane_table_path = resolve_baked("MRFLOW_INPLANE_SPACING_TABLE",
+                                           "inplane_spacing_table.json")
+        inplane_table = InplaneSpacingTable.load(
+            inplane_table_path, top_k=env_int("MRFLOW_INPLANE_TOPK", DEFAULT_TOP_K),
+            mode=inplane_mode)
+        print(f"[rank {rank}] inplane-spacing table={inplane_table_path} mode={inplane_mode} "
+              f"top_k={inplane_table.top_k}")
+    else:
+        print(f"[rank {rank}] inplane mode=off -- leaving the generated 256^2 1mm grid unchanged")
+
     max_blocks = env_int("MRFLOW_MAX_BLOCKS",
                          config.mri.preprocess.max_slices // config.globals.target_nframes)
     base_seed = env_int("MRFLOW_SEED", config.seed)
     dtype = np.dtype(env_str("MRFLOW_OUTPUT_DTYPE", "float32"))
-    batch_size = env_int("MRFLOW_BATCH_SIZE", 1)
 
     device = f"cuda:{local_rank}" if is_ddp else env_str("MRFLOW_DEVICE", "cuda")
     generator, tokenizer, text_encoder = build_generator(config, device)
     print(f"[rank {rank}] modality_cfg_scale={generator.modality_cfg_scale} "
-          f"report_cfg_scale={generator.report_cfg_scale} max_blocks={max_blocks} "
-          f"batch_size={batch_size}")
+          f"report_cfg_scale={generator.report_cfg_scale} max_blocks={max_blocks}")
 
-    # Striped, disjoint slice of the (1-indexed) prompt list -- rank 0 gets prompts 1, 1+N, ...,
-    # then chunked into groups of batch_size (batch_size=1 is the original one-case-at-a-time
-    # loop, unchanged). A batch shares one Euler integration per block across every member --
-    # the expensive part -- but everything after generation (decode, native-spacing, save) stays
-    # a per-volume inner loop: native_spacing.to_native_grid takes one 3D array and one thickness
-    # target, and different volumes in a batch generally need different targets (different
-    # bucket, different per-case draw, different natural length), so it can't be vectorized
-    # across the batch -- see submission/README.md.
+    # Striped, disjoint slice of the (1-indexed) prompt list -- rank 0 gets prompts 1, 1+N, ... --
+    # one case per rollout. Batching several volumes into one Euler integration was tried and
+    # removed: it is faster per volume, but noise can then only be seeded per batch rather than
+    # per case, so a resumed run with a different grouping redraws different volumes.
     my_prompts = list(enumerate(prompts, start=1))[rank::world_size]
-    for batch_start in range(0, len(my_prompts), batch_size):
-        chunk = my_prompts[batch_start:batch_start + batch_size]
-        chunk = [(idx, cid, rpt) for idx, (cid, rpt) in chunk if f"{cid}.nii.gz" not in done]
-        if not chunk:
+    for index, (case_id, report) in my_prompts:
+        filename = f"{case_id}.nii.gz"
+        if filename in done:
             continue
 
-        embeds, mod_ids, plane_ids, modalities, planes = [], [], [], [], []
-        for _, case_id, report in chunk:
-            modality, plane = modality_plane_for(case_id)
-            sections = split_sections(report)
-            embedding = encode_conditioning(tokenizer, text_encoder, sections, modality, plane,
-                                            max_length=config.mri.text_max_length)
-            embedding = embedding / (embedding.norm(p=2) + 1e-6)
-            embeds.append(embedding)
-            mod_ids.append(modality_to_id(modality))
-            plane_ids.append(plane_to_id(plane))
-            modalities.append(modality)
-            planes.append(plane)
+        modality, plane = modality_plane_for(case_id)
+        sections = split_sections(report)
 
-        # encode_conditioning already returns [1, D] (the tokenizer's own batch-of-1 leading dim),
-        # so stacking N of them along a new leading dim gives exactly [N, 1, D] -- no extra
-        # unsqueeze needed (that would wrongly produce [N, 1, 1, D]).
-        embeds_batch = torch.stack(embeds).to(device)  # [N, 1, D]
-        mod_batch = torch.tensor(mod_ids, device=device)
-        plane_batch = torch.tensor(plane_ids, device=device)
+        torch.manual_seed(seed_for_case(case_id, base_seed))
+        embedding = encode_conditioning(tokenizer, text_encoder, sections, modality, plane,
+                                        max_length=config.mri.text_max_length)
+        embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
+        modality_id = torch.tensor([modality_to_id(modality)], device=device)
+        plane_id = torch.tensor([plane_to_id(plane)], device=device)
 
-        # One shared seed for the whole batch -- a single torch.randn draw covers every member
-        # of a batched block, so per-case seeding (the batch_size=1 behaviour) isn't possible
-        # once N > 1. Deterministic in the batch's own case ids, so a resumed run with the same
-        # batch grouping reproduces the same noise; a different batch_size draws different noise
-        # for the same case, an inherent (and documented) trade-off of batching, not a bug.
-        batch_seed_key = "|".join(cid for _, cid, _ in chunk)
-        torch.manual_seed(seed_for_case(batch_seed_key, base_seed))
+        case_started = time.time()
+        latent = generator.generate(embedding, modality_id, plane_id, max_blocks=max_blocks)
+        if latent.shape[2] == 0:
+            raise RuntimeError(f"{case_id}: every generated slice was a stop frame")
+        volume = generator.decode_latent(latent)[0, 0].numpy().astype(np.float32)  # (T, H, W)
 
-        batch_started = time.time()
-        # padded_latents is [N, C, T, H, W], T padded to the longest sample in this chunk;
-        # lengths[i] is sample i's own valid frame count (see generate()/trim_stop_frames).
-        padded_latents, lengths = generator.generate(embeds_batch, mod_batch, plane_batch,
-                                                      max_blocks=max_blocks)
+        spacing_by_axis = (1.0, 1.0, 1.0)
+        note = f"grid={volume.shape} slice_spacing=1.00mm"
+        if native_table is not None:
+            target = native_table.draw(modality, plane, case_id)
+            volume, slice_spacing, info = to_native_grid(volume, target["thickness_mm"])
+            spacing_by_axis = (slice_spacing, 1.0, 1.0)
+            note = (f"grid {info['source_slices']}->{info['target_slices']} "
+                    f"drew {target['thickness_mm']:.1f}mm got {info['slice_spacing_mm']:.2f}mm "
+                    f"bucket={target['bucket']}")
 
-        for i, ((index, case_id, _), modality, plane) in enumerate(zip(chunk, modalities, planes)):
-            filename = f"{case_id}.nii.gz"
-            if lengths[i] == 0:
-                raise RuntimeError(f"{case_id}: every generated slice was a stop frame")
-            latent = padded_latents[i:i + 1, :, :lengths[i]]
-            volume = generator.decode_latent(latent)[0, 0].numpy().astype(np.float32)  # (T, H, W)
+        # Independent of the slice axis above, and applied after it so it upsamples whichever
+        # slice grid this volume ended up on. Same FOV-preserving contract, same per-case draw.
+        if inplane_table is not None:
+            inplane_target = inplane_table.draw(modality, plane, case_id)
+            volume, inplane_spacing, inplane_info = to_inplane_grid(
+                volume, inplane_target["inplane_mm"])
+            spacing_by_axis = (spacing_by_axis[0], *inplane_spacing)
+            note += (f" | inplane {inplane_info['source_inplane']}->"
+                     f"{inplane_info['target_inplane']} drew "
+                     f"{inplane_target['inplane_mm']:.2f}mm got "
+                     f"{inplane_info['inplane_spacing_mm'][0]:.2f}mm "
+                     f"bucket={inplane_target['bucket']}")
 
-            spacing_by_axis = (1.0, 1.0, 1.0)
-            note = f"grid={volume.shape} slice_spacing=1.00mm"
-            if native_table is not None:
-                target = native_table.draw(modality, plane, case_id)
-                volume, slice_spacing, info = to_native_grid(volume, target["thickness_mm"])
-                spacing_by_axis = (slice_spacing, 1.0, 1.0)
-                note = (f"grid {info['source_slices']}->{info['target_slices']} "
-                        f"drew {target['thickness_mm']:.1f}mm got {info['slice_spacing_mm']:.2f}mm "
-                        f"bucket={target['bucket']}")
+        affine = build_affine(plane, spacing_by_axis, volume.shape)
+        nib.save(nib.Nifti1Image(volume.astype(dtype, copy=False), affine), OUTPUT_DIR / filename)
+        mark_done(filename, done, done_file, backup_dir)
 
-            affine = build_affine(plane, spacing_by_axis, volume.shape)
-            nib.save(nib.Nifti1Image(volume.astype(dtype, copy=False), affine), OUTPUT_DIR / filename)
-            mark_done(filename, done, done_file, backup_dir)
-            print(f"[rank {rank}][{index}/{len(prompts)}] {case_id} {modality} {plane} {note}")
-
-        elapsed = time.time() - batch_started
-        print(f"[rank {rank}] batch of {len(chunk)} finished in {elapsed:.1f}s "
-              f"({elapsed / len(chunk):.1f}s/volume)")
+        elapsed = time.time() - case_started
+        print(f"[rank {rank}][{index}/{len(prompts)}] {case_id} {modality} {plane} "
+              f"{note} {elapsed:.1f}s")
 
     if is_ddp:
         import torch.distributed as dist

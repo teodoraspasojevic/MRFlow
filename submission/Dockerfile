@@ -119,11 +119,15 @@ ENV TRANSFORMERS_OFFLINE=1 \
 #
 #   /opt/app/echosyn/                   MRFlow's shared package (denoiser, VAE scaling, mrrate.py)
 #   /opt/app/auto_regressive_generate/  LatentAutoregressiveGenerator
-#   /opt/app/{predict.py,entrypoint.sh,native_spacing.py}
+#   /opt/app/{predict.py,entrypoint.sh}
 #   /opt/app/config.yaml                 the training config saved next to the checkpoint, with
 #                                         vae.pretrained/mri.text_checkpoint overridden at runtime
 #                                         by predict.py once the weight dirs below are resolved
-#   /opt/app/native_spacing_table.json    MR-RATE's own slice-thickness survey (model-agnostic)
+#   /opt/app/helpers/                    the grid-rewriting post-processors, each with its table:
+#                                         native_spacing.py  + native_spacing_table.json
+#                                          (MR-RATE's own slice-thickness survey, model-agnostic)
+#                                         inplane_resample.py + inplane_spacing_table.json
+#                                          (MR-RATE's own in-plane pixel-spacing survey, ditto)
 #   /opt/app/models/                     -> symlinks into /weights (made by entrypoint.sh):
 #                                            denoiser_ema/, flux-vae-f8-16ch/, <text-encoder>/
 ENV PYTHONPATH=/opt/app \
@@ -145,6 +149,19 @@ ENV PYTHONPATH=/opt/app \
 # large FID win, for the same reason it applies here: FID_2p5D never resamples, so a generated
 # volume's always-~1mm slice grid is otherwise scored against native 4-6.5mm 2D acquisitions on a
 # mismatched grid. Set to "off" to write the generated grid unchanged (the A/B control).
+#
+# MRFLOW_INPLANE_MODE=sample: the same trick on the other two axes -- cubic-spline upsamples each
+# finished volume's in-plane grid from its fixed 256^2 at 1mm to a pixel spacing drawn from
+# MR-RATE's own per-(modality, plane) distribution (0.45-0.8mm median, i.e. finer than we
+# generate), see inplane_resample.py. R2V-MR-Generation measured this separately from the slice
+# axis (FID_2p5D_Avg 43.90 -> 35.37, SSIM/PSNR/MSE unchanged), so it gets its own switch rather
+# than being folded into MRFLOW_NATIVE_SPACING_MODE; "off" is that A/B control. Note the cost is
+# disk, not time: ~3.6x the pixels on average (1.6x-6.2x by bucket) and, because interpolated
+# floats compress worse than the uint8 levels decode_latent emits, ~3.5x the written bytes at the
+# median draw (measured: 8.5 MB -> 30 MB for a 61x256x256 float32 volume, up to 90 MB at the 0.40mm
+# tail). /output and /checkpoint each hold a copy. A few seconds of CPU per volume, against minutes
+# of rollout. MRFLOW_OUTPUT_DTYPE=float16 halves the bytes and is lossless for uint8 levels, if the
+# platform's disk turns out to be the binding constraint.
 #
 # The two cfg scales are build ARGs, not hardcoded, so a cfg sweep is `--build-arg
 # MODALITY_CFG_SCALE=.. --build-arg REPORT_CFG_SCALE=..` per combination rather than a hand-edited
@@ -175,6 +192,8 @@ ENV MRFLOW_MODALITY_CFG_SCALE=${MODALITY_CFG_SCALE} \
     MRFLOW_MAX_BLOCKS=16 \
     MRFLOW_NATIVE_SPACING_MODE=sample \
     MRFLOW_NATIVE_SPACING_TOPK=8 \
+    MRFLOW_INPLANE_MODE=sample \
+    MRFLOW_INPLANE_TOPK=8 \
     MRFLOW_OUTPUT_DTYPE=float32 \
     MRFLOW_USE_BF16=1 \
     MRFLOW_USE_COMPILE=1
@@ -187,8 +206,7 @@ COPY --chown=appuser:appuser echosyn/                   /opt/app/echosyn/
 COPY --chown=appuser:appuser auto_regressive_generate/   /opt/app/auto_regressive_generate/
 COPY --chown=appuser:appuser submission/predict.py            /opt/app/predict.py
 COPY --chown=appuser:appuser submission/entrypoint.sh          /opt/app/entrypoint.sh
-COPY --chown=appuser:appuser submission/native_spacing.py      /opt/app/native_spacing.py
-COPY --chown=appuser:appuser submission/native_spacing_table.json /opt/app/native_spacing_table.json
+COPY --chown=appuser:appuser submission/helpers/                /opt/app/helpers/
 COPY --chown=appuser:appuser submission/config.yaml              /opt/app/config.yaml
 RUN chmod +x /opt/app/entrypoint.sh
 
