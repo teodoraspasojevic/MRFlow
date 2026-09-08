@@ -55,8 +55,7 @@ from evaluation import METRIC_KEYS, ChallengeAccumulator, combine, comparison_fr
 
 def full_body(generator, embedding, labels, max_blocks, gt_latent):
     """Report-to-volume: seed from the black boundary token, roll out until the white one."""
-    latent, _lengths = generator.generate(embedding, *labels, max_blocks=max_blocks)
-    return latent
+    return generator.generate(embedding, *labels, max_blocks=max_blocks)
 
 
 def gt_head(generator, embedding, labels, max_blocks, gt_latent):
@@ -64,9 +63,8 @@ def gt_head(generator, embedding, labels, max_blocks, gt_latent):
     # gt_latent() carries both posterior parameters; scaling it whole would scale the stds too.
     first_block = sample_latents(generator.config, gt_latent()[:, :, :generator.block_size])
     first_block = scale_latents(first_block, generator.vae_scaling)
-    latent, _lengths = generator.generate(embedding, *labels, max_blocks=max_blocks - 1,
-                                          gt_first_block=first_block)
-    return latent
+    return generator.generate(embedding, *labels, max_blocks=max_blocks - 1,
+                              gt_first_block=first_block)
 
 
 REGIMES = {"full-body": full_body, "gt-head": gt_head}
@@ -170,6 +168,26 @@ def parse_args():
     parser.add_argument("--combine", action="store_true",
                         help="Pool the shards already in --out into metrics.json and log to W&B.")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging.")
+    parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False,
+                        help="Run the denoiser under bfloat16 autocast (the VAE stays fp32). ~3.2x "
+                             "faster per block, and the precision training itself ran in -- but it "
+                             "does not reproduce an fp32 sample: measured, one denoiser call "
+                             "differs by 1.9e-2 relative and a rollout lands 23.6 dB from its fp32 "
+                             "counterpart. Off, so scores stay comparable with everything already "
+                             "measured; turn it on only for both sides of a comparison.")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                        help="torch.compile the denoiser, with static shapes. Unlike --bf16 this "
+                             "leaves the sampler alone (measured 1.91e-2 relative velocity "
+                             "difference with bf16 on, against 1.90e-2 for bf16 alone -- i.e. "
+                             "compile contributes nothing to the drift). The first two or three "
+                             "blocks of a run are still compiling, so pass --no-compile for a "
+                             "handful of cases.")
+    parser.add_argument("--ode_steps", type=int, default=201,
+                        help="Fixed Euler steps per block. 201 is what every number in this "
+                             "project was produced with, so leave it there to stay comparable; "
+                             "lowering it is the cheapest speed lever, at a cost this flag exists "
+                             "to measure. Exposed here only -- the debug script and the "
+                             "submission container both stay on the 201-step default.")
     parser.add_argument("--modality_cfg_scale", type=float, default=None,
                         help="Overrides config.guidance.modality_cfg_scale.")
     parser.add_argument("--report_cfg_scale", type=float, default=None,
@@ -181,8 +199,12 @@ def parse_args():
     return args
 
 
-def build_generator(config, ckpt, device):
-    """The same generator `auto_regressive_generate/main.py` builds, from the same config."""
+def build_generator(config, ckpt, device, args):
+    """The same generator `auto_regressive_generate/main.py` builds, from the same config, plus the
+    three speed switches -- `--compile`, which does not change the sample, and `--bf16` and
+    `--ode_steps`, which do. Everything else about the rollout is fixed: fp32 unless asked, one
+    case at a time. At their defaults (no bf16, 201 steps) a run is the same sampler every number
+    in this project was produced with; the debug script and the submission get no such knobs."""
     denoiser = instantiate_class_from_config(config.denoiser)
     denoiser = denoiser.from_pretrained(ckpt).to(device).eval()
     vae = instantiate(config.vae).eval().to(device)
@@ -192,6 +214,7 @@ def build_generator(config, ckpt, device):
         block_size=config.globals.target_nframes,
         modality_cfg_scale=config.guidance.modality_cfg_scale,
         report_cfg_scale=config.guidance.report_cfg_scale,
+        use_bf16=args.bf16, use_compile=args.compile, ode_steps=args.ode_steps,
     )
 
 
@@ -206,9 +229,10 @@ def run_shard(config, args, out, device):
     series = series[args.shard::args.num_shards][:args.limit]
     print(f"[shard {args.shard}/{args.num_shards}] {len(series)} {args.split} cases, "
           f"regime {args.regime}, max_blocks {args.max_blocks}, "
-          f"n_per_bucket {args.n_per_bucket}")
+          f"n_per_bucket {args.n_per_bucket}, bf16 {args.bf16}, compile {args.compile}, "
+          f"ode_steps {args.ode_steps}")
 
-    generator = build_generator(config, args.ckpt, device)
+    generator = build_generator(config, args.ckpt, device, args)
     tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
     accumulator = ChallengeAccumulator(device=device)
     generate = REGIMES[args.regime]

@@ -134,8 +134,22 @@ Each case is derived from one read of its MR-RATE series:
   | `gt-head` | the volume's own first block | diagnosing the rollout |
 
 - **Rollout** — `LatentAutoregressiveGenerator`, the same one `auto_regressive_generate/main.py`
-  builds: 201-step Euler per block, stopping when a block matches the white boundary token.
-  `--max_blocks` defaults to `max_slices / target_nframes` (20).
+  builds: 201-step Euler per block, fp32, one case per rollout, stopping when a block matches the
+  white boundary token. `--max_blocks` defaults to `max_slices / target_nframes` (20).
+
+  Two speed switches, and the difference between them matters. **`--compile`** (on) compiles the
+  denoiser with static shapes and leaves the sampler alone — measured, `torch.compile` contributes
+  nothing to the numerical drift (1.91e-2 relative velocity difference with bf16 on, against
+  1.90e-2 for bf16 alone) — so it is on by default; pass `--no-compile` for a smoke test, since the
+  first two or three blocks of any run are spent compiling. **`--bf16`** (off) is ~3.2x faster per
+  block and is the precision training itself ran in, but it does *not* reproduce an fp32 sample:
+  one denoiser call differs by 1.9e-2 relative, and 201 steps x 6 blocks amplify that to a volume
+  23.6 dB from its fp32 counterpart. So it stays off, and if you turn it on, turn it on for both
+  sides of a comparison.
+
+  Batching several volumes into one rollout is deliberately **not** available here, although it is
+  another 1.7x: a batch draws all of its noise in one call, so noise could only be seeded per batch
+  rather than per case, and two runs with different groupings would score different volumes.
 - **Seeding** — per case, from the case id rather than its position, so a rerun and a run under a
   different shard count draw the same noise. Verified bit-identical per case.
 - **Failures** — an unreadable series or a rollout that collapses to nothing is logged and counted
