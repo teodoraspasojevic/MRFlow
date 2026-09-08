@@ -1,7 +1,7 @@
 # Evaluation
 
 Roll out MRFlow over an MR-RATE split and score it with the **official VLM3D
-`mr-volume-generation` metrics**. The metric code in [`challenge.py`](challenge.py) is a port of the
+`mr-volume-generation` metrics**. The metric code in [`metrics.py`](metrics.py) is a port of the
 challenge's own scoring container, so the numbers here are the leaderboard's, not our own
 definitions.
 
@@ -81,7 +81,7 @@ whatever shards it finds, so a task that died leaves a quietly smaller evaluatio
 
 | file | what |
 |---|---|
-| [`challenge.py`](challenge.py) | vendored official container: modality scope, MSE/PSNR/SSIM, streaming 2.5D FID — plus, in its own marked section, FVD and Inception Score, which no MR container scores |
+| [`metrics.py`](metrics.py) | vendored official container: modality scope, MSE/PSNR/SSIM, streaming 2.5D FID — plus, in its own marked section, FVD and Inception Score, which no MR container scores |
 | [`__init__.py`](__init__.py) | `ChallengeAccumulator` — the official `score.py` aggregation, over pairs held in memory |
 | [`main.py`](main.py) | the CLI: build a case, generate, score, write `metrics.json`, log to W&B |
 | [`../tests/test_evaluation_metrics.py`](../tests/test_evaluation_metrics.py) | the FVD and IS tests: formulas against closed forms, backbones against corruption ladders |
@@ -176,7 +176,7 @@ computed over every shard's slices at once rather than averaged per shard.
 ### FVD and Inception Score are ours, not the leaderboard's
 
 `mr-volume-generation` scores neither, so both live in their own section at the bottom of
-[`challenge.py`](challenge.py), behind a header that says so — nothing above that line changed to
+[`metrics.py`](metrics.py), behind a header that says so — nothing above that line changed to
 add them, and a golden-value test keeps it that way. **Do not quote either number as a challenge
 metric.**
 
@@ -233,7 +233,7 @@ better defined, since it loads each `.nii.gz` with no reorientation at all. And 
 counts eligible MR-RATE series from `list_series` (report present, not derived, not a localizer, no
 duplicate acquisitions), not files in the platform's ground-truth directory.
 
-**Do not "improve" [`challenge.py`](challenge.py)** above its last section header. Its quirks are
+**Do not "improve" [`metrics.py`](metrics.py)** above its last section header. Its quirks are
 the leaderboard's arithmetic. The only sanctioned additions to the official half are marked in the
 file: `raw_features`/`finalize_pooled` for cross-shard FID pooling, and `_matrix_sqrt`, which drops
 a `sqrtm` kwarg scipy ≥ 1.17 removed. Everything after

@@ -400,7 +400,8 @@ class InceptionScoreAccumulator:
         self.batch_size = batch_size
         weights = tv_models.Inception_V3_Weights.IMAGENET1K_V1
         # transform_input=False: the reference port's setting, since the input is already [-1, 1].
-        self.model = tv_models.inception_v3(weights=weights, transform_input=False).eval().to(device)
+        self.model = tv_models.inception_v3(weights=weights,
+                                            transform_input=False).eval().to(device)
         self._probs = []
 
     @torch.no_grad()

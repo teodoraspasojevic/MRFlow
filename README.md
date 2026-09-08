@@ -52,7 +52,7 @@ MRFlow/
 │   ├── __init__.py              # LatentAutoregressiveGenerator class
 │   └── main.py                  # Inference entry point
 ├── evaluation/
-│   ├── challenge.py             # Vendored VLM3D scoring container (MSE/PSNR/SSIM, 2.5D FID)
+│   ├── metrics.py               # Vendored VLM3D scoring container (MSE/PSNR/SSIM, 2.5D FID)
 │   ├── __init__.py              # ChallengeAccumulator: the official score.py aggregation
 │   └── main.py                  # Rollout + scoring entry point
 ├── slurms/
@@ -135,7 +135,7 @@ This runs 64 parallel workers (16 nodes × 4 GPUs), each processing a partition 
 
 Scores a checkpoint with the official VLM3D `mr-volume-generation` metrics — MSE, PSNR, SSIM and
 2.5D FID (XY/XZ/YZ and their average) — using the vendored evaluation container in
-`evaluation/challenge.py`, so the numbers are the leaderboard's. Ground truth is the released
+`evaluation/metrics.py`, so the numbers are the leaderboard's. Ground truth is the released
 MR-RATE volume, RAS-reoriented and otherwise untouched; the metric resamples the generated volume
 onto it, exactly as the platform does to a submission.
 

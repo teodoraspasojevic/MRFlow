@@ -2,7 +2,7 @@
 
 See `evaluation/README.md` for the pipeline and what each metric means.
 
-    challenge.py   vendored port of the official container -- the source of truth for what
+    metrics.py     vendored port of the official container -- the source of truth for what
                    "SSIM" or "FID" means here. Do not adjust it to taste. Its last section is
                    ours: FVD and Inception Score, which no MR container scores.
     __init__.py    ChallengeAccumulator: the official score.py's aggregation, fed volume pairs
@@ -12,16 +12,16 @@ See `evaluation/README.md` for the pipeline and what each metric means.
 `METRIC_KEYS` is also the reporting order: FID average first, then PSNR/SSIM/MSE, then the
 per-plane FIDs, then the platform's `dice` shim and the file counts. `FVD` and `IS_mean`/`IS_std`
 sit alongside their nearest official neighbour -- neither is scored by the MR challenge, and
-`challenge.py`'s last section says what they are instead.
+`metrics.py`'s last section says what they are instead.
 """
 
 import numpy as np
 
 # `_normalize01` is the metric's own normalization, borrowed by `comparison_frames` so the
 # picture and the number can never disagree about what the pair looks like.
-from evaluation.challenge import (ALLOWED_MODALITIES, FIDAccumulator, FVDAccumulator,
-                                  InceptionScoreAccumulator, _normalize01, compute_basic_metrics,
-                                  finalize_pooled, fvd_pooled, inception_score)
+from evaluation.metrics import (ALLOWED_MODALITIES, FIDAccumulator, FVDAccumulator,
+                                InceptionScoreAccumulator, _normalize01, compute_basic_metrics,
+                                finalize_pooled, fvd_pooled, inception_score)
 
 METRIC_KEYS = (
     "FID_2p5D_Avg", "FVD", "PSNR_mean", "SSIM_mean", "MSE_mean",
