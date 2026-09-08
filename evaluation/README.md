@@ -81,9 +81,10 @@ whatever shards it finds, so a task that died leaves a quietly smaller evaluatio
 
 | file | what |
 |---|---|
-| [`challenge.py`](challenge.py) | vendored official container: modality scope, MSE/PSNR/SSIM, streaming 2.5D FID |
+| [`challenge.py`](challenge.py) | vendored official container: modality scope, MSE/PSNR/SSIM, streaming 2.5D FID — plus, in its own marked section, FVD and Inception Score, which no MR container scores |
 | [`__init__.py`](__init__.py) | `ChallengeAccumulator` — the official `score.py` aggregation, over pairs held in memory |
 | [`main.py`](main.py) | the CLI: build a case, generate, score, write `metrics.json`, log to W&B |
+| [`../tests/test_evaluation_metrics.py`](../tests/test_evaluation_metrics.py) | the FVD and IS tests: formulas against closed forms, backbones against corruption ladders |
 
 ## Preprocessing
 
@@ -167,8 +168,53 @@ computed over every shard's slices at once rather than averaged per shard.
 | `MSE_mean` / `PSNR_mean` / `SSIM_mean` | per case on the normalized pair, then averaged |
 | `FID_2p5D_XY` / `_XZ` / `_YZ` | Frechet distance over squeezenet1_1 features of every 4th slice, per array axis |
 | `FID_2p5D_Avg` | mean of the three |
+| `FVD` | Frechet distance over I3D features of the whole volume, one vector per case — **not official** |
+| `IS_mean` / `IS_std` | Inception Score of the generated slices, no ground truth involved — **not official** |
 | `dice` | a literal copy of `SSIM_mean` — the platform's primary-metric shim, not real Dice |
 | `n_total_files` etc. | cases seen, scored, missing, and excluded by modality |
+
+### FVD and Inception Score are ours, not the leaderboard's
+
+`mr-volume-generation` scores neither, so both live in their own section at the bottom of
+[`challenge.py`](challenge.py), behind a header that says so — nothing above that line changed to
+add them, and a golden-value test keeps it that way. **Do not quote either number as a challenge
+metric.**
+
+FVD *is* scored by the challenge's CT track, so it follows that container
+(`ct_challenges/ctgen_evaluation`) as closely as MR allows: the same fixed-size trilinear resize to
+201×224×224, the same `[-1, 1]` video, and its `FVD/fvd_pytorch_model.py` Frechet arithmetic
+verbatim. Two things could not carry over, and one thing we chose not to:
+
+| | CT container | here |
+|---|---|---|
+| backbone | CT-Net, an 18-class CT classifier that windows Hounsfield units | I3D Kinetics-400 — the network FVD is *defined* over, and what the container's own `FVD/frechet_video_distance.py` reference pulls from tf.hub. MR has no HU scale, so CT-Net cannot be fed |
+| intensity | clip to `[-1000, 1000]` HU | `_normalize01`, the MR metric's own 0.5/99.5-percentile normalization, so FVD and MSE/PSNR/SSIM see the same two volumes |
+| aggregation | mean FVD over strata of `CHUNK = 4` pairs | one distance over every case, pooled at the feature level like FID — a 400×400 covariance from 4 samples is not an estimate of anything |
+
+Inception Score appears nowhere in the challenge, so it is the canonical definition instead —
+`exp(E_x KL(p(y|x) ‖ p(y)))` over ImageNet Inception-v3, split-averaged as Salimans et al. and the
+reference PyTorch port compute it — fed the slices FID_2p5D already looks at, along **array axis 0
+only**: the acquisition plane the model rolls out along, so the images scored are the images
+generated. It is no-reference; the ground truth never enters.
+
+Three things to know before reading either number:
+
+- **FVD needs more than 400 cases.** Its features are 400-d, so a covariance from fewer volumes is
+  rank-deficient (`sqrtm` warns that the matrix is singular) — the same caveat the 512-d FID
+  carries at `--n_per_bucket 100`, except one dimension per *case* rather than per slice.
+  `--n_per_bucket 100` gives 1,000 scored cases, 2.5× the dimension: usable, biased, and not
+  comparable across different case counts.
+- **IS on brain MRI is small.** ImageNet's 1,000 classes do not describe an MR slice, so the
+  posteriors are flat and the score is compressed. Measured on one real T2w case: 1.76 for the
+  ground truth, 1.60 for the rollout, 1.00 for a volume of one repeated slice. Read it against
+  another MR run, never against a natural-image number.
+- **The I3D weights are a download.** `_load_i3d` caches the torchscript in the torch hub directory
+  (so `TORCH_HOME` moves it) on first use, over the proxy the SLURM script exports. Set
+  `MRFLOW_I3D_PATH` to a pre-baked copy on a node with no outbound route — the CT container bakes
+  CT-Net into its image for the same reason.
+
+Shard files written before these metrics existed carry no `fvd_raw`/`is_probs`, so `--combine`
+raises on them rather than pooling a partial FVD. Re-run the array.
 
 **Scope.** Only T1w/T2w/FLAIR/SWI are scored, matching the organizers' decision. Other modalities
 are counted in `n_excluded_out_of_scope_modality` and skipped before generation.
@@ -187,9 +233,12 @@ better defined, since it loads each `.nii.gz` with no reorientation at all. And 
 counts eligible MR-RATE series from `list_series` (report present, not derived, not a localizer, no
 duplicate acquisitions), not files in the platform's ground-truth directory.
 
-**Do not "improve" [`challenge.py`](challenge.py).** Its quirks are the leaderboard's arithmetic.
-The only sanctioned additions are marked in the file: `raw_features`/`finalize_pooled` for
-cross-shard FID pooling, and `_matrix_sqrt`, which drops a `sqrtm` kwarg scipy ≥ 1.17 removed.
+**Do not "improve" [`challenge.py`](challenge.py)** above its last section header. Its quirks are
+the leaderboard's arithmetic. The only sanctioned additions to the official half are marked in the
+file: `raw_features`/`finalize_pooled` for cross-shard FID pooling, and `_matrix_sqrt`, which drops
+a `sqrtm` kwarg scipy ≥ 1.17 removed. Everything after
+`### FVD and Inception Score -- NOT part of any official MR container ###` is ours and may be
+changed freely, as long as it stays there.
 
 ## Output
 

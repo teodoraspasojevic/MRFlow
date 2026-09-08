@@ -3,25 +3,30 @@
 See `evaluation/README.md` for the pipeline and what each metric means.
 
     challenge.py   vendored port of the official container -- the source of truth for what
-                   "SSIM" or "FID" means here. Do not adjust it to taste.
+                   "SSIM" or "FID" means here. Do not adjust it to taste. Its last section is
+                   ours: FVD and Inception Score, which no MR container scores.
     __init__.py    ChallengeAccumulator: the official score.py's aggregation, fed volume pairs
                    in memory instead of two directories of .nii.gz
     main.py        the CLI -- roll out every series of a split, score it, log to W&B
 
 `METRIC_KEYS` is also the reporting order: FID average first, then PSNR/SSIM/MSE, then the
-per-plane FIDs, then the platform's `dice` shim and the file counts.
+per-plane FIDs, then the platform's `dice` shim and the file counts. `FVD` and `IS_mean`/`IS_std`
+sit alongside their nearest official neighbour -- neither is scored by the MR challenge, and
+`challenge.py`'s last section says what they are instead.
 """
 
 import numpy as np
 
 # `_normalize01` is the metric's own normalization, borrowed by `comparison_frames` so the
 # picture and the number can never disagree about what the pair looks like.
-from evaluation.challenge import (ALLOWED_MODALITIES, FIDAccumulator, _normalize01,
-                                  compute_basic_metrics, finalize_pooled)
+from evaluation.challenge import (ALLOWED_MODALITIES, FIDAccumulator, FVDAccumulator,
+                                  InceptionScoreAccumulator, _normalize01, compute_basic_metrics,
+                                  finalize_pooled, fvd_pooled, inception_score)
 
 METRIC_KEYS = (
-    "FID_2p5D_Avg", "PSNR_mean", "SSIM_mean", "MSE_mean",
+    "FID_2p5D_Avg", "FVD", "PSNR_mean", "SSIM_mean", "MSE_mean",
     "FID_2p5D_XY", "FID_2p5D_XZ", "FID_2p5D_YZ",
+    "IS_mean", "IS_std",
     "dice",
     "n_total_files", "n_scored_files", "n_missing_outputs",
     "n_excluded_out_of_scope_modality",
@@ -34,11 +39,13 @@ class ChallengeAccumulator:
 
     Volumes are scored as they arrive and never retained -- only the small 512-d slice features
     accumulate -- because the official container works the same way and a full split would not fit
-    in memory otherwise.
+    in memory otherwise. FVD and IS accumulate the same way: 400-d per volume, 1000-d per slice.
     """
 
     def __init__(self, device="auto"):
         self._fid = FIDAccumulator(device=device)
+        self._fvd = FVDAccumulator(device=device)
+        self._is = InceptionScoreAccumulator(device=device)
         self._per_case = []
         self.n_total = 0
         self.n_excluded = 0
@@ -57,6 +64,8 @@ class ChallengeAccumulator:
             return
         metrics = compute_basic_metrics(real, produced)
         self._fid.add_pair(real, produced)
+        self._fvd.add_pair(real, produced)
+        self._is.add(produced)  # no-reference: the generated volume only
         self._per_case.append({"case_id": case_id, "bucket": bucket, "status": "scored", **metrics})
 
     def add_missing(self, case_id, bucket, modality):
@@ -75,11 +84,15 @@ class ChallengeAccumulator:
     def state(self):
         return {"per_case": list(self._per_case), "n_total": self.n_total,
                 "n_excluded": self.n_excluded, "n_missing": self.n_missing,
-                "fid_raw": self._fid.raw_features()}
+                "fid_raw": self._fid.raw_features(), "fvd_raw": self._fvd.raw_features(),
+                "is_probs": self._is.probs()}
 
 
 def combine(states):
-    """The official aggregation over one or more shards' `ChallengeAccumulator.state()`."""
+    """The official aggregation over one or more shards' `ChallengeAccumulator.state()`, plus the
+    two unofficial metrics. Both pool at the feature level like FID, so a shard written before they
+    existed has no `fvd_raw`/`is_probs` and raises here rather than combining into a partial FVD.
+    """
     per_case = [r for s in states for r in s["per_case"]]
     scored = [r for r in per_case if r["status"] == "scored"]
 
@@ -88,9 +101,12 @@ def combine(states):
 
     n_total = sum(s["n_total"] for s in states)
     n_excluded = sum(s["n_excluded"] for s in states)
+    is_mean, is_std = inception_score(np.concatenate([s["is_probs"] for s in states]))
     metrics = {
         "MSE_mean": mean("MSE"), "PSNR_mean": mean("PSNR"), "SSIM_mean": mean("SSIM"),
         **finalize_pooled([s["fid_raw"] for s in states]),
+        "FVD": fvd_pooled([s["fvd_raw"] for s in states]),
+        "IS_mean": is_mean, "IS_std": is_std,
         # The platform's primary-metric shim: a copy of SSIM_mean, not real Dice.
         "dice": mean("SSIM"),
         "n_total_files": n_total,
