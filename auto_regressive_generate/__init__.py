@@ -30,7 +30,7 @@ class LatentAutoregressiveGenerator:
     Auto-regressive generator for latent video volumes.
 
     Generates a sequence of latent blocks conditioned on:
-    - A text/CT embedding (prompt_embeds)
+    - A report embedding (prompt_embeds)
     - The previously generated block (cond_image)
     - Modality and plane class ids
 
@@ -170,7 +170,8 @@ class LatentAutoregressiveGenerator:
         Generate a full latent volume auto-regressively.
 
         Args:
-            prompt_embeds: Text/CT embedding [B, 1, D].
+            prompt_embeds: report embedding [B, N, D] -- the config's conditioning decides N and
+                D (1 x 768 pooled or 3 x 2560 sectioned), and this method is indifferent to both.
             modality_id: Modality class ids [B], dtype long.
             plane_id: Plane class ids [B], dtype long.
             max_blocks: Maximum number of blocks to generate.
@@ -259,7 +260,7 @@ class LatentAutoregressiveGenerator:
 
         Args:
             prev_latent: Previous block latent [B, C, T, H, W].
-            prompt_embeds: Text/CT embedding [B, 1, D].
+            prompt_embeds: report embedding [B, N, D], as in `generate`.
             modality_id: Modality class ids [B], dtype long.
             plane_id: Plane class ids [B], dtype long.
 

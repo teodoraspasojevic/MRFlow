@@ -131,9 +131,10 @@ a generated one cannot end up in different orders.
 
 Each case is derived from one read of its MR-RATE series:
 
-- **Conditioning** — `encode_conditioning`, the same call preprocessing makes: frozen CXR-BERT over
-  the study's report plus the series' `[MODALITY]`/`[PLANE]`/`[SPACING]` markers, pooled to one
-  768-d token and L2-normalized. Identical to what the model trained against.
+- **Conditioning** — `build_conditioner(mri, device)`, the same factory preprocessing uses, so
+  whichever configuration `mri.conditioning` names is the one the model trained against: the
+  study's report plus the series' `[MODALITY]`/`[PLANE]` markers, either pooled to one 768-d
+  CXR-BERT token or split into three 2560-wide section tokens, then L2-normalized.
 - **Regime** — one entry in `REGIMES`. The challenge is report-to-volume, so `full-body` is the
   default. Adding a regime is adding an entry; each receives a zero-argument `gt_latent()` so a
   regime that needs no ground truth never pays to encode one.

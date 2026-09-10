@@ -5,7 +5,7 @@ Usage:
     python auto_regressive_generate/main.py \
         --config /path/to/experiment/config.yaml \
         --ckpt   /path/to/checkpoint/denoiser_ema \
-        --embedding /path/to/ct_embedding.pt \
+        --embedding /path/to/report_embedding.pt \
         --output /path/to/output_dir \
         --type full-body
 
@@ -59,12 +59,24 @@ def save_video_as_frames(video: torch.Tensor, output_dir: str, n_frames: int = 2
         pil_image = transforms.ToPILImage()(frame)
         pil_image.save(os.path.join(output_dir, f"frame_{i:03d}.png"), format="PNG", optimize=True)
 
-    print(f"Saved {n_frames} frames to: {output_dir}")
+    # Say which frames are real. `n_frames` is a fixed 201 -- the CT challenge's slice count --
+    # so a short rollout is padded with copies of its last slice and a long one is cut, and
+    # "Saved 201 frames" on its own tells you nothing about how far the rollout actually got.
+    if T < n_frames:
+        detail = f"{T} generated + {n_frames - T} padded copies of the last slice"
+    elif T > n_frames:
+        detail = f"{T} generated, {T - n_frames} dropped past the {n_frames}-frame cap"
+    else:
+        detail = f"{T} generated"
+    print(f"Saved {n_frames} frames to: {output_dir} ({detail})")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Auto-regressive CT volume generation")
-    parser.add_argument("--embedding", type=str, required=True, help="Path to CT embedding .pt file")
+    parser.add_argument("--embedding", type=str, required=True,
+                        help="Path to a report embedding .pt file, [N, D] as preprocessing wrote "
+                             "it. Must be the conditioning --ckpt was trained with; nothing can "
+                             "check that, because a pooled embedding cannot be read back.")
     parser.add_argument("--gt-latent", type=str, default=None, help="Path to GT latent .pt file (gt-head / block-wise modes)")
     parser.add_argument("--config", type=str, required=True, help="Path to training config file")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint (denoiser_ema)")

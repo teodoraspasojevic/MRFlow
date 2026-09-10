@@ -14,9 +14,9 @@ needed and `test` works the same as `val`:
                    per contrast and plane, so `n_total_files` counts series rather than the files
                    in the platform's ground-truth directory. Deduplicating here and not from
                    `mri.max_repeats` is deliberate; see `run_shard`.
-    conditioning   CXR-BERT over the study's report plus the series' acquisition markers -- the
-                   same `encode_conditioning` call preprocessing makes, so the embedding the model
-                   sees here is the one it trained against.
+    conditioning   the config's own `mri.conditioning`, built through the same
+                   `build_conditioner` factory preprocessing uses, so the embedding the model sees
+                   here is the one it trained against -- whichever configuration that was.
     generation     one `REGIMES` entry. The challenge is report-to-volume, so `full-body` is the
                    default; the others exist to diagnose it.
 
@@ -38,10 +38,9 @@ from tqdm import tqdm
 
 import wandb
 from echosyn.common import *
-from echosyn.common.mrrate import (build_text_encoder, encode_conditioning, encode_volume,
-                                   list_series, load_native_volume, modality_to_id, plane_order,
-                                   plane_to_id, preprocess_volume, read_member, read_report,
-                                   sample_id)
+from echosyn.common.mrrate import (build_conditioner, encode_volume, list_series,
+                                   load_native_volume, modality_to_id, plane_order, plane_to_id,
+                                   preprocess_volume, read_member, read_report, sample_id)
 from auto_regressive_generate import LatentAutoregressiveGenerator
 from evaluation import METRIC_KEYS, ChallengeAccumulator, combine, comparison_frames
 
@@ -233,7 +232,7 @@ def run_shard(config, args, out, device):
           f"ode_steps {args.ode_steps}")
 
     generator = build_generator(config, args.ckpt, device, args)
-    tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
+    conditioner = build_conditioner(mri, device)
     accumulator = ChallengeAccumulator(device=device)
     generate = REGIMES[args.regime]
     examples_left = args.examples
@@ -256,10 +255,7 @@ def run_shard(config, args, out, device):
             nii_bytes = read_member(entry["archive"], entry["member"])
             real, spacing = load_native_volume(nii_bytes, entry["plane"])
             report = read_report(entry["archive"], entry["study_uid"])
-            embedding = encode_conditioning(
-                tokenizer, text_encoder, report,
-                entry["modality"], entry["plane"], max_length=mri.text_max_length,
-            )
+            embedding = conditioner.encode(report, entry["modality"], entry["plane"])
             embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
 
             labels = (torch.tensor([modality_to_id(entry["modality"])], device=device),

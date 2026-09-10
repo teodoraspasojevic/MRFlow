@@ -21,6 +21,7 @@ import csv
 import os
 import zipfile
 from collections import Counter
+from glob import glob
 
 import torch
 from omegaconf import OmegaConf
@@ -51,6 +52,36 @@ def listing(root, container):
             if os.path.isdir(os.path.join(base, sub)):
                 out |= {f"{kind}/{sub}/{f}" for f in os.listdir(os.path.join(base, sub))}
     return out
+
+
+def verify_embeddings(root, split, expected):
+    """Every encoded series must also have a readable embedding in the separate tree an
+    `--embeddings_only` pass wrote.
+
+    That pass is its own SLURM array and fails the same ways the latent one does. Its manifests
+    carry no `n_slices` and no labels, so ids are all there is to check -- which is enough, because
+    the latent manifest stays the authority on which series exist and this only has to cover them.
+    """
+    manifests = sorted(glob(os.path.join(root, "manifest", "*.csv")))
+    if not manifests:
+        return [f"{root}: no manifest/*.csv -- the embeddings-only pass never ran"]
+
+    listings, found = {}, set()
+    for path in manifests:
+        with open(path, newline="") as f:
+            for row in (r for r in csv.DictReader(f) if r["split"] == split):
+                container = row.get("zip") or ""
+                if container not in listings:
+                    listings[container] = listing(root, container)
+                if row["embedding_path"] in listings[container]:
+                    found.add(row["sample_id"])
+
+    absent = expected - found
+    print(f"\nembeddings: {len(found & expected)}/{len(expected)} encoded series covered by {root}")
+    if absent:
+        return [f"{len(absent)} of {len(expected)} series have no readable embedding under {root} "
+                f"(first: {sorted(absent)[:3]})"]
+    return []
 
 
 def main():
@@ -123,6 +154,10 @@ def main():
             problems.append(f"boundary/{name}.pt has {got_c} channels, expected {want_c} "
                             f"(mean and std) -- this dataset predates sample_latents, re-run "
                             f"preprocessing")
+
+    # A split conditioning tree is its own array, verified the same way.
+    if mri.get("embedding_root"):
+        problems += verify_embeddings(mri.embedding_root, args.split, found)
 
     missing = set(owner) - found
     print(f"\nencoded {len(found)}/{len(owner)} expected series ({100*len(found)/max(len(owner),1):.2f}%)")

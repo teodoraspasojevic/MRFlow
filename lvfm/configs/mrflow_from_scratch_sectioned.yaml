@@ -1,10 +1,28 @@
-# MRFlow from scratch: MR-RATE report-to-volume, STDiT-L (512M) trained from random init -- no
-# CTFlow weights. The counterpart to mrflow_from_ct_checkpoint.yaml, identical in every respect
-# except initialization and the knobs that follow from it.
+# MRFlow with sectioned conditioning, from scratch: MR-RATE report-to-volume, STDiT-L (512M) from
+# random init, conditioned on three 2560-wide report-section tokens instead of one pooled CXR-BERT
+# CLS vector. Everything else is mrflow_from_scratch.yaml unchanged -- same architecture, init,
+# batch, lr, warmup, schedule and node count -- so the two runs differ in the conditioning and in
+# nothing else, which is what makes them comparable.
+#
+# The conditioning is `report2ct_style_meta` in echosyn/common/mrrate.py: findings, impression and
+# the acquisition markers, each pooled independently by MedEmbed-large, Bio_ClinicalBERT and
+# CXR-BERT, concatenated on the feature axis (1024 + 768 + 768 = 2560) and stacked on the sequence
+# axis. Three tokens rather than one is the point -- cross-attention over a single key is
+# degenerate, since a softmax over one element is identically 1, so a pooled conditioning reaches
+# the denoiser as a per-channel bias that is the same at every voxel and its query and key
+# projections never receive gradient.
+#
+# Two prerequisites, both of which fail loudly rather than silently:
+#
+#   1. The three encoders staged under mri.text_root (~2.3 GB).
+#   2. mri.embedding_root populated by
+#        sbatch --array=0-63 slurms/mrflow_preprocess_helma.sh train --zip --embeddings_only
+#      That pass re-encodes only the reports; the latents under dataset_root are the ones the
+#      pooled run already encoded and are read exactly as they are.
 #
 # Every path is a real path on Helma -- no shell variables, so this file runs as-is, no envsubst.
 #
-#   sbatch --nodes=16 slurms/mrflow_train_helma.sh lvfm/configs/mrflow_from_scratch.yaml
+#   sbatch --nodes=16 slurms/mrflow_train_helma.sh lvfm/configs/mrflow_from_scratch_sectioned.yaml
 #
 # THIS IS CTFLOW'S OWN SCRATCH RECIPE, NOT A DERIVED ONE. CTFlow was trained from random init on
 # this same cluster, and its launcher and config are still in this repo:
@@ -135,9 +153,14 @@ white_value: 1.0
 mri:
   raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
   dataset_root: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_flux
-  conditioning: cxr_bert_cls   # one pooled CXR-BERT CLS token; see mrrate.CONDITIONINGS
+  # Three frozen encoders, one 2560-wide token per report section. See mrrate.CONDITIONINGS.
+  conditioning: report2ct_style_meta
+  text_root: /hnvme/workspace/y100dc19-mrflow-final/models
   text_checkpoint: /hnvme/workspace/y100dc19-mrflow-final/models/BiomedVLP-CXR-BERT-specialized
-  text_max_length: 512          # CXR-BERT's context; longer reports are truncated head-first
+  text_max_length: 512          # every encoder here caps at 512; sections are far shorter
+  # Where `preprocess_mrrate.py --embeddings_only` wrote this conditioning's embeddings. The
+  # latents under dataset_root are the ones the pooled run encoded and are reused as they are.
+  embedding_root: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_sectioned
   vae_batch_size: 32            # slices per VAE forward
   # Series selection. All ~576k eligible train series would be ~9 TB of latents and ~1300
   # GPU-hours to encode; a 60k-step fine-tune at an effective batch of 64 sees 3.8M samples, so
@@ -173,8 +196,8 @@ denoiser:
         class_dropout_prob: 0.0
         drop_path: 0.0
         no_temporal_pos_emb: false
-        caption_channels: 768     # one pooled CXR-BERT CLS vector
-        model_max_length: 1
+        caption_channels: 2560    # 1024 MedEmbed-large + 768 Bio_ClinicalBERT + 768 CXR-BERT
+        model_max_length: 3       # findings, impression, acquisition
         space_scale: 1.0
         time_scale: 1.0
         enable_flashattn: false
@@ -236,6 +259,7 @@ datasets:
       active: true
       params:
         root: ${mri.dataset_root}
+        embedding_root: ${mri.embedding_root}
         split: train
         block_size: ${globals.target_nframes}
         p_start: 0.3             # matches the released checkpoint's own `black_rate_0.3`
@@ -246,6 +270,7 @@ val_datasets:
       active: true
       params:
         root: ${mri.dataset_root}
+        embedding_root: ${mri.embedding_root}
         split: val
         block_size: ${globals.target_nframes}
         p_start: 0.0             # validation compares real -> real blocks
@@ -288,9 +313,9 @@ logging_dir: logs
 report_to: wandb
 wandb_args:
   project: MRFlow
-  name: mrflow_from_scratch
+  name: mrflow_from_scratch_sectioned
   group: mrflow
-  id: mrflow_from_scratch
+  id: mrflow_from_scratch_sectioned
 
 # 2000, CTFlow's own value, rather than the 5000 the shorter runs use: at ~1.2 s/step this is a
 # 40-minute recovery window, and an interrupted leg wastes that window x 64 GPUs -- 43 GPU-hours at

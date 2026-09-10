@@ -9,6 +9,16 @@
 #
 # Task 0 also writes the two boundary latents, so let it finish before training starts.
 #
+# The config is an env override, not $1 -- $1 is the split here, unlike the train and eval scripts.
+# A different conditioning is therefore a different config, and re-encoding only its report
+# embeddings (no VAE, no volumes, ~10x faster) is `--embeddings_only`:
+#
+#   sbatch --export=ALL,MRFLOW_CONFIG=lvfm/configs/mrflow_from_scratch_sectioned.yaml \
+#       --array=0-63 slurms/mrflow_preprocess_helma.sh train --zip --embeddings_only
+#
+# That writes only <config>.mri.embedding_root; the latents under dataset_root are untouched, and
+# task 0 writes no boundary latents because it does not need to.
+#
 # Anything after the split is passed through to the script. `--zip` bundles each shard into one
 # file, which this account needs: 244k loose .pt files is well past its 102k inode quota.
 #
@@ -43,9 +53,9 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 VENV=/hnvme/workspace/y100dc19-mrflow-final/venv
-CONFIG=lvfm/configs/mrflow_STDiT-L2_16f8.yaml
+CONFIG=${MRFLOW_CONFIG:-lvfm/configs/mrflow_STDiT-L2_16f8.yaml}
 
-echo "[$(date)] shard $SHARD/$NUM_SHARDS split=$SPLIT"
+echo "[$(date)] shard $SHARD/$NUM_SHARDS split=$SPLIT config=$CONFIG"
 $VENV/bin/python lvfm/preprocess_mrrate.py \
     --config $CONFIG --split "$SPLIT" \
     --shard "$SHARD" --num_shards "$NUM_SHARDS" "$@"

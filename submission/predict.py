@@ -4,7 +4,7 @@
 MRFlow's own STDiT + flow-matching autoregressive generator (`auto_regressive_generate`), reused
 unchanged -- this is the same rollout `evaluation/main.py` scores. What's new here is the platform
 I/O contract, decoding (modality, plane) out of each `input_image_name`, turning the challenge's one
-flat report string into the {findings, impression} sections `encode_conditioning` was trained
+flat report string into the {findings, impression} sections the conditioning was trained
 against, writing a NIfTI whose affine matches the axis order the model rolls out in, multi-GPU
 launch and checkpoint/resume.
 
@@ -163,8 +163,8 @@ def read_prompts(input_dir: Path) -> list[tuple[str, str]]:
     return prompts
 
 
-# Section headings MR-RATE's own structuring step emits -- see `echosyn.common.mrrate.format_report`,
-# which is what `encode_conditioning` was trained against (`sections=("findings", "impression")`).
+# Section headings MR-RATE's own structuring step emits -- see `echosyn.common.mrrate.format_report`
+# and `report_sections`, which are what the conditioning was trained against.
 _SECTION_HEADINGS = {
     "clinical_information": r"clinical(?:\s+information|\s+history)?|history|indication",
     "technique": r"technique|protocol",
@@ -283,13 +283,13 @@ def resolve_baked(name_env: str, default_name: str) -> Path:
 
 
 def build_generator(config, device: str):
-    """`(generator, tokenizer, text_encoder)`. Mirrors `evaluation/main.py::build_generator`, plus
-    the text encoder MRFlow's own `preprocess_mrrate.py` builds separately."""
+    """`(generator, conditioner)`. Mirrors `evaluation/main.py::build_generator`, plus the text
+    conditioner MRFlow's own `preprocess_mrrate.py` builds separately."""
     import torch
 
     from auto_regressive_generate import LatentAutoregressiveGenerator
     from echosyn.common import get_vae_scaler, instantiate, instantiate_class_from_config
-    from echosyn.common.mrrate import build_text_encoder
+    from echosyn.common.mrrate import build_conditioner
 
     denoiser_dir = resolve_dir("MRFLOW_DENOISER_DIR", "denoiser_ema")
     vae_dir = resolve_dir("MRFLOW_VAE_DIR", "flux-vae-f8-16ch")
@@ -298,12 +298,15 @@ def build_generator(config, device: str):
     # (get_vae_scaler reads vae.pretrained/config.json; text_checkpoint is otherwise informational).
     config.vae.pretrained = str(vae_dir)
     config.mri.text_checkpoint = str(text_dir)
+    # A sectioned conditioning needs its other encoders, which the weights bundle stages beside
+    # this one, so the encoder root is that directory's parent.
+    config.mri.text_root = str(text_dir.parent)
 
     print(f"denoiser={denoiser_dir} vae={vae_dir} text_encoder={text_dir} device={device}")
     denoiser = instantiate_class_from_config(config.denoiser)
     denoiser = denoiser.from_pretrained(str(denoiser_dir)).to(device).eval()
     vae = instantiate(config.vae).eval().to(device)
-    tokenizer, text_encoder = build_text_encoder(str(text_dir), device)
+    conditioner = build_conditioner(config.mri, device)
 
     generator = LatentAutoregressiveGenerator(
         denoiser=denoiser, vae=vae, device=device,
@@ -314,7 +317,7 @@ def build_generator(config, device: str):
         use_bf16=env_str("MRFLOW_USE_BF16", "1") == "1",
         use_compile=env_str("MRFLOW_USE_COMPILE", "1") == "1",
     )
-    return generator, tokenizer, text_encoder
+    return generator, conditioner
 
 
 # ─────────────────────────── writing the NIfTI ───────────────────────────
@@ -364,7 +367,7 @@ def main() -> int:
     from omegaconf import OmegaConf
 
     from echosyn.common import check_label_mapping
-    from echosyn.common.mrrate import encode_conditioning, modality_to_id, plane_to_id
+    from echosyn.common.mrrate import modality_to_id, plane_to_id
     from helpers.inplane_resample import InplaneSpacingTable, to_inplane_grid
     from helpers.native_spacing import (DEFAULT_MODE, DEFAULT_TOP_K, MODES, NativeSpacingTable,
                                         to_native_grid)
@@ -418,7 +421,7 @@ def main() -> int:
     dtype = np.dtype(env_str("MRFLOW_OUTPUT_DTYPE", "float32"))
 
     device = f"cuda:{local_rank}" if is_ddp else env_str("MRFLOW_DEVICE", "cuda")
-    generator, tokenizer, text_encoder = build_generator(config, device)
+    generator, conditioner = build_generator(config, device)
     print(f"[rank {rank}] modality_cfg_scale={generator.modality_cfg_scale} "
           f"report_cfg_scale={generator.report_cfg_scale} max_blocks={max_blocks}")
 
@@ -436,8 +439,7 @@ def main() -> int:
         sections = split_sections(report)
 
         torch.manual_seed(seed_for_case(case_id, base_seed))
-        embedding = encode_conditioning(tokenizer, text_encoder, sections, modality, plane,
-                                        max_length=config.mri.text_max_length)
+        embedding = conditioner.encode(sections, modality, plane)
         embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
         modality_id = torch.tensor([modality_to_id(modality)], device=device)
         plane_id = torch.tensor([plane_to_id(plane)], device=device)

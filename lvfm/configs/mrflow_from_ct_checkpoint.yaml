@@ -78,6 +78,7 @@ white_value: 1.0
 mri:
   raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
   dataset_root: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_flux
+  conditioning: cxr_bert_cls   # one pooled CXR-BERT CLS token; see mrrate.CONDITIONINGS
   text_checkpoint: /hnvme/workspace/y100dc19-mrflow-final/models/BiomedVLP-CXR-BERT-specialized
   text_max_length: 512          # CXR-BERT's context; longer reports are truncated head-first
   vae_batch_size: 32            # slices per VAE forward

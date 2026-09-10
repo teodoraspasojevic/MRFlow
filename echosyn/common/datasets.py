@@ -87,10 +87,13 @@ class MRRateLatentBlockDataset(Dataset):
 
     Modality and plane are resolved to integer class ids at construction, so an unmapped label
     fails here rather than 40 minutes into a run.
+
+    `embedding_root` we have two conditioning types: CXR BERT's CLS token or 3 concatenated text encoders.
+    This argument leads us to the directory where configured conditioning embeddings live.
     """
 
     def __init__(self, root, split, block_size=16, p_start=0.3, p_end=0.2,
-                 deterministic=False, seed=42):
+                 deterministic=False, seed=42, embedding_root=None):
         self.root = root
         self.block_size = block_size
         self.p_start = p_start
@@ -104,6 +107,20 @@ class MRRateLatentBlockDataset(Dataset):
 
         # Resolve every label up front: the whole manifest is validated once, in the main process.
         self.labels = [(modality_to_id(r["modality"]), plane_to_id(r["plane"])) for r in self.rows]
+
+        # Figures out the root of the configured conditioning embeddings
+        self.embedding_root = embedding_root or root
+        if embedding_root:
+            by_id = {r["sample_id"]: r for r in read_manifest(embedding_root, split)}
+            absent = [r["sample_id"] for r in self.rows if r["sample_id"] not in by_id]
+            if absent:
+                raise RuntimeError(f"{len(absent)} of {len(self.rows)} {split!r} series have no "
+                                   f"embedding under {embedding_root} (first: {absent[:3]})")
+            self.embedding_rows = [by_id[r["sample_id"]] for r in self.rows]
+            print(f"[{split}] embeddings from {embedding_root}")
+        else:
+            self.embedding_rows = self.rows
+
         modality, plane, pair = label_counts(self.rows)
         print(f"[{split}] {len(self.rows)} series")
         print(f"[{split}] modality: {dict(sorted(modality.items()))}")
@@ -141,7 +158,7 @@ class MRRateLatentBlockDataset(Dataset):
             t = rng.randint(0, T - 2 * b)
             block_curr, block_next = latent[:, t:t + b], latent[:, t + b:t + 2 * b]
 
-        embedding = load_artifact(self.root, row, "embedding_path")
+        embedding = load_artifact(self.embedding_root, self.embedding_rows[idx], "embedding_path")
         embedding = embedding / (embedding.norm(p=2) + 1e-6)
 
         modality_id, plane_id = self.labels[idx]
@@ -150,7 +167,7 @@ class MRRateLatentBlockDataset(Dataset):
             # Posterior parameters, not latents -- train.py samples these before scaling.
             "image": block_curr.float(),   # condition: [2C, T, H, W]
             "video": block_next.float(),   # target:    [2C, T, H, W]
-            "embedding": embedding,        # text embedding: [1, D]
+            "embedding": embedding,        # text embedding: [N, D]
             # Scalars, so the default collator stacks them into [B] class-label tensors.
             "modality_id": torch.tensor(modality_id, dtype=torch.long),
             "plane_id": torch.tensor(plane_id, dtype=torch.long),

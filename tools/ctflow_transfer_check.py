@@ -24,8 +24,8 @@ from omegaconf import OmegaConf
 from echosyn.common import (get_noise, get_vae_scaler, instantiate,
                             instantiate_class_from_config, load_init_weights, sample_latents,
                             scale_latents)
-from echosyn.common.mrrate import (_unit, build_text_encoder, encode_conditioning, encode_volume,
-                                   list_series, preprocess_volume, read_member, read_report)
+from echosyn.common.mrrate import (_unit, build_conditioner, encode_volume, list_series,
+                                   preprocess_volume, read_member, read_report)
 
 # name -> (a, b), mapping a [0, 1] volume into the range under test as volume * a + b.
 RANGES = {"[0, 1]": (1.0, 0.0), "[-1, 1]": (2.0, -1.0)}
@@ -61,7 +61,7 @@ def main():
 
     vae = instantiate(config.vae).eval().to(device, torch.float32)
     vae_scaling = get_vae_scaler(config, "cpu")
-    tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
+    conditioner = build_conditioner(mri, device)
     denoiser = instantiate_class_from_config(config.denoiser).eval()
     load_init_weights(config, denoiser, logging.getLogger(__name__))
     denoiser = denoiser.to(device)
@@ -75,9 +75,9 @@ def main():
         for entry in series:
             volume, spacing = preprocess_volume(read_member(entry["archive"], entry["member"]),
                                                 entry["plane"], **preprocess_args)
-            embeddings.append(_unit(encode_conditioning(
-                tokenizer, text_encoder, read_report(entry["archive"], entry["study_uid"]),
-                entry["modality"], entry["plane"], spacing, mri.text_max_length,
+            embeddings.append(_unit(conditioner.encode(
+                read_report(entry["archive"], entry["study_uid"]),
+                entry["modality"], entry["plane"], spacing,
             )).unsqueeze(0))
             for name, (a, b) in RANGES.items():
                 z = encode_volume(vae, volume * a + b, mri.vae_batch_size, torch.float32)

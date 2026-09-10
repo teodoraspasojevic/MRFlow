@@ -255,29 +255,17 @@ def acquisition_prefix(modality, plane, spacing=None):
     return " ".join(parts)
 
 
-def encode_conditioning(tokenizer, model, report, modality, plane, spacing=None,
-                        max_length=512, sections=("findings", "impression")):
-    """Report + acquisition markers -> one pooled [1, D] conditioning vector.
+SECTIONS = ("findings", "impression", "acquisition")
 
-    The string is `acquisition_prefix` followed by the report sections, so conditioning always
-    starts with modality, plane and spacing, and one CLS pass over that string is the whole
-    embedding.
 
-    Markers are faint at this length (~0.0002 cosine against ~0.03 for report content), but the
-    prefix is no longer pooled separately and added back -- this is one encode of one string.
-
-    No caller passes `spacing` any more, so `[SPACING]` is omitted: it described the *native*
-    geometry while the stored latents are all 1 mm isotropic, its (S, R, A) frame disagreed with the
-    plane-permuted array, and the challenge cannot supply it at inference. It was also measurably
-    inert -- an 8x wrong value moved the normalized embedding by 7e-5 cosine, against ~0.09 for a
-    different patient's report. Pass a spacing here to put it back.
-
-    Stays a single 768-d token, so STDiT's caption path and the released checkpoint's weights are
-    untouched.
+def report_sections(report, modality, plane, spacing=None):
+    """The three sectioned-conditioning sections, in `SECTIONS` order.
     """
-    prefix = acquisition_prefix(modality, plane, spacing)
-    return encode_report(tokenizer, model, f"{prefix}\n{format_report(report, sections)}",
-                         max_length)
+    return (
+        (report.get("findings") or "").strip(),
+        (report.get("impression") or "").strip(),
+        acquisition_prefix(modality, plane, spacing),
+    )
 
 
 def _unit(x):
@@ -467,39 +455,163 @@ def encode_boundary(vae, value, inplane_size=256):
 
 ### Text ###
 
+# Available encoders
+TEXT_ENCODERS = {
+    "cxr_bert": ("BiomedVLP-CXR-BERT-specialized", "bert_shim"),
+    "medembed_large": ("MedEmbed-large-v0.1", "auto"),
+    "bio_clinicalbert": ("Bio_ClinicalBERT", "auto"),
+}
 
-def build_text_encoder(checkpoint, device, dtype=torch.float32):
-    """Frozen CXR-BERT -> (tokenizer, model).
+# Available conditioning configurations.
+# A. "cxr_bert_cls" - report is encoded with CXR-BERT and only its CLS token is used -> [1, 768]
+# B. "report2ct_style_meta" - 3 report sections are encoded separately, each is encoded with three different encoders
+#    and the resulting vectors are concatenated (1024 MedEmbed-large + 768 Bio_ClinicalBERT + 768 CXR-BERT, in that order) -> [3, 2560]
+CONDITIONINGS = {
+    "cxr_bert_cls": {
+        "encoders": ("cxr_bert",), "pooling": "cls", "sections": None, "tokens": 1, "dim": 768,
+    },
+    "report2ct_style_meta": {
+        "encoders": ("medembed_large", "bio_clinicalbert", "cxr_bert"),
+        "pooling": "mean", "sections": SECTIONS, "tokens": len(SECTIONS), "dim": 2560,
+    },
+}
 
-    Loaded as a stock `BertModel` rather than with `trust_remote_code`: CXR-BERT declares a custom
-    model type whose repo code would otherwise execute, while its `bert.*` weights are plain BERT.
-    `.from_pretrained` on the named tokenizer class, never `BertTokenizerFast(vocab_file=...)` --
-    the constructor form builds a WordPiece model that emits one [UNK] per word without raising.
+DEFAULT_CONDITIONING = "cxr_bert_cls"
+
+
+def build_conditioner(mri, device, dtype=torch.float32):
+    """The one place a config becomes a live `TextConditioner`.
+
+    `mri.conditioning` defaults to the released checkpoint's pooled CXR-BERT, and the encoder root
+    falls back to the parent of the single-encoder `mri.text_checkpoint` -- which is the same
+    directory the sectioned encoders are staged in. Both defaults exist so that a config written
+    before sectioned conditioning (including the ones saved next to released checkpoints) keeps
+    working untouched, and neither can be silently wrong: `check_conditioning` refuses to start a
+    run whose denoiser caption shape disagrees with the choice.
     """
-    from transformers import BertConfig, BertModel, BertTokenizerFast
-
-    tokenizer = BertTokenizerFast.from_pretrained(checkpoint, local_files_only=True)
-    config = BertConfig.from_pretrained(checkpoint, local_files_only=True)
-    model = BertModel.from_pretrained(checkpoint, config=config, local_files_only=True,
-                                      add_pooling_layer=False)
-    model.eval().to(device, dtype)
-    for p in model.parameters():
-        p.requires_grad_(False)
-    return tokenizer, model
+    return TextConditioner(
+        mri.get("conditioning", DEFAULT_CONDITIONING),
+        mri.get("text_root") or os.path.dirname(mri.text_checkpoint),
+        device, dtype, max_length=mri.text_max_length,
+    )
 
 
-def encode_report(tokenizer, model, text, max_length=512):
-    """-> [1, D] pooled CLS state, unnormalized.
+def check_conditioning(config):
+    """Refuse a config whose denoiser is not shaped for the conditioning it selects.
 
-    STDiT cross-attends exactly one caption token (`model_max_length: 1`), so the report becomes a
-    single pooled vector. Stored unnormalized; the dataset L2-normalizes at load, as CT does.
+    Static -- no encoder is loaded -- so `lvfm/train.py` can call it without a text encoder, which
+    it never builds: it trains on the embeddings preprocessing already wrote. A config with no
+    `mri` block is a CT run and has nothing to check.
     """
-    batch = tokenizer(text, add_special_tokens=True, truncation=True, max_length=max_length,
-                      return_tensors="pt")
-    batch = {k: v.to(model.device) for k, v in batch.items()}
-    with torch.no_grad():
-        tokens = model(**batch).last_hidden_state
-    return tokens[:, 0].float().cpu()
+    if not config.get("mri"):
+        return
+    name = config.mri.get("conditioning", DEFAULT_CONDITIONING)
+    if name not in CONDITIONINGS:
+        raise ValueError(f"unknown conditioning {name!r}. Choose from: {sorted(CONDITIONINGS)}")
+    spec, args = CONDITIONINGS[name], config.denoiser.args
+    if (args.caption_channels, args.model_max_length) != (spec["dim"], spec["tokens"]):
+        raise RuntimeError(
+            f"conditioning {name!r} produces [{spec['tokens']}, {spec['dim']}] tokens, but the "
+            f"denoiser is configured for caption_channels={args.caption_channels}, "
+            f"model_max_length={args.model_max_length}."
+        )
+
+
+class TextConditioner:
+    """Report -> conditioning tokens `[N, D]`, under one named configuration.
+
+    Holds the frozen encoders, so preprocessing, evaluation and the submission container build the
+    conditioning the same way and cannot drift in tokenizer, pooling or section order. Stored
+    unnormalized; the dataset L2-normalizes the whole tensor at load, as CT does.
+    """
+
+    def __init__(self, name, root, device, dtype=torch.float32, max_length=512):
+        if name not in CONDITIONINGS:
+            raise ValueError(f"unknown conditioning {name!r}. Choose from: {sorted(CONDITIONINGS)}")
+        spec = CONDITIONINGS[name]
+        self.name = name
+        self.sections = spec["sections"]
+        self.pooling = spec["pooling"]
+        self.tokens = spec["tokens"]
+        self.dim = spec["dim"]
+        self.max_length = max_length
+        self.encoders = [self._load(n, root, device, dtype) for n in spec["encoders"]]
+
+        width = sum(m.config.hidden_size for _, m in self.encoders)
+        if width != self.dim:
+            raise RuntimeError(
+                f"conditioning {name!r} built {width} channels wide, but the table says {self.dim} "
+                f"-- a staged snapshot's hidden size is not what this configuration was defined "
+                f"against. Check {root}."
+            )
+
+    @staticmethod
+    def _load(name, root, device, dtype):
+        from transformers import (AutoConfig, AutoModel, AutoTokenizer, BertConfig, BertModel,
+                                  BertTokenizerFast)
+
+        directory, loader = TEXT_ENCODERS[name]
+        path = os.path.join(root, directory)
+        if loader == "bert_shim":
+            tokenizer = BertTokenizerFast.from_pretrained(path, local_files_only=True)
+            config = BertConfig.from_pretrained(path, local_files_only=True)
+            model = BertModel.from_pretrained(path, config=config, local_files_only=True,
+                                              add_pooling_layer=False)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True,
+                                                      trust_remote_code=False)
+            config = AutoConfig.from_pretrained(path, local_files_only=True,
+                                                trust_remote_code=False)
+            # These are MLM checkpoints with no trained pooler; letting transformers add one would
+            # hand back a randomly initialized `pooler_output`.
+            model = AutoModel.from_pretrained(path, config=config, local_files_only=True,
+                                              trust_remote_code=False, add_pooling_layer=False)
+        model.eval().to(device, dtype)
+        for p in model.parameters():
+            p.requires_grad_(False)
+        return tokenizer, model
+
+    def _pool(self, tokenizer, model, texts):
+        """`[len(texts), D]` for one encoder. Padding is excluded from the mean, never averaged in."""
+        batch = tokenizer(texts, add_special_tokens=True, truncation=True,
+                          max_length=self.max_length, padding=True, return_tensors="pt")
+        batch = {k: v.to(model.device) for k, v in batch.items()}
+        with torch.no_grad():
+            tokens = model(**batch).last_hidden_state
+        if self.pooling == "cls":
+            return tokens[:, 0].float().cpu()
+        weights = batch["attention_mask"].unsqueeze(-1).to(tokens.dtype)
+        return ((tokens * weights).sum(1) / weights.sum(1).clamp(min=1.0)).float().cpu()
+
+    def encode(self, report, modality, plane, spacing=None):
+        """-> `[tokens, dim]`, one row per section (or the single pooled vector).
+
+        The acquisition markers always reach the encoder: as the head of the joined string for a
+        pooled configuration, as their own section for a sectioned one. Markers are faint at report
+        length (~0.0002 cosine against ~0.03 for report content), which is what the sectioned
+        configuration's third token exists to fix.
+
+        No preprocessing or inference path passes `spacing`, so `[SPACING]` is omitted there (only
+        `tools/ctflow_transfer_check.py` still does): it described the *native* geometry
+        while the stored latents are all 1 mm isotropic, its (S, R, A) frame disagreed with the
+        plane-permuted array, and the challenge cannot supply it at inference. It was also
+        measurably inert -- an 8x wrong value moved the normalized embedding by 7e-5 cosine, against
+        ~0.09 for a different patient's report. Pass a spacing here to put it back.
+        """
+        if self.sections is None:
+            texts = [f"{acquisition_prefix(modality, plane, spacing)}\n{format_report(report)}"]
+        else:
+            texts = list(report_sections(report, modality, plane, spacing))
+        # One pass per encoder over every section at once, then concatenate on the feature axis.
+        # Each encoder pools its own tokenization: three tokenizers have no token-level
+        # correspondence to align, which is what makes independent pooling the only way to fuse
+        # them. Batching the sections rather than encoding them one at a time is equivalent up to
+        # roundoff -- masked-mean pooling excludes the padding, so a section's vector depends on
+        # its own tokens only, but the batch's padded width changes the matmul shapes and with them
+        # the last bits (measured max 1.6e-6 absolute, 1.8e-7 relative, cosine 1.0 to 10 places).
+        embedding = torch.cat([self._pool(t, m, texts) for t, m in self.encoders], dim=-1)
+        assert embedding.shape == (self.tokens, self.dim), embedding.shape
+        return embedding
 
 
 ### Artifact storage ###
@@ -516,11 +628,15 @@ class LatentStore:
 
     The cost is resume granularity: loose artifacts are skipped individually on a re-run, while a
     bundle is written fresh, so a killed shard re-encodes all of its series.
+
+    `bundle_dir` is the directory the zip goes in, which a re-embedding pass points elsewhere so its
+    archives are not mistaken for latent bundles. Nothing reads it back: the manifest's `zip` column
+    records the full relative path.
     """
 
-    def __init__(self, root, name, bundle=False):
+    def __init__(self, root, name, bundle=False, bundle_dir="latents"):
         self.root = root
-        self.zip_path = os.path.join("latents", f"{name}.zip") if bundle else None
+        self.zip_path = os.path.join(bundle_dir, f"{name}.zip") if bundle else None
         if bundle:
             path = os.path.join(root, self.zip_path)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -565,6 +681,11 @@ class LatentStore:
 MANIFEST_FIELDS = ("sample_id", "split", "modality", "plane", "n_slices",
                    "latent_path", "embedding_path", "zip")
 
+# What a re-embedding pass can honestly write: it decodes no volume, so it knows neither `n_slices`
+# nor whether the volume was long enough to keep. The dataset joins on `sample_id` against the
+# latent manifest, which stays the authority on which series exist.
+EMBEDDING_MANIFEST_FIELDS = ("sample_id", "split", "embedding_path", "zip")
+
 
 def read_manifest(root, split):
     """Every row for one split. Shard manifests are globbed, so there is no merge step."""
@@ -575,10 +696,10 @@ def read_manifest(root, split):
     return rows
 
 
-def write_manifest(path, rows):
+def write_manifest(path, rows, fields=MANIFEST_FIELDS):
     """One CSV per preprocessing shard; the dataset globs them, so there is no merge step."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)

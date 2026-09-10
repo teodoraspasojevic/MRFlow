@@ -31,7 +31,7 @@ import wandb
 from echosyn.common import *
 from echosyn.common.schedulers import StepBasedLearningRateScheduleWithWarmup
 from echosyn.common.datasets import instantiate_dataset
-from echosyn.common.mrrate import CFG_NULL_MODALITY_ID
+from echosyn.common.mrrate import CFG_NULL_MODALITY_ID, check_conditioning
 
 
 allow_ops_in_compiled_graph()
@@ -207,6 +207,9 @@ def main():
 
     args = parse_args()
     config = OmegaConf.load(args.config)
+    # Seconds, and before anything is allocated: an embedding shape the denoiser cannot take would
+    # otherwise surface as a caption-projection error at step 1, on 16 nodes.
+    check_conditioning(config)
 
     logger = get_logger(__name__, log_level="INFO")
     accelerator, logger = setup_accelerator_and_logging(config, logger)
