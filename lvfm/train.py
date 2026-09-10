@@ -259,6 +259,11 @@ def main():
         lr_scheduler = instantiate_class_from_config(config.scheduler, optimizer)
     else:
         global_step = initial_global_step
+        # The scheduler is built after prepare(), so accelerate never checkpoints it -- there is no
+        # scheduler.bin to restore. Fast-forward it by hand, or every resume re-runs warmup from 0
+        # and restarts the decay clock, making a chained run follow a different lr curve.
+        lr_scheduler.last_epoch = global_step - 1
+        lr_scheduler.step()
 
     if global_step == 0:
         set_seed(config.seed)
