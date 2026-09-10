@@ -276,7 +276,8 @@ def run_shard(config, args, out, device):
             accumulator.add_missing(case_id, bucket, entry["modality"])
             continue
 
-        accumulator.add(case_id, bucket, entry["modality"], real, produced)
+        accumulator.add(case_id, bucket, entry["modality"], real, produced, spacing,
+                        entry["plane"])
 
         if volumes_left > 0:
             volumes_left -= 1

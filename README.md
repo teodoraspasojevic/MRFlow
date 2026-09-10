@@ -131,13 +131,17 @@ This runs 64 parallel workers (16 nodes × 4 GPUs), each processing a partition 
 
 ---
 
-## Challenge evaluation (MRFlow)
+## Evaluation
 
-Scores a checkpoint with the official VLM3D `mr-volume-generation` metrics — MSE, PSNR, SSIM and
-2.5D FID (XY/XZ/YZ and their average) — using the vendored evaluation container in
-`evaluation/metrics.py`, so the numbers are the leaderboard's. Ground truth is the released
-MR-RATE volume, RAS-reoriented and otherwise untouched; the metric resamples the generated volume
-onto it, exactly as the platform does to a submission.
+Scores a checkpoint twice over. The **challenge** metrics — MSE, PSNR, SSIM and 2.5D FID
+(XY/XZ/YZ and their average) — come from the vendored evaluation container in
+`evaluation/challenge_metrics.py`, so those numbers are the leaderboard's: ground truth is the
+released MR-RATE volume, RAS-reoriented and otherwise untouched, and the metric resamples the
+generated volume onto it exactly as the platform does to a submission. The **paper** metrics —
+slice-axis FID on Inception-v3 pool3, FVD over 16- and 64-slice I3D clips, Inception Score — come
+from `evaluation/paper_metrics.py`, which puts both volumes in the 1 mm isotropic / 256² grid the
+model was trained on. See [`evaluation/README.md`](evaluation/README.md) for why the two families
+are given different arrays.
 
 ```bash
 # one array task per shard, then one pass to pool them
