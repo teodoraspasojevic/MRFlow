@@ -27,8 +27,8 @@ from evaluation.paper_metrics import (CLIP_CONFIGS, STRATA, ClipFVDAccumulator,
                                       canonicalize_generated, canonicalize_gt, fid_pooled,
                                       fvd_pooled, inception_score, slice_spacing, stratum_for)
 
-# Reporting order, and it drives the console dump, metrics.json and the W&B table at once.
-# Paper metrics first -- they are what the paper reports -- then the challenge block, then counts.
+# The two metric families, by provenance. Membership, not reporting order -- `METRIC_KEYS` below
+# leads with the headline numbers and interleaves the families to do it.
 PAPER_KEYS = (
     "FID", "FVD_f16", "FVD_f64", "IS_mean", "IS_std",
     "FID_thin", "FID_thick", "FVD_f16_thin", "FVD_f16_thick", "FVD_f64_thin", "FVD_f64_thick",
@@ -40,7 +40,16 @@ CHALLENGE_KEYS = (
 )
 COUNT_KEYS = ("n_total_files", "n_scored_files", "n_missing_outputs",
               "n_excluded_out_of_scope_modality")
-METRIC_KEYS = PAPER_KEYS + CHALLENGE_KEYS + COUNT_KEYS
+
+# The numbers a run is read by, in the order they are read in: the paper's distribution distances,
+# then the challenge's, then the per-voxel trio. Everything else -- the strata splits, the
+# per-plane FIDs, the sample and file counts -- keeps its family order behind them.
+HEADLINE_KEYS = ("FVD_f16", "FVD_f64", "FID", "FID_2p5D_Avg", "IS_mean",
+                 "PSNR_mean", "MSE_mean", "SSIM_mean")
+
+# Reporting order, and it drives the console dump, metrics.json and the W&B table at once.
+METRIC_KEYS = HEADLINE_KEYS + tuple(
+    k for k in PAPER_KEYS + CHALLENGE_KEYS + COUNT_KEYS if k not in HEADLINE_KEYS)
 
 
 class ChallengeAccumulator:

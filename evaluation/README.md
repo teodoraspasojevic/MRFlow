@@ -275,9 +275,10 @@ are counted in `n_excluded_out_of_scope_modality` and skipped before generation.
 **Missing cases are dropped from the MSE/PSNR/SSIM means**, not penalized with a worst-case value —
 that is what the official aggregation actually does, despite what its per-case record suggests.
 
-**`METRIC_KEYS` is also the reporting order** — FID average, PSNR, SSIM, MSE, the per-plane FIDs,
-then `dice` and the counts — and it drives the console dump, `metrics.json` and the W&B table at
-once.
+**`METRIC_KEYS` is also the reporting order** — `HEADLINE_KEYS` first (`FVD_f16`, `FVD_f64`, `FID`,
+`FID_2p5D_Avg`, `IS_mean`, `PSNR_mean`, `MSE_mean`, `SSIM_mean`), then whatever each family has
+left: the strata splits and sample counts, the per-plane FIDs and `dice`, and the file counts. It
+drives the console dump, `metrics.json` and the W&B table at once.
 
 One caveat on the counts: `n_total_files` counts eligible MR-RATE series from `list_series` (report
 present, not derived, not a localizer, no duplicate acquisitions), not files in the platform's

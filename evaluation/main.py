@@ -303,9 +303,8 @@ def print_metrics(metrics, out):
 
 def log_wandb(config, args, metrics, out):
     """The metrics table, the run summary and the scalars, plus whatever example mp4s the shards
-    kept. Table row order is METRIC_KEYS -- FID average first, then PSNR/SSIM/MSE, then the
-    per-plane FIDs -- which is the order the R2V-MR-Generation baseline logs, so the two models'
-    runs read side by side.
+    kept. Table row order is METRIC_KEYS -- the headline block first (both FVDs, both FIDs, IS,
+    then PSNR/MSE/SSIM), then the strata splits, the per-plane FIDs and the counts.
 
     The guidance scales go in the run *name* as well as the config. A cfg sweep is several runs
     over one checkpoint that differ in nothing else, so without them in the label the run table is
