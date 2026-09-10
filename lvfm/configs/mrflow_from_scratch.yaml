@@ -36,8 +36,10 @@
 #   * training is compute-bound at 96% GPU utilization, flat over 400 steps; reads are not a factor
 #   * multi-node scales at 97.9% at 2 nodes; 16 nodes is unmeasured, which is the whole residual
 #
-# Time one 16-node leg before committing the chain. Everything below assumes 1.3 s/step, and only
-# the allreduce term is unverified -- a step time 30% off moves the 200k plan by a full leg.
+# MEASURED at 16 nodes (job 820836: 12,323 steps in 12 h 26 m, and 2,000 steps between the 32k
+# and 34k checkpoints in 1 h 59 m): 3.63 s/step, 990 steps/h. That is 2.8x the 1.3 s/step assumed
+# above, so the unverified 16-node allreduce term was the whole residual. The budget table below
+# uses the measured rate; the per-GPU figures are unaffected.
 #
 # What differs from the CT-init run, and why:
 #
@@ -50,22 +52,22 @@
 #                                  this model has only ever been shown to work at 2048
 #   lr           1e-4 -> 2e-4      CTFlow's scratch value at this effective batch
 #   warmup       500 -> 2000       "the trunk is pretrained, not random" no longer holds
-#   max_steps    60k -> 200k       a fine-tune converges in 60k; a scratch run does not. 200k is
+#   max_steps    60k -> 100k       a fine-tune converges in 60k; a scratch run does not. 100k is
 #                                  a budget, not a convergence point -- see below
 #   accum        1 -> 2            CTFlow's own microbatching. Safe again as of d5303d7, which
 #                                  gated the max_train_steps break on sync_gradients; before that
 #                                  fix accum > 1 could break mid-accumulation and skip the final
 #                                  checkpoint
 #
-# BUDGET. 200k steps x 2048 is 410M samples, ~72 h on 16 nodes, ~4,600 GPU-hours, 4 legs of the
-# partition's 24 h cap. That is 29% of the 1.39B samples CTFlow's released checkpoint saw, so this
+# BUDGET. 100k steps x 2048 is 205M samples, ~101 h on 16 nodes, ~6,500 GPU-hours, 5 legs of the
+# partition's 24 h cap. That is 15% of the 1.39B samples CTFlow's released checkpoint saw, so this
 # is a budget rather than a convergence point -- report it that way.
 #
 #   steps    samples    % of CTFlow   wall clock   legs   GPU-hours
-#   680k      1.39B         100%         246 h      11      15,700   CTFlow's own horizon
-#   400k       819M          59%         144 h       7       9,200
-#   200k       410M          29%          72 h       4       4,600   <- set here
-#   100k       205M          15%          36 h       2       2,300   floor, retained checkpoint
+#   680k      1.39B         100%         686 h      29      43,900   CTFlow's own horizon
+#   400k       819M          59%         403 h      17      25,800
+#   200k       410M          29%         202 h       9      12,900
+#   100k       205M          15%         101 h       5       6,500   <- set here, retained ckpt
 #
 # The horizon is the ONE knob that is safe to move. Because ref_steps is pinned at 1e6 rather than
 # linked to it, every truncation follows the identical lr curve, so a checkpoint at 100k is the
@@ -74,14 +76,14 @@
 # that changes the effective batch and voids lr 2e-4 with it.
 #
 # The flip side of that pinning: this run barely anneals. Inverse-sqrt decay at ref_steps 1e6 puts
-# the lr at 91% of base at 100k and 85% at 200k, so the final checkpoint is taken mid-plateau, not
-# at the end of a decay. That is not an oversight -- CTFlow's own 680k checkpoint was still at 65%,
-# so the model this one is compared against was made the same way.
+# the lr at 91% of base at 100k and 85% at 200k, so the final checkpoint here is taken at 91% of
+# base -- mid-plateau, not at the end of a decay. That is not an oversight -- CTFlow's own 680k
+# checkpoint was still at 65%, so the model this one is compared against was made the same way.
 #
-# For scale: 200k steps is 712 passes over the 575,328-series train list (281 steps a pass). A
+# For scale: 100k steps is 356 passes over the 575,328-series train list (281 steps a pass). A
 # pass is not an epoch over the sample space, though -- each series holds 32-320 latent slices and
-# every visit draws a different block pair from it, so there are ~86M distinct pairs and 410M
-# samples sees each ~5 times. CT-RATE is more than an order of magnitude fewer volumes than
+# every visit draws a different block pair from it, so there are ~86M distinct pairs and 205M
+# samples sees each ~2.4 times. CT-RATE is more than an order of magnitude fewer volumes than
 # MR-RATE, so CTFlow spent this same sample budget on a far smaller pair space: relative to it this
 # run is data-rich and compute-poor, which is the argument for spending budget on steps rather than
 # on preprocessing more data.
@@ -92,7 +94,7 @@
 #
 #   C=lvfm/configs/mrflow_from_scratch.yaml
 #   J=$(sbatch --parsable --nodes=16 slurms/mrflow_train_helma.sh $C)
-#   for i in 1 2 3; do J=$(sbatch --parsable --nodes=16 --dependency=afternotok:$J \
+#   for i in 1 2 3 4; do J=$(sbatch --parsable --nodes=16 --dependency=afternotok:$J \
 #       slurms/mrflow_train_helma.sh $C); done
 #
 # A leg that finishes at max_train_steps exits immediately on resume, so an over-long chain is
@@ -105,7 +107,7 @@ globals:
   resolution: 256               # in-plane image size fed to the VAE
   latent_res: 32                # 256 / 8, the FLUX f8 in-plane latent size
   latent_channels: 16
-  max_steps: 200_000
+  max_steps: 100_000
 
 max_train_steps: ${globals.max_steps}
 gradient_accumulation_steps: 2   # CTFlow's own microbatching: 16/GPU x 4 x 16 nodes x 2 = 2048
