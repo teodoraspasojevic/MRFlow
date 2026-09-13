@@ -62,6 +62,15 @@ def main():
             f"are read as they are. Point it at a new directory and set the dataset stanza's "
             f"embedding_root to match."
         )
+    # Both trees write <root>/manifest/<split>-<shard>.csv, so the same root would overwrite the
+    # latent manifests with rows that have no latent_path -- and a zipped split cannot be resumed
+    # per series, so recovering them means re-encoding the volumes.
+    if args.embeddings_only and os.path.realpath(mri.embedding_root) == os.path.realpath(mri.dataset_root):
+        raise SystemExit(
+            f"mri.embedding_root and mri.dataset_root are the same directory ({mri.dataset_root}). "
+            f"An embeddings-only pass would overwrite the latent manifests. Give this conditioning "
+            f"its own directory."
+        )
     root = mri.embedding_root if args.embeddings_only else mri.dataset_root
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16 if device == "cuda" else torch.float32
