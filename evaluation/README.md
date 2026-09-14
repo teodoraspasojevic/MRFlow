@@ -422,7 +422,7 @@ highest-scoring candidates.
   at patch `(6,16,16)` → 1568 tokens) and the official loader's `nearest-exact` resample is what
   meets it.
 - **Text: the exact string the generator was conditioned on**, re-encoded by HLIP's own tokenizer
-  and text tower. `conditioning_text` calls the very same `acquisition_prefix` and `format_report`
+  and text tower. `variant_text` calls the very same builders the generator's conditioner calls
   that `encode_conditioning` calls, so the two cannot drift; the generator's own CXR-BERT *vector*
   never reaches this file. That string is `[MODALITY] … [PLANE] …` followed by bracketed
   `[FINDINGS]` and `[IMPRESSION]` sections — **not** either of HLIP's MR-RATE templates, and no

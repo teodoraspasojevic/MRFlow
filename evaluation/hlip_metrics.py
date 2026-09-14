@@ -209,30 +209,6 @@ def preprocess_scan(volume):
     return ((img - _MEAN) / _STD)[None]
 
 
-def conditioning_text(report, modality, plane):
-    """**The exact string the generator was conditioned on** -- not a report field chosen to suit
-    the metric.
-
-    `encode_conditioning` builds `acquisition_prefix` + the bracketed `[FINDINGS]`/`[IMPRESSION]`
-    sections and encodes that one string; this calls the very same two builders, so the two cannot
-    drift. Returns `None` when the report has neither section, and that case is excluded with a
-    count rather than scored against an empty string.
-
-    It is therefore *not* either of HLIP's own MR-RATE templates. HLIP was trained on MR-RATE with
-    `--text-process-cfg "sentence and findings"`, i.e. `f'This study shows: {impression}'` against
-    `'This study looks like:' + findings`. Ours carries both sections at once behind bracket
-    markers and an acquisition prefix. **No HLIP template is prepended**, because prepending one
-    would score a string the model was never asked to generate from. The consequence to state when
-    quoting these numbers: the text distribution is not the one HLIP's text tower was trained on,
-    so the absolute cosine is not comparable with HLIP's own MR-RATE figures -- only across our own
-    runs, which all use this same string.
-    """
-    body = format_report(report)
-    if not body.strip():
-        return None
-    return f"{acquisition_prefix(modality, plane)}\n{body}"
-
-
 class HlipAccumulator:
     """One volume embedding per case, and up to three text embeddings beside it.
 
