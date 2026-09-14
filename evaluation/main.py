@@ -1,4 +1,4 @@
-"""Roll out MRFlow over an MR-RATE split and score it with the official VLM3D challenge metrics.
+"""Roll out MRFlow over an MR-RATE split and score it with FID, FVD and Inception Score.
 
     python evaluation/main.py --config <experiment>/config.yaml \
         --ckpt <experiment>/checkpoint-N/denoiser_ema --split val --limit 32
@@ -7,9 +7,9 @@ Every case is derived from the raw MR-RATE archives in one read, so no preproces
 needed and `test` works the same as `val`:
 
     ground truth   `load_native_volume` -- RAS-reoriented, plane-first, otherwise the released
-                   volume. NOT resampled, normalized or cropped: the official metric normalizes
-                   both volumes itself and resamples the *generated* one onto this shape, which is
-                   exactly what the leaderboard does to a submission.
+                   volume. Nothing else happens here: `EvalAccumulator.add` canonicalizes the pair
+                   into the model's own 1 mm / 256^2 training grid, which is the only geometry any
+                   metric is defined on.
     cases          `list_series` at `max_repeats=1` -- eligible MR-RATE series, one acquisition
                    per contrast and plane, so `n_total_files` counts series rather than the files
                    in the platform's ground-truth directory. Deduplicating here and not from
@@ -17,13 +17,13 @@ needed and `test` works the same as `val`:
     conditioning   CXR-BERT over the study's report plus the series' acquisition markers -- the
                    same `encode_conditioning` call preprocessing makes, so the embedding the model
                    sees here is the one it trained against.
-    generation     one `REGIMES` entry. The challenge is report-to-volume, so `full-body` is the
+    generation     one `REGIMES` entry. The task is report-to-volume, so `full-body` is the
                    default; the others exist to diagnose it.
 
 Long rollouts, so this shards like `preprocess_mrrate.py`: each SLURM array task takes an
 interleaved slice of the split and writes its own `shard-NNNN.pt`, then one `--combine` pass pools
-them -- FID included, since the per-plane distances are computed over every shard's slice features
-at once rather than averaged per shard.
+them. Every metric pools at the feature level rather than being averaged per shard, so the shard
+count never changes a number.
 """
 
 import argparse
@@ -43,7 +43,7 @@ from echosyn.common.mrrate import (build_text_encoder, encode_conditioning, enco
                                    plane_to_id, preprocess_volume, read_member, read_report,
                                    sample_id)
 from auto_regressive_generate import LatentAutoregressiveGenerator
-from evaluation import METRIC_KEYS, ChallengeAccumulator, combine, comparison_frames
+from evaluation import METRIC_KEYS, EvalAccumulator, combine, comparison_frames
 
 
 ### Inference regimes ###
@@ -109,6 +109,18 @@ def select_cases(series, n_per_bucket):
     return selected
 
 
+def cache_generated(root, bucket, case_id, produced):
+    """The generated volume as fp16 `.npy`, one file per case."""
+    os.makedirs(root, exist_ok=True)
+    np.save(os.path.join(root, f"{bucket}-{case_id}.npy"), produced.astype(np.float16))
+
+
+def pick_example_buckets(series, shard, n):
+    """The `(modality, plane)` buckets this shard writes an example video for."""
+    buckets = sorted({f"{e['modality']}__{e['plane']}" for e in series})
+    return {buckets[(shard + i) % len(buckets)] for i in range(n)} if buckets and n else set()
+
+
 def save_case(root, bucket, case_id, real, produced, report, entry, spacing):
     """One case's ground truth, generated volume and report, for offline inspection.
 
@@ -141,7 +153,7 @@ def save_case(root, bucket, case_id, real, produced, report, entry, spacing):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate MRFlow on the VLM3D challenge metrics")
+    parser = argparse.ArgumentParser(description="Evaluate MRFlow: FID, FVD and Inception Score")
     parser.add_argument("--config", type=str, required=True,
                         help="The config saved into the experiment dir, next to the checkpoints.")
     parser.add_argument("--ckpt", type=str, help="Path to denoiser_ema. Not needed for --combine.")
@@ -159,7 +171,12 @@ def parse_args():
     parser.add_argument("--max_blocks", type=int, default=None,
                         help="Rollout budget. Default: max_slices / target_nframes.")
     parser.add_argument("--examples", type=int, default=2,
-                        help="Ground-truth-vs-generated mp4s this shard keeps, for W&B.")
+                        help="Distinct (modality, plane) buckets this shard illustrates with a "
+                             "ground-truth-vs-generated mp4, for W&B. Which buckets is offset by "
+                             "the shard index, so an array covers all of them.")
+    parser.add_argument("--no-cache_generated", dest="cache_generated", action="store_false",
+                        help="Skip <out>/generated/. On by default: caching every rollout makes a "
+                             "later metric change a rescore instead of another generation pass.")
     parser.add_argument("--save_volumes", type=int, default=0,
                         help="Cases of this shard to write to <out>/volumes/ as ground_truth."
                              "nii.gz + generated.nii.gz + case.json (report included). Off by "
@@ -227,6 +244,9 @@ def run_shard(config, args, out, device):
     if args.n_per_bucket:
         series = select_cases(series, args.n_per_bucket)
     series = series[args.shard::args.num_shards][:args.limit]
+    # After the slice, so a shard only promises examples from buckets it will actually reach --
+    # which matters under a small --limit, where a task sees only the head of the list.
+    example_buckets = pick_example_buckets(series, args.shard, args.examples)
     print(f"[shard {args.shard}/{args.num_shards}] {len(series)} {args.split} cases, "
           f"regime {args.regime}, max_blocks {args.max_blocks}, "
           f"n_per_bucket {args.n_per_bucket}, bf16 {args.bf16}, compile {args.compile}, "
@@ -234,17 +254,18 @@ def run_shard(config, args, out, device):
 
     generator = build_generator(config, args.ckpt, device, args)
     tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
-    accumulator = ChallengeAccumulator(device=device)
+    accumulator = EvalAccumulator(device=device)
     generate = REGIMES[args.regime]
-    examples_left = args.examples
-    if examples_left:
+    cached = [] if args.cache_generated else None
+    if example_buckets:
         os.makedirs(os.path.join(out, "examples"), exist_ok=True)
+        print(f"[shard {args.shard}] example buckets: {sorted(example_buckets)}")
     volumes_left = args.save_volumes
 
     for entry in tqdm(series, disable=None):
         case_id = sample_id(entry["study_uid"], entry["series_id"])
         bucket = f"{entry['modality']}__{entry['plane']}"
-        if not ChallengeAccumulator.is_scored(entry["modality"]):
+        if not EvalAccumulator.is_scored(entry["modality"]):
             accumulator.add_missing(case_id, bucket, entry["modality"])
             continue
 
@@ -279,19 +300,34 @@ def run_shard(config, args, out, device):
         accumulator.add(case_id, bucket, entry["modality"], real, produced, spacing,
                         entry["plane"])
 
+        if cached is not None:
+            cache_generated(os.path.join(out, "generated"), bucket, case_id, produced)
+            # Everything a rescore needs to rebuild this pair without re-reading the population:
+            # the npy holds the rollout, these fields find and orient its ground truth.
+            cached.append({"case_id": case_id, "bucket": bucket, "modality": entry["modality"],
+                           "plane": entry["plane"], "spacing": [float(v) for v in spacing],
+                           "archive": entry["archive"], "member": entry["member"],
+                           "generated": f"{bucket}-{case_id}.npy"})
+
         if volumes_left > 0:
             volumes_left -= 1
             save_case(os.path.join(out, "volumes"), bucket, case_id, real, produced, report,
                       entry, spacing)
 
-        if examples_left > 0:
-            examples_left -= 1
-            save_as_mp4(torch.from_numpy(comparison_frames(real, produced)),
+        if bucket in example_buckets:
+            example_buckets.discard(bucket)  # the shard's first case of that bucket, then done
+            save_as_mp4(torch.from_numpy(comparison_frames(real, produced, spacing,
+                                                           entry["plane"])),
                         os.path.join(out, "examples", f"{bucket}-{case_id}.mp4"),
                         fps=config.globals.target_fps)
 
+    if cached:
+        with open(os.path.join(out, "generated", f"index-{args.shard:04d}.json"), "w") as handle:
+            json.dump(cached, handle, indent=2)
+
     torch.save(accumulator.state(), os.path.join(out, f"shard-{args.shard:04d}.pt"))
-    print(f"[shard {args.shard}] {accumulator.n_total} cases, {accumulator.n_missing} missing")
+    print(f"[shard {args.shard}] {accumulator.n_total} cases, {accumulator.n_missing} missing"
+          + (f", {len(cached)} rollouts cached" if cached else ""))
 
 
 def print_metrics(metrics, out):
@@ -303,8 +339,8 @@ def print_metrics(metrics, out):
 
 def log_wandb(config, args, metrics, out):
     """The metrics table, the run summary and the scalars, plus whatever example mp4s the shards
-    kept. Table row order is METRIC_KEYS -- the headline block first (both FVDs, both FIDs, IS,
-    then PSNR/MSE/SSIM), then the strata splits, the per-plane FIDs and the counts.
+    kept. Table row order is METRIC_KEYS -- the headline block first (FVD_f16, FID, IS, FVD_f64),
+    then the strata splits, the sample counts and the case counts.
 
     The guidance scales go in the run *name* as well as the config. A cfg sweep is several runs
     over one checkpoint that differ in nothing else, so without them in the label the run table is
@@ -325,8 +361,8 @@ def log_wandb(config, args, metrics, out):
     )
     examples = sorted(glob(os.path.join(out, "examples", "*.mp4")))
     run.log({
-        "challenge_metrics": wandb.Table(columns=["metric", "value"],
-                                         data=[[k, metrics[k]] for k in METRIC_KEYS]),
+        "metrics": wandb.Table(columns=["metric", "value"],
+                              data=[[k, metrics[k]] for k in METRIC_KEYS]),
         **metrics,
         **{f"examples/{os.path.basename(p)[:-4]}": wandb.Video(
             p, caption="ground truth | generated") for p in examples},

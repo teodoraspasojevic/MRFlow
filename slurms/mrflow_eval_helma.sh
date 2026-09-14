@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #
-# Roll out a checkpoint over an MR-RATE split and score it with the official VLM3D metrics.
+# Roll out a checkpoint over an MR-RATE split and score it with FID, FVD and Inception Score.
 # One GPU per array task; each task writes its own shard-NNNN.pt, then one --combine pass pools
 # them. See evaluation/README.md.
 #
