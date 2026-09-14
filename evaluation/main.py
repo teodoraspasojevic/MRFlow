@@ -1,4 +1,4 @@
-"""Roll out MRFlow over an MR-RATE split and score it with FID, FVD and Inception Score.
+"""Roll out MRFlow over an MR-RATE split and score it.
 
     python evaluation/main.py --config <experiment>/config.yaml \
         --ckpt <experiment>/checkpoint-N/denoiser_ema --split val --limit 32
@@ -21,9 +21,18 @@ needed and `test` works the same as `val`:
                    default; the others exist to diagnose it.
 
 Long rollouts, so this shards like `preprocess_mrrate.py`: each SLURM array task takes an
-interleaved slice of the split and writes its own `shard-NNNN.pt`, then one `--combine` pass pools
-them. Every metric pools at the feature level rather than being averaged per shard, so the shard
-count never changes a number.
+interleaved slice of the split, **generates and caches its volumes**, and writes a
+`shard-NNNN.json` manifest. One `--combine` pass then scores every cached volume in a single
+process.
+
+**The volumes are what persists; the features are transient.** Each task scores its own cases as
+it generates them and writes a `shard-NNNN.pt` beside its volumes; `--combine` pools those, writes
+`metrics.json`, and **deletes them**. Pooling is moments addition, so it is exact -- the shard count
+cannot move a number -- and it costs seconds rather than a second pass over the population.
+
+What survives a run: `generated/*.npy`, the manifests, `metrics.json`. That is what makes a later
+metric change a rescore (`--combine` with the feature files gone re-reads the cached volumes)
+instead of another generation pass.
 """
 
 import argparse
@@ -43,7 +52,9 @@ from echosyn.common.mrrate import (build_conditioner, encode_volume, list_series
                                    load_native_volume, modality_to_id, plane_order, plane_to_id,
                                    preprocess_volume, read_member, read_report, sample_id)
 from auto_regressive_generate import LatentAutoregressiveGenerator
-from evaluation import METRIC_KEYS, EvalAccumulator, combine, comparison_frames
+from evaluation import (METRIC_KEYS, EvalAccumulator, comparison_frames,
+                        merge_states, metrics_from, signature)
+from evaluation.hlip_metrics import conditioning_uid, warn_if_not_independent
 
 
 ### Inference regimes ###
@@ -110,9 +121,17 @@ def select_cases(series, n_per_bucket):
 
 
 def cache_generated(root, bucket, case_id, produced):
-    """The generated volume as fp16 `.npy`, one file per case."""
+    """The generated volume as fp16 `.npy`, one file per case. Returns the file name.
+
+    Written exactly as the model produced it -- straight off `decode_latent`, before any
+    canonicalization, windowing or quantization. **This file is the evaluation's only cache**:
+    no features are ever persisted, so changing a metric is a `--combine` away rather than
+    another generation pass.
+    """
     os.makedirs(root, exist_ok=True)
-    np.save(os.path.join(root, f"{bucket}-{case_id}.npy"), produced.astype(np.float16))
+    name = f"{bucket}-{case_id}.npy"
+    np.save(os.path.join(root, name), produced.astype(np.float16))
+    return name
 
 
 def pick_example_buckets(series, shard, n):
@@ -153,7 +172,8 @@ def save_case(root, bucket, case_id, real, produced, report, entry, spacing):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate MRFlow: FID, FVD and Inception Score")
+    parser = argparse.ArgumentParser(
+        description="Evaluate MRFlow: FID (2D/2.5D/3D), FVD, Inception Score and HLIP")
     parser.add_argument("--config", type=str, required=True,
                         help="The config saved into the experiment dir, next to the checkpoints.")
     parser.add_argument("--ckpt", type=str, help="Path to denoiser_ema. Not needed for --combine.")
@@ -174,16 +194,24 @@ def parse_args():
                         help="Distinct (modality, plane) buckets this shard illustrates with a "
                              "ground-truth-vs-generated mp4, for W&B. Which buckets is offset by "
                              "the shard index, so an array covers all of them.")
-    parser.add_argument("--no-cache_generated", dest="cache_generated", action="store_false",
-                        help="Skip <out>/generated/. On by default: caching every rollout makes a "
-                             "later metric change a rescore instead of another generation pass.")
     parser.add_argument("--save_volumes", type=int, default=0,
                         help="Cases of this shard to write to <out>/volumes/ as ground_truth."
                              "nii.gz + generated.nii.gz + case.json (report included). Off by "
                              "default: a native-geometry volume is ~150 MB before compression.")
+    parser.add_argument("--feature_batch_size", type=int, default=32,
+                        help="Slices per forward pass in the Inception and RadImageNet "
+                             "extractors. Lower it on a small GPU.")
+    parser.add_argument("--hlip_batch_size", type=int, default=8,
+                        help="Volumes per forward pass in the HLIP tower. A ViT-L over 1568 "
+                             "tokens is the heaviest extractor here; 8 fits an h200 comfortably.")
+    parser.add_argument("--hlip", action=argparse.BooleanOptionalAction, default=True,
+                        help="Score report-to-volume agreement with the released HLIP brain-MRI "
+                             "checkpoint. --no-hlip skips the tower and its 1.5 GB download; the "
+                             "hlip_* keys then read nan.")
     parser.add_argument("--overwrite", action="store_true", help="Re-run an existing shard.")
     parser.add_argument("--combine", action="store_true",
-                        help="Pool the shards already in --out into metrics.json and log to W&B.")
+                        help="Score the volumes already cached in --out into metrics.json and log "
+                             "to W&B. Generates nothing; one sequential pass over the population.")
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging.")
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=False,
                         help="Run the denoiser under bfloat16 autocast (the VAE stays fp32). ~3.2x "
@@ -254,9 +282,10 @@ def run_shard(config, args, out, device):
 
     generator = build_generator(config, args.ckpt, device, args)
     conditioner = build_conditioner(mri, device)
-    accumulator = EvalAccumulator(device=device)
+    accumulator = EvalAccumulator(device=device, batch_size=args.feature_batch_size,
+                                  hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip)
     generate = REGIMES[args.regime]
-    cached = [] if args.cache_generated else None
+    cases = []
     if example_buckets:
         os.makedirs(os.path.join(out, "examples"), exist_ok=True)
         print(f"[shard {args.shard}] example buckets: {sorted(example_buckets)}")
@@ -265,7 +294,16 @@ def run_shard(config, args, out, device):
     for entry in tqdm(series, disable=None):
         case_id = sample_id(entry["study_uid"], entry["series_id"])
         bucket = f"{entry['modality']}__{entry['plane']}"
+        record = {"case_id": case_id, "bucket": bucket, "modality": entry["modality"],
+                  "plane": entry["plane"], "study_uid": entry["study_uid"],
+                  # what a correct HLIP retrieval is, recorded at generation time rather than
+                  # re-derived at scoring time from fields that might have moved
+                  "conditioning_uid": conditioning_uid(entry["study_uid"], entry["modality"],
+                                                       entry["plane"]),
+                  "archive": entry["archive"], "member": entry["member"]}
+        cases.append(record)
         if not EvalAccumulator.is_scored(entry["modality"]):
+            record["status"] = "excluded"
             accumulator.add_missing(case_id, bucket, entry["modality"])
             continue
 
@@ -291,20 +329,16 @@ def run_shard(config, args, out, device):
             # One unreadable series or collapsed rollout must not lose the shard; the official
             # scoring counts it as a missing output, which is the same penalty the platform applies.
             print(f"[shard {args.shard}] {case_id} failed: {type(e).__name__}: {e}")
+            record["status"] = "missing"
             accumulator.add_missing(case_id, bucket, entry["modality"])
             continue
 
         accumulator.add(case_id, bucket, entry["modality"], real, produced, spacing,
-                        entry["plane"])
-
-        if cached is not None:
-            cache_generated(os.path.join(out, "generated"), bucket, case_id, produced)
-            # Everything a rescore needs to rebuild this pair without re-reading the population:
-            # the npy holds the rollout, these fields find and orient its ground truth.
-            cached.append({"case_id": case_id, "bucket": bucket, "modality": entry["modality"],
-                           "plane": entry["plane"], "spacing": [float(v) for v in spacing],
-                           "archive": entry["archive"], "member": entry["member"],
-                           "generated": f"{bucket}-{case_id}.npy"})
+                        entry["plane"], report, entry["study_uid"], record["conditioning_uid"])
+        record["status"] = "generated"
+        record["spacing"] = [float(v) for v in spacing]
+        record["generated"] = cache_generated(os.path.join(out, "generated"), bucket, case_id,
+                                              produced)
 
         if volumes_left > 0:
             volumes_left -= 1
@@ -318,13 +352,73 @@ def run_shard(config, args, out, device):
                         os.path.join(out, "examples", f"{bucket}-{case_id}.mp4"),
                         fps=config.globals.target_fps)
 
-    if cached:
-        with open(os.path.join(out, "generated", f"index-{args.shard:04d}.json"), "w") as handle:
-            json.dump(cached, handle, indent=2)
-
+    # Features first, manifest last: a shard that died half way leaves no manifest, so `--combine`
+    # cannot quietly pool a partial run. The `.pt` is **transient** -- `--combine` deletes it once
+    # it has pooled it. The volumes and the manifest are what survive.
     torch.save(accumulator.state(), os.path.join(out, f"shard-{args.shard:04d}.pt"))
-    print(f"[shard {args.shard}] {accumulator.n_total} cases, {accumulator.n_missing} missing"
-          + (f", {len(cached)} rollouts cached" if cached else ""))
+    with open(os.path.join(out, f"shard-{args.shard:04d}.json"), "w") as handle:
+        json.dump({"shard": args.shard, "num_shards": args.num_shards, "cases": cases},
+                  handle, indent=2)
+    done = sum(c["status"] == "generated" for c in cases)
+    print(f"[shard {args.shard}] {len(cases)} cases, {done} volumes cached, "
+          f"{sum(c['status'] == 'missing' for c in cases)} missing")
+
+
+### Scoring ###
+
+
+def combine_shards(out):
+    """Pool the shards' transient feature files, then **delete them**.
+
+    The fast path, and the normal one: every array task already scored its own cases beside
+    generating them, so this is moments addition and costs seconds. Moments are additive, so the
+    result is exactly what one process over every pair would have found -- the shard count cannot
+    move a number. Returns None when the feature files are not all there, and the caller falls back
+    to rescoring from the cached volumes.
+    """
+    manifests = sorted(glob(os.path.join(out, "shard-*.json")))
+    features = [p.replace(".json", ".pt") for p in manifests]
+    if not manifests or not all(os.path.exists(p) for p in features):
+        return None
+
+    result = metrics_from(merge_states([torch.load(p, weights_only=False) for p in features]))
+    for path in features:
+        os.remove(path)          # transient: the volumes and the manifests are what survive
+    print(f"[combine] pooled and removed {len(features)} shard feature files")
+    return result
+
+
+def score_cached(config, args, out, device):
+    """Every metric, recomputed from the volumes the shards cached. Nothing is generated here.
+
+    The manifests say which cases exist and where their ground truth lives; `generated/*.npy` is
+    the rollout, byte for byte what the model produced. **No features are ever written to disk**,
+    so every distance is computed once, in this process, over every case -- which is also what
+    makes the numbers independent of the shard count, with no pooling contract to keep.
+
+    The cost of that: this is one sequential pass over the whole population on one GPU, where the
+    generation before it was spread over the array. Budget for it -- see evaluation/README.md.
+    """
+    manifests = sorted(glob(os.path.join(out, "shard-*.json")))
+    if not manifests:
+        raise SystemExit(f"no shard-*.json in {out} -- run the generation array first")
+    cases = [c for path in manifests for c in json.load(open(path))["cases"]]
+    print(f"[score] {len(cases)} cases from {len(manifests)} shards")
+
+    accumulator = EvalAccumulator(device=device, batch_size=args.feature_batch_size,
+                                  hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip)
+    for case in tqdm(cases, disable=None):
+        if case["status"] != "generated":
+            accumulator.add_missing(case["case_id"], case["bucket"], case["modality"])
+            continue
+        produced = np.load(os.path.join(out, "generated", case["generated"])).astype(np.float32)
+        real, spacing = load_native_volume(read_member(case["archive"], case["member"]),
+                                           case["plane"])
+        report = read_report(case["archive"], case["study_uid"])
+        accumulator.add(case["case_id"], case["bucket"], case["modality"], real, produced,
+                        spacing, case["plane"], report, case["study_uid"],
+                        case["conditioning_uid"])
+    return accumulator.results()
 
 
 def print_metrics(metrics, out):
@@ -355,8 +449,8 @@ def checkpoint_step(ckpt):
 
 def log_wandb(config, args, metrics, out):
     """The metrics table, the run summary and the scalars, plus whatever example mp4s the shards
-    kept. Table row order is METRIC_KEYS -- the headline block first (FVD_f16, FID, IS, FVD_f64),
-    then the strata splits, the sample counts and the case counts.
+    kept. Table row order is METRIC_KEYS: every score first -- FVD, the FIDs, HLIP, IS, then the
+    container's per-case scores -- and then every `n_*` count.
 
     The checkpoint step and the guidance scales both go in the run *name* as well as the config:
     a sweep is several runs over one experiment that differ in exactly one of those two, so without
@@ -402,25 +496,26 @@ def main():
 
     # CLI guidance scales override the config, so a sweep is one sbatch argument.
     check_label_mapping(config)
+    warn_if_not_independent(config.mri.text_checkpoint)
     for name in ("modality_cfg_scale", "report_cfg_scale"):
         if getattr(args, name) is not None:
             config.guidance[name] = getattr(args, name)
 
     if not args.combine:
-        shard_path = os.path.join(out, f"shard-{args.shard:04d}.pt")
+        shard_path = os.path.join(out, f"shard-{args.shard:04d}.json")
         if os.path.exists(shard_path) and not args.overwrite:
             print(f"{shard_path} already written; pass --overwrite to redo it")
         else:
             run_shard(config, args, out, device)
         if args.num_shards > 1:
-            return  # the --combine pass pools every shard, including this one
+            return  # the --combine pass scores every shard's volumes, including this one
 
-    shards = sorted(glob(os.path.join(out, "shard-*.pt")))
-    states = [torch.load(p, weights_only=False) for p in shards]
-    if not states:
-        raise SystemExit(f"no shard-*.pt in {out}")
-    result = combine(states)
-    result.update({"regime": args.regime, "split": args.split, "ckpt": args.ckpt})
+    result = combine_shards(out)
+    if result is None:
+        print("[combine] no shard feature files -- rescoring from the cached volumes")
+        result = score_cached(config, args, out, device)
+    result.update({"regime": args.regime, "split": args.split, "ckpt": args.ckpt,
+                   "extractors": signature()})
     with open(os.path.join(out, "metrics.json"), "w") as f:
         json.dump(result, f, indent=2)
 

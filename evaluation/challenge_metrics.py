@@ -123,7 +123,7 @@ class RunningMoments:
             self._chunks.append(feats)
 
     def array(self):
-        """The concatenated `(N, 512)` feature matrix. Ours, for cross-shard pooling."""
+        """The concatenated `(N, 512)` feature matrix."""
         if not self._chunks:
             return np.zeros((0, _FEATURE_DIM), dtype=np.float32)
         return np.concatenate(self._chunks, axis=0)
@@ -173,6 +173,13 @@ class FIDAccumulator:
             self.real_moments[plane].add(self._extract_volume_features(real_vol, axis))
             self.fake_moments[plane].add(self._extract_volume_features(fake_vol, axis))
 
+    def raw_features(self):
+        """`{plane: {"real": array, "fake": array}}`. Ours: what a shard hands `finalize_pooled`
+        so the per-plane distances are computed over every shard's slices at once."""
+        return {plane: {"real": self.real_moments[plane].array(),
+                        "fake": self.fake_moments[plane].array()}
+                for plane in _AXIS_FOR_PLANE}
+
     def finalize(self):
         results = {}
         for plane in _AXIS_FOR_PLANE:
@@ -186,14 +193,6 @@ class FIDAccumulator:
         valid_vals = [v for v in results.values() if not np.isnan(v)]
         results["FID_2p5D_Avg"] = float(np.mean(valid_vals)) if valid_vals else float("nan")
         return results
-
-    def raw_features(self):
-        """`{plane: {"real": array, "fake": array}}`. Ours: what a SLURM array task hands to
-        `finalize_pooled` so the per-plane distances are computed over every shard's slices at
-        once, rather than averaged per shard."""
-        return {plane: {"real": self.real_moments[plane].array(),
-                        "fake": self.fake_moments[plane].array()}
-                for plane in _AXIS_FOR_PLANE}
 
 
 def finalize_pooled(raw_features_per_shard):
