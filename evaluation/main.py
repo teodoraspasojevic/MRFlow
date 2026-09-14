@@ -29,6 +29,7 @@ count never changes a number.
 import argparse
 import json
 import os
+import re
 from glob import glob
 
 import numpy as np
@@ -333,24 +334,46 @@ def print_metrics(metrics, out):
     print(f"{'=' * 60}\nfull results -> {out}/metrics.json")
 
 
+def checkpoint_tag(ckpt):
+    """`checkpoint-60000/denoiser_ema` -> `ck60000`, for the W&B run name.
+
+    A checkpoint sweep -- every step of one training run at a fixed cfg pair -- otherwise produces
+    N runs whose names differ in nothing, the same failure mode the cfg scales are in the name for.
+    Returns "" for a path that is not a `checkpoint-<step>` directory, so a released or renamed
+    checkpoint just leaves the segment out.
+    """
+    match = re.search(r"checkpoint-(\d+)", os.path.abspath(ckpt))
+    return f"ck{match.group(1)}-" if match else ""
+
+
+def checkpoint_step(ckpt):
+    """The step as an int, or None -- a W&B config field, so a checkpoint sweep can be plotted
+    against training step rather than read off run names."""
+    match = re.search(r"checkpoint-(\d+)", os.path.abspath(ckpt))
+    return int(match.group(1)) if match else None
+
+
 def log_wandb(config, args, metrics, out):
     """The metrics table, the run summary and the scalars, plus whatever example mp4s the shards
     kept. Table row order is METRIC_KEYS -- the headline block first (FVD_f16, FID, IS, FVD_f64),
     then the strata splits, the sample counts and the case counts.
 
-    The guidance scales go in the run *name* as well as the config. A cfg sweep is several runs
+    The checkpoint step and the guidance scales both go in the run *name* as well as the config:
+    a sweep is several runs over one experiment that differ in exactly one of those two, so without
+    them the run table is a column of identical names. A cfg sweep is several runs
     over one checkpoint that differ in nothing else, so without them in the label the run table is
     a column of identical names -- and at 1.0/1.0 the sampler takes its single-conditional
     short-circuit, i.e. no guidance at all, which is worth being able to see at a glance."""
     guidance = config.guidance
     run = wandb.init(
         project=config.wandb_args.project,
-        name=f"eval-{args.regime}-{args.split}"
-             f"-mod{guidance.modality_cfg_scale:g}-rep{guidance.report_cfg_scale:g}"
+        name=f"eval-{args.regime}-{args.split}-{checkpoint_tag(args.ckpt)}"
+             f"mod{guidance.modality_cfg_scale:g}-rep{guidance.report_cfg_scale:g}"
              f"-{config.wandb_args.name}",
         group=config.wandb_args.group,
         mode="disabled" if args.no_wandb else os.environ.get("WANDB_MODE", "online"),
         config={"regime": args.regime, "split": args.split, "ckpt": args.ckpt,
+                "checkpoint_step": checkpoint_step(args.ckpt),
                 "max_blocks": args.max_blocks, "n_per_bucket": args.n_per_bucket,
                 "modality_cfg_scale": guidance.modality_cfg_scale,
                 "report_cfg_scale": guidance.report_cfg_scale},
