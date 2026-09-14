@@ -30,6 +30,11 @@ peft>=0.8.0
 # Experiment tracking
 wandb>=0.16.0
 
+# Evaluation feature extractors: HLIP (open_clip) and the Drive-hosted MedicalNet / RadImageNet
+# weights (gdown). Only evaluation/ needs these.
+open-clip-torch>=2.32.0
+gdown>=5.0.0
+
 # Image / video I/O
 imageio>=2.33.0
 imageio-ffmpeg>=0.4.9

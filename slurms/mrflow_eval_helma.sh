@@ -1,6 +1,7 @@
 #!/bin/bash -l
 #
-# Roll out a checkpoint over an MR-RATE split and score it with FID, FVD and Inception Score.
+# Roll out a checkpoint over an MR-RATE split and score it: fid_2d_inception, fid_3d_medicalnet,
+# fid_2p5d_radimagenet_*, FVD, Inception Score and the HLIP report-volume metrics.
 # One GPU per array task; each task writes its own shard-NNNN.pt, then one --combine pass pools
 # them. See evaluation/README.md.
 #

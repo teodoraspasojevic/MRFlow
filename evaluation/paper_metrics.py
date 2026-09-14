@@ -1,10 +1,14 @@
-"""FID, FVD and Inception Score, each by its field's reference protocol.
+"""2D FID, FVD and Inception Score, each by its field's reference protocol.
 
 Every number here is meant to be quotable against the literature, so where a reference
 implementation exists it is used rather than reimplemented, and where we deviate it is stated.
 The three references, read from source rather than from memory:
 
-  FID   github.com/mseitzer/pytorch-fid, tag v0.3.0. `evaluation/fid_inception.py` is that code
+  `fid_2d_inception`
+        **A slice-level 2D FID**, and named for what it is: one feature vector per image, never per
+        volume. The volume-level `fid_3d_medicalnet` and the three-plane
+        `fid_2p5d_radimagenet_*` live in `medical_fid.py`.
+        github.com/mseitzer/pytorch-fid, tag v0.3.0. `evaluation/fid_inception.py` is that code
         verbatim. Backbone `pt_inception-2015-12-05` (the TF port, NOT torchvision's ImageNet
         Inception), 2048-d final pool; images as `[0, 1]` floats that the module itself resizes to
         299^2 (bilinear, `align_corners=False`, no antialias) and rescales to `[-1, 1]`; every
@@ -28,13 +32,13 @@ Ours, and to be declared wherever these are quoted:
                with the generation resampled onto it. That is the distribution the model was asked
                to match. It also means these numbers are not comparable to a paper that scored
                native-geometry references.
-  slice axis   FID and IS see slices of array axis 0 only -- the acquisition plane, the axis the
-               model rolls out along, so the images scored are the images generated.
+  slice axis   `fid_2d_inception` and IS see slices of array axis 0 only -- the acquisition
+               plane, the axis the model rolls out along, so the images scored are the images
+               generated.
   intensity    `normalize01`, a 0.5/99.5-percentile window per volume, then a uint8 quantization,
                because both references consume uint8 images.
   `FVD_f64`    an extension: 64-frame clips read whether the rollout stays coherent across block
                boundaries (a block is 16 frames). Only `FVD_f16` is the standard protocol.
-  strata       `thin`/`thick`, split on the ground truth's native slice spacing.
 
 The geometry contract, in detail:
 
@@ -48,9 +52,10 @@ Two consequences worth knowing before reading a number:
 
   interpolated z   58% of MR-RATE is acquired above 1.5 mm slice spacing (median 4.05 mm), and
                    `preprocess_volume` trilinearly upsampled those to 1 mm for training. So for
-                   thick-slice series the 1 mm reference is interpolated, and FVD there measures
-                   agreement with interpolated data rather than with a real 1 mm acquisition.
-                   MR-RATE contains no real 1 mm T2w at all to check against.
+                   most of the split the 1 mm reference is interpolated, and FVD measures agreement
+                   with interpolated data rather than with a real 1 mm acquisition. MR-RATE
+                   contains no real 1 mm T2w at all to check against. `slice_mm` is recorded per
+                   case, so this can be read off a run rather than assumed.
   no fixed length  neither side is padded or stretched to a common slice count, so a rollout that
                    stops early contributes fewer slices, and a rollout shorter than a clip drops
                    out of that FVD entirely -- which is why the real and generated sample counts
@@ -71,11 +76,20 @@ from evaluation.fid_inception import (InceptionV3, calculate_frechet_distance,
 
 
 def normalize01(vol):
-    """A 0.5/99.5-percentile window per volume, clipped to `[0, 1]`.
+    """A 0.5/99.5-percentile window per volume, clipped to `[0, 1]`. Exactly:
 
-    Ours, applied identically to both sides, so absolute intensity scale never reaches a metric.
-    Per volume rather than per slice: a slice of a real acquisition is a slice of a volume that was
-    windowed as a whole, and re-windowing each slice would erase how much signal a slice carries.
+        lo = percentile(vol, 0.5)          over **every** voxel of the volume, background
+        hi = percentile(vol, 99.5)         included; numpy's default linear interpolation
+        out = clip((vol - lo) / (hi - lo), 0, 1)      float32; all-zeros when hi - lo < 1e-6
+
+    This is the `[0, 1]` representation every image extractor starts from -- RadImageNet's
+    `2x - 1` maps this, and the uint8 quantization for Inception and the I3D rounds it.
+
+    Ours, applied identically to both sides *after* the geometry canonicalization, so absolute
+    intensity scale never reaches a metric. Per volume rather than per slice: a slice of a real
+    acquisition is a slice of a volume that was windowed as a whole, and re-windowing each slice
+    would erase how much signal a slice carries -- and would behave differently on real and
+    generated artifacts.
     """
     vol = vol.astype(np.float32)
     lo, hi = np.percentile(vol, 0.5), np.percentile(vol, 99.5)
@@ -174,54 +188,68 @@ def canonicalize_generated(produced):
     return normalize01(produced)
 
 
-### Strata ###
-
-# Split on the ground truth's *native* slice spacing, not on modality. MR-RATE mixes 2D
-# thick-slice and 3D thin-slice acquisitions inside every (modality, plane) bucket -- measured, the
-# modal spacing covers only 33-71% of a bucket and FLAIR/SAGITTAL spans 0.5-6.5 mm -- so contrast
-# is not a proxy for geometry. The split is a diagnostic rather than a correction: both volumes are
-# already on the same 1 mm grid either way. What differs is whether the reference's z detail was
-# acquired or interpolated, and the model is told neither (`[SPACING]` is not in the conditioning
-# and there is no spacing class embedding), so it cannot know which to produce. A model that hedges
-# between the two shows up as too smooth on `thin` and too detailed on `thick`.
-THIN_MAX_MM = 1.5
-STRATA = ("thin", "thick")
+### Feature bookkeeping ###
 
 
-def stratum_for(slice_mm):
-    return "thin" if slice_mm <= THIN_MAX_MM else "thick"
+class Moments:
+    """Streaming mean and covariance: a `dim` sum and a `dim x dim` second-moment matrix, never the
+    rows themselves.
 
-
-def _empty_sides():
-    return {s: {"real": [], "fake": []} for s in STRATA}
-
-
-def _stack(sides_per_stratum, dim):
-    empty = np.zeros((0, dim), np.float32)
-    return {stratum: {side: np.concatenate(chunks) if chunks else empty
-                      for side, chunks in sides.items()}
-            for stratum, sides in sides_per_stratum.items()}
-
-
-def _frechet(feats_fake, feats_real):
-    """pytorch-fid's own distance over two feature sets.
-
-    `calculate_activation_statistics` is `np.mean` / `np.cov(rowvar=False)` on the stacked
-    activations, and `calculate_frechet_distance` is vendored verbatim -- including that it
-    regularizes only after `sqrtm` has already returned something non-finite. StyleGAN-V's FVD
-    does not regularize at all, which is the same thing whenever sqrtm is finite.
+    Every slice of every volume is used, so the rows do not fit: the 2.5D FID alone is ~670 slices
+    per volume per side across its three planes, which at 1,000 cases is 1.3M rows of 2048 floats.
+    Accumulating `sum` and `X^T X` instead costs 33 MB per side whatever the case count, and gives
+    exactly the mean and the unbiased covariance `np.cov(rowvar=False)` would -- `add` in one call
+    or in a hundred chunks is the same arithmetic, which is what makes batching safe. float64
+    throughout, because a second moment over a million rows is where float32 loses digits.
     """
-    mu_f, sigma_f = np.mean(feats_fake, axis=0), np.cov(feats_fake, rowvar=False)
-    mu_r, sigma_r = np.mean(feats_real, axis=0), np.cov(feats_real, rowvar=False)
-    return float(calculate_frechet_distance(mu_f, sigma_f, mu_r, sigma_r))
+
+    def __init__(self, dim):
+        self.dim = dim
+        self.n = 0
+        self._sum = np.zeros(dim, np.float64)
+        self._outer = np.zeros((dim, dim), np.float64)
+
+    def add(self, feats):
+        if feats.shape[0] == 0:
+            return
+        feats = feats.astype(np.float64)
+        self.n += feats.shape[0]
+        self._sum += feats.sum(axis=0)
+        self._outer += feats.T @ feats
+
+    def finalize(self):
+        """`(mu, sigma)`, matching `np.mean` / `np.cov(rowvar=False)` on the rows."""
+        mu = self._sum / self.n
+        sigma = (self._outer - self.n * np.outer(mu, mu)) / (self.n - 1)
+        return mu, sigma
+
+    def state(self):
+        """A picklable snapshot -- what a shard writes for `--combine` to pool."""
+        return {"dim": self.dim, "n": self.n, "sum": self._sum, "outer": self._outer}
+
+    @classmethod
+    def merged(cls, states):
+        """One `Moments` from several shards'. Sums and second moments are additive, so pooling is
+        exact -- the same mean and covariance a single process over every row would have found,
+        with no rows to concatenate."""
+        out = cls(states[0]["dim"])
+        for st in states:
+            out.n += st["n"]
+            out._sum += st["sum"]
+            out._outer += st["outer"]
+        return out
 
 
-### FID: pytorch-fid, every slice of the acquisition plane ###
+def _empty_sides(dim):
+    return {"real": Moments(dim), "fake": Moments(dim)}
+
+
+### fid_2d_inception: pytorch-fid, every slice of the acquisition plane ###
 
 _FID_DIM = 2048
 
 
-class SliceFIDAccumulator:
+class Fid2dInceptionAccumulator:
     """FID over slices of array axis 0 -- the acquisition plane, the axis the model rolls out
     along, so the images scored are the images generated.
 
@@ -237,7 +265,7 @@ class SliceFIDAccumulator:
         self.device = device
         self.batch_size = batch_size
         self.model = InceptionV3().eval().to(device)
-        self._feats = _empty_sides()
+        self._feats = _empty_sides(_FID_DIM)
 
     @torch.no_grad()
     def _features(self, vol):
@@ -249,12 +277,12 @@ class SliceFIDAccumulator:
             out.append(self.model(x)[0].squeeze(3).squeeze(2).float().cpu().numpy())
         return np.concatenate(out)
 
-    def add_pair(self, real, fake, stratum):
-        self._feats[stratum]["real"].append(self._features(real))
-        self._feats[stratum]["fake"].append(self._features(fake))
+    def add_pair(self, real, fake):
+        self._feats["real"].add(self._features(real))
+        self._feats["fake"].add(self._features(fake))
 
-    def raw_features(self):
-        return _stack(self._feats, _FID_DIM)
+    def moments(self):
+        return self._feats
 
 
 ### FVD: StyleGAN-V's I3D, one clip per volume ###
@@ -309,7 +337,7 @@ class ClipFVDAccumulator:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.i3d = load_i3d(device)
-        self._feats = {name: _empty_sides() for name in CLIP_CONFIGS}
+        self._feats = {name: _empty_sides(_FVD_DIM) for name in CLIP_CONFIGS}
 
     @torch.no_grad()
     def _clip_feature(self, vol, clip_len):
@@ -323,14 +351,14 @@ class ClipFVDAccumulator:
         feats = self.i3d(x, rescale=True, resize=True, return_features=True)
         return feats.float().cpu().numpy()
 
-    def add_pair(self, real, fake, stratum):
+    def add_pair(self, real, fake):
         for name, clip_len in CLIP_CONFIGS.items():
-            sides = self._feats[name][stratum]
-            sides["real"].append(self._clip_feature(real, clip_len))
-            sides["fake"].append(self._clip_feature(fake, clip_len))
+            sides = self._feats[name]
+            sides["real"].add(self._clip_feature(real, clip_len))
+            sides["fake"].add(self._clip_feature(fake, clip_len))
 
-    def raw_features(self):
-        return {name: _stack(sides, _FVD_DIM) for name, sides in self._feats.items()}
+    def moments(self):
+        return self._feats
 
 
 ### Inception Score: torch-fidelity's protocol, on the same TF-ported Inception ###
@@ -413,36 +441,34 @@ def inception_score(logits, splits=_IS_SPLITS, shuffle=True, rng_seed=_IS_RNG_SE
     return float(np.mean(scores)), float(np.std(scores))
 
 
-### Cross-shard pooling ###
+### The distance ###
 
 
-def fid_pooled(raw_per_shard, strata=STRATA):
-    """`(distance, n_real, n_fake)` over several shards' `SliceFIDAccumulator` features, merging
-    the named strata. Concatenating rows before mean/covariance is associative, so this is what one
-    process that had seen every pair itself would compute."""
-    return _pooled(raw_per_shard, _FID_DIM, strata)
-
-
-def fvd_pooled(raw_per_shard, name, strata=STRATA):
+def fvd_pooled(features, name):
     """`(distance, n_real, n_fake)` for one `CLIP_CONFIGS` entry."""
-    return _pooled([s[name] for s in raw_per_shard], _FVD_DIM, strata)
+    return pooled(features[name])
 
 
-def _pooled(per_shard, dim, strata):
-    empty = np.zeros((0, dim), np.float32)
-    sides = {side: np.concatenate([s[stratum][side] for s in per_shard for stratum in strata]
-                                  or [empty]) for side in ("real", "fake")}
-    counts = (int(sides["real"].shape[0]), int(sides["fake"].shape[0]))
+def pooled(sides):
+    """`(distance, n_real, n_fake)` over one `{"real": Moments, "fake": Moments}` pair.
+
+    `calculate_frechet_distance` is pytorch-fid's, vendored, and takes moments -- so every Frechet
+    distance in this project is this function on different features. One accumulator sees the whole
+    population, so nothing is pooled across processes and no shard count can move a number.
+    """
+    real, fake = sides["real"], sides["fake"]
+    counts = (real.n, fake.n)
     # Both covariances must be estimable at all; whether they are estimable *well* is a matter of
-    # rows against `dim`, which is why the counts are reported alongside every distance.
+    # rows against the feature width, which is why the counts are reported with every distance.
     if min(counts) < 2:
         return (float("nan"),) + counts
+    mu_r, sigma_r = real.finalize()
+    mu_f, sigma_f = fake.finalize()
     try:
-        return (_frechet(sides["fake"], sides["real"]),) + counts
+        return (float(calculate_frechet_distance(mu_f, sigma_f, mu_r, sigma_r)),) + counts
     except ValueError as e:
         # pytorch-fid raises rather than returning a number when `sqrtm` of a badly rank-deficient
         # product comes back meaningfully complex -- reachable with a handful of samples against
-        # 2048 or 400 dimensions, i.e. a nearly empty stratum. That must read as nan and let the
-        # other strata through, not take the whole `--combine` down.
+        # 2048 or 400 dimensions. That must read as nan rather than take the whole `--combine` down.
         print(f"[paper_metrics] Frechet distance undefined at n={counts}: {e}")
         return (float("nan"),) + counts
