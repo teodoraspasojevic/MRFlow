@@ -41,21 +41,30 @@
 # Two stages are still worth considering, because model selection on the split you report is a
 # methodological problem even when the compute is affordable:
 #
-#   # stage 1 -- rank the grid, ~100 val cases per cell (the defaults)
+#   # stage 1 -- rank the grid on FID, ~100 val cases per cell (the defaults)
 #   bash slurms/mrflow_cfg_sweep.sh $CONFIG $CKPT $BASE/sweep
 #
 #   # stage 2 -- the winner only, on the exact population every other model was scored on
 #   SPLIT=test N_PER_BUCKET=100 TASKS=32 MOD_SCALES=4 REP_SCALES=7 \
 #       bash slurms/mrflow_cfg_sweep.sh $CONFIG $CKPT $BASE/final
 #
-# Running all 16 cells at SPLIT=test N_PER_BUCKET=100 works and is comparable everywhere, it just
-# costs the full ~2,900 GPU-hours and picks the cfg pair on test.
+# Running the whole grid at SPLIT=test N_PER_BUCKET=100 works and is comparable everywhere; it
+# costs ~820 GPU-hours for a 10-cell grid and picks the cfg pair on test. It is also the only way
+# to rank on FVD_f16, since that needs the full population to have samples at all.
 #
-# **Rank on FVD_f16, not FID.** At N_PER_BUCKET=10 (~100 scored cases) a case yields ~17-21 f16
-# clips, so FVD_f16 rests on ~2,000 samples against 400 feature dimensions -- thin but usable for
-# ordering. FID sees ~4,000 slices against 2,048 dimensions, which is too close to the dimension to
-# rank on. Absolute values from a 100-case sweep are not comparable to the 1,000-case run either;
-# only the ordering carries over.
+# Every rollout is cached to <out>/<cell>/generated/ as fp16 .npy (~21 GB per 1,000-case cell), so
+# a later metric change is a rescore rather than a re-run. Ten cells is ~210 GB and ~10,000 inodes
+# against this account's 102,400 -- fine, but check `df -i` before a grid much larger than that,
+# or pass --no-cache_generated.
+#
+# **Rank on FID at small N, NOT on FVD -- this reversed when the metrics moved to their reference
+# protocols.** FVD now takes one clip per volume (StyleGAN-V's own protocol) rather than ~17-21
+# overlapping windows, so the clip count *is* the case count: N_PER_BUCKET=10 gives ~100 samples
+# against 400 feature dimensions, a rank-deficient covariance and a number that cannot order
+# anything. FID went the other way -- every slice is used now instead of every 4th -- so ~100 cases
+# give ~15,800 rows against 2,048 dimensions, which is usable. Either rank on FID, or skip the
+# ranking stage and run the grid on the full population. Absolute values from a 100-case sweep are
+# not comparable to a 1,000-case run either; only the ordering carries over.
 #
 # Cost: the 1/1 cell is cheaper per block than the rest, because at
 # modality_cfg_scale == report_cfg_scale == 1 the sampler takes its single-conditional

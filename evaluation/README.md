@@ -2,16 +2,18 @@
 
 Roll out MRFlow over an MR-RATE split and score it with **two metric families at once**.
 
-- **Challenge** — MSE/PSNR/SSIM and 2.5D FID, from [`challenge_metrics.py`](challenge_metrics.py),
-  a port of the challenge's own scoring container. These numbers are the leaderboard's, not our own
-  definitions, and the pair reaches them exactly as the platform would see it.
-- **Paper** — slice-axis FID on Inception-v3 pool3, FVD over 16- and 64-slice I3D clips, and
-  Inception Score, from [`paper_metrics.py`](paper_metrics.py). These put both volumes in the 1 mm
-  isotropic / 256² grid the model was *trained* in, and describe the generative distribution rather
-  than agreement with one particular patient's scan.
+- **FID, FVD and Inception Score**, each computed the way its own reference implementation computes
+  it — pytorch-fid, StyleGAN-V and torch-fidelity respectively. These are the numbers the work is
+  read by, and they are the field's standard protocols *unmodified*. Both volumes reach them in the
+  1 mm isotropic / 256² grid the model was trained in.
+- **MSE/PSNR/SSIM and the 2.5D FID**, from [`challenge_metrics.py`](challenge_metrics.py), the
+  VLM3D scoring container vendored. The challenge is over so these are nobody's reference any more,
+  but they are still worth having and cost one extra pass over volumes already in memory. They see
+  the pair exactly as the leaderboard did.
 
-The two families are given **different arrays on purpose** — see [the geometry
-contract](#the-geometry-contract).
+**The two families are given different arrays, and that separation is the point** — see [the
+geometry contract](#the-geometry-contract). Nothing from the container may reach the reference
+protocols.
 
 No preprocessed split is needed — every case is read straight out of the raw MR-RATE tars — so
 `--split test` runs exactly like `--split val`.
@@ -63,8 +65,8 @@ one acquisition per (study, contrast, plane) is eligible — the same cohort R2V
 `series_selection="one_per_study_per_bucket"` builds, on the full split too (29,016 scored series
 either way). With the config's `max_repeats: null` the duplicate acquisitions
 (`t1w-raw-axi-2`, `-3`, …) crowd out other studies and only 868 of the 1,000 match. Its per-bucket
-caveat carries over too: the 2.5D FID compares 512-d covariances, so at 100 per bucket only the
-pooled numbers are trustworthy.
+caveat carries over too: a per-bucket FID or FVD compares covariances estimated from one bucket's
+samples, so at 100 per bucket only the pooled numbers are trustworthy.
 
 Sampler noise is seeded per case (`config.seed + case_id`), not per position, so a rerun — or the
 same case under a different shard count — draws the same noise and scores the same. `config.seed`
@@ -89,24 +91,25 @@ whatever shards it finds, so a task that died leaves a quietly smaller evaluatio
 
 | file | what |
 |---|---|
-| [`challenge_metrics.py`](challenge_metrics.py) | vendored official container: modality scope, MSE/PSNR/SSIM, streaming 2.5D FID. Do not "improve" it |
-| [`paper_metrics.py`](paper_metrics.py) | ours: the 1 mm/256² canonicalization, slice-axis FID on Inception-v3 pool3, FVD over I3D clips, Inception Score |
-| [`__init__.py`](__init__.py) | `ChallengeAccumulator` — feeds each metric family the geometry it is defined on, and pools shards |
+| [`paper_metrics.py`](paper_metrics.py) | the metrics: the 1 mm/256² canonicalization, then FID, FVD and IS by their reference protocols |
+| [`fid_inception.py`](fid_inception.py) | pytorch-fid v0.3.0 verbatim — the TF-ported Inception and its Frechet distance. Do not edit |
+| [`__init__.py`](__init__.py) | `EvalAccumulator` — canonicalizes each pair, accumulates features, pools shards |
 | [`main.py`](main.py) | the CLI: build a case, generate, score, write `metrics.json`, log to W&B |
-| [`../tests/test_evaluation_metrics.py`](../tests/test_evaluation_metrics.py) | 16 value tests: identical pairs score zero, ladders order, pooling is shard-invariant, the container's golden values hold |
+| [`challenge_metrics.py`](challenge_metrics.py) | the VLM3D scoring container, vendored: modality scope, MSE/PSNR/SSIM, streaming 2.5D FID. Do not "improve" it |
+| [`../tests/test_evaluation_metrics.py`](../tests/test_evaluation_metrics.py) | value tests: the reference protocols hold, identical pairs score zero, ladders order, pooling is shard-invariant |
 
 ## Preprocessing
 
-**The rule: only one version of the pair is ever read from disk, and each metric family
-canonicalizes it its own way.** `run_shard` loads the ground truth once, in its released geometry;
-whatever a metric needs beyond that happens inside that metric's module.
+**The rule: the pair is read from disk once, in its released geometry, and each family
+canonicalizes it its own way.** `run_shard` loads the ground truth and nothing else happens to it
+there; whatever a metric needs beyond that happens inside that metric's module.
 
 | | what happens to it |
 |---|---|
 | ground truth, as loaded | `load_native_volume`: reorient to RAS, transpose so the slice axis leads. **Nothing else** — no resample, no normalization, no crop or pad. |
 | generated, as produced | nothing. 256², 1 mm, `T` slices, however many the stop token emitted. |
-| inside the **challenge** metrics | 0.5/99.5-percentile normalize to `[0, 1]`; the generated volume is `zoom`ed onto the ground truth's shape. The reference is never touched — resampling it would score against a different target than the platform does. |
-| inside the **paper** metrics | both volumes canonicalized to 1 mm / 256², then normalized — see [the geometry contract](#the-geometry-contract) |
+| inside the **reference-protocol** metrics | both volumes canonicalized to 1 mm / 256², percentile-normalized and quantized to uint8 — see [the geometry contract](#the-geometry-contract) |
+| inside the **container** metrics | 0.5/99.5-percentile normalize to `[0, 1]`; the generated volume is `zoom`ed onto the ground truth's shape. The reference is never touched — resampling it would score against a different target than the platform did. |
 
 The one transformation applied to the ground truth is a **transpose**, which is filing, not
 preprocessing: same voxel values, same three axis lengths, same spacing. It exists so that "slice
@@ -135,13 +138,13 @@ Each case is derived from one read of its MR-RATE series:
   whichever configuration `mri.conditioning` names is the one the model trained against: the
   study's report plus the series' `[MODALITY]`/`[PLANE]` markers, either pooled to one 768-d
   CXR-BERT token or split into three 2560-wide section tokens, then L2-normalized.
-- **Regime** — one entry in `REGIMES`. The challenge is report-to-volume, so `full-body` is the
+- **Regime** — one entry in `REGIMES`. The task is report-to-volume, so `full-body` is the
   default. Adding a regime is adding an entry; each receives a zero-argument `gt_latent()` so a
   regime that needs no ground truth never pays to encode one.
 
   | `--regime` | seed block | for |
   |---|---|---|
-  | `full-body` | the black boundary token | the challenge task |
+  | `full-body` | the black boundary token | report-to-volume, the real task |
   | `gt-head` | the volume's own first block | diagnosing the rollout |
 
 - **Rollout** — `LatentAutoregressiveGenerator`, the same one `auto_regressive_generate/main.py`
@@ -167,40 +170,67 @@ Each case is derived from one read of its MR-RATE series:
   as a missing output, never allowed to lose the shard.
 
 **Sharding.** A full-body rollout is 20 blocks of 201 steps, so shard as wide as the queue allows.
-Each task writes `shard-NNNN.pt` (its per-case scores plus its accumulated FID features); the
-`--combine` pass pools them. FID is pooled at the feature level, so the per-plane distances are
-computed over every shard's slices at once rather than averaged per shard.
+Each task writes `shard-NNNN.pt` (its per-case record plus its accumulated feature rows); the
+`--combine` pass pools them. Every distance pools at the feature level, so the shard count never
+changes it. `IS` is the exception: it shuffles on a fixed seed before splitting, which makes the
+ten splits representative rather than contiguous blocks of shards, but a fixed permutation of a
+reordered set is still a different assignment — `IS_mean` moves ~0.25% across a 1-vs-32 shard
+change, `IS_std` a lot, so quote `IS_std` only between runs of the same shard count.
+
+Feature volume is the one thing to size. Every slice is kept as a 2048-d row per side for FID plus
+a 1008-d row for IS, so a 1,000-case run at ~158 slices per case pools to roughly **3 GB** in the
+`--combine` process — fine on a compute node, worth knowing before running it on a login node.
 
 ## Metrics
 
-**Two families, two geometries.** The challenge metrics get the pair exactly as the leaderboard
-would — ground truth in its released geometry, generated volume `zoom`ed onto it by the official
-code. The paper metrics get both volumes canonicalized into the 1 mm isotropic / 256² grid the
-model was *trained* in, because that is the distribution it was asked to match. Neither family may
-be handed the other's arrays.
+**The three numbers the work is read by are computed the way their own reference implementations
+compute them.** Where a reference exists it is used rather than reimplemented, and every place we
+deviate is named. The references, read from source:
 
-### Paper metrics ([`paper_metrics.py`](paper_metrics.py))
+| metric | reference implementation | what it pins |
+|---|---|---|
+| `FID` | [`pytorch-fid`](https://github.com/mseitzer/pytorch-fid) **v0.3.0**, vendored verbatim as [`fid_inception.py`](fid_inception.py) | backbone `pt_inception-2015-12-05` (the TF port, **not** torchvision's ImageNet Inception), 2048-d final pool, images as `[0, 1]` floats the module itself resizes to 299² (bilinear, `align_corners=False`, no antialias) and rescales to `[-1, 1]`, **every image** in the set, `eps·I` only when `sqrtm` returns non-finite |
+| `FVD_f16`, `FVD_f64` | [StyleGAN-V](https://github.com/universome/stylegan-v) `src/metrics/frechet_video_distance.py` | Kinetics-400 I3D torchscript at its 400-d pre-softmax layer, called `rescale=True, resize=True, return_features=True` so the detector does its own `x/255*2-1` and its own bilinear resize to 224², **one clip of `num_frames` consecutive frames per video, no overlap**, short videos discarded |
+| `IS_mean`, `IS_std` | [`torch-fidelity`](https://github.com/toshas/torch-fidelity) `torch_fidelity/metric_isc.py` | logits (not probabilities), shuffled with `RandomState(2020).permutation(N)`, 10 contiguous splits at `i*N//splits`, KL in float64. The shuffle makes the splits representative; it does **not** make the value order-invariant |
+
+Both references consume **uint8** images, so both volumes are percentile-normalized to `[0, 1]` and
+then quantized to uint8 before any feature extractor sees them.
+
+The container's MSE/PSNR/SSIM and 2.5D FID are computed alongside, on their own arrays, and are
+marked **container** below — they follow no reference but the leaderboard's, see [the container
+metrics](#the-container-metrics-and-why-they-stay-separate).
 
 | metric | what it is |
 |---|---|
-| `FID` | Frechet distance over Inception-v3 **pool3 (2048-d)** features of every 4th acquisition-plane slice |
-| `FVD_f16` / `FVD_f64` | Frechet distance over I3D features of **clips of 16 / 64 consecutive slices** (stride 8 / 32) |
+| `FID` | Frechet distance over pool3 features of **every** acquisition-plane slice |
+| `FVD_f16` | Frechet distance over I3D features, **one 16-slice clip per volume** — the standard protocol |
+| `FVD_f64` | the same with 64-slice clips — **ours**, four generated blocks, reads coherence across block boundaries |
 | `IS_mean` / `IS_std` | Inception Score of the generated slices; no ground truth involved |
-| `FID_thin` / `FID_thick`, `FVD_*_thin` / `_thick` | the same, split by the ground truth's **native** slice spacing (≤ 1.5 mm vs above) |
-| `n_fid_slices`, `n_fvd_f16_clips`, `n_fvd_f64_clips` | samples behind each distance — read these against the 2048/400 feature dimension |
+| `FID_thin` / `FID_thick`, `FVD_*_thin` / `_thick` | the same, split by the ground truth's **native** slice spacing (≤ 1.5 mm vs above) — **ours** |
+| `n_fid_slices_real` / `_fake`, `n_fvd_*_clips_real` / `_fake`, `n_is_slices` | samples behind each number — read these against the 2048/400 feature dimension |
 | `n_thin_cases` / `n_thick_cases` | cases in each stratum |
+| `MSE_mean` / `PSNR_mean` / `SSIM_mean` | **container**: per case on its own normalized pair, then averaged over the scored cases |
+| `FID_2p5D_XY` / `_XZ` / `_YZ` / `_Avg` | **container**: Frechet distance over squeezenet1_1 (512-d) features of every 4th slice, per array axis, and their mean |
 
-`FID` uses torchvision's Inception-v3, not the TF-ported `pt_inception-2015-12-05` that
-`pytorch-fid` wraps, so it is comparable across our own runs and to other torchvision-based numbers
-but not digit-for-digit to a paper quoting the TF port.
+**Both sample counts are reported for every distance**, because nothing forces a rollout to the
+reference's length: a generation that stopped early contributes fewer slices, and one shorter than
+a clip contributes no clip at all. Equal counts are a property of the run, not of the code.
 
-**Why clips.** FVD is not defined on a whole volume: the reference implementation cuts videos into
-clips and each clip is one sample. `f16` is one generated block, so it reads within-block
-continuity; `f64` is four, so it reads whether the rollout stays coherent across block boundaries —
-the drift the CT paper's `FVD_f16`/`FVD_f128` pair was built to expose. `f128` does not fit here:
-MR-RATE volumes are 143–200 slices at 1 mm, which would leave ~1 clip per case against 400 feature
-dimensions. The strides overlap by half so the covariance has enough samples to be an estimate
-(~20k `f16` and ~4k `f64` clips at 1,000 cases, against 1,000 under one-vector-per-volume).
+### What is ours, and must be declared when these are quoted
+
+- **The geometry.** Both volumes are canonicalized into the model's own 1 mm isotropic / 256²
+  training grid rather than the reference being left in its released geometry with the generation
+  resampled onto it — see [the geometry contract](#the-geometry-contract). That is the distribution
+  the model was asked to match, but it also means these numbers are not comparable to a paper that
+  scored native-geometry references.
+- **The slice axis.** `FID` and `IS` see slices of array axis 0 only — the acquisition plane, the
+  axis the model rolls out along, so the images scored are the images generated.
+- **The intensity window**, a 0.5/99.5 percentile per volume.
+- **`FVD_f64`**, and the `thin`/`thick` strata. `FVD_f16` is the only number here computed by an
+  unmodified reference protocol, which is why it leads the report.
+- **The clip offset.** StyleGAN-V draws a random offset per video; we center it, because these
+  "videos" are anatomically ordered rather than arbitrary and a random offset would add sampling
+  noise without buying independence.
 
 **Why the strata.** MR-RATE mixes 2D thick-slice and 3D thin-slice acquisitions *inside every*
 `(modality, plane)` bucket — the modal spacing covers only 33–71% of a bucket, and FLAIR/SAGITTAL
@@ -210,23 +240,37 @@ interpolated**. The model is told neither (`[SPACING]` is not in the conditionin
 spacing class embedding), so it cannot know which to produce. A model that hedges between the two
 shows up as too smooth on `thin` and too detailed on `thick`.
 
-### Challenge metrics ([`challenge_metrics.py`](challenge_metrics.py))
+**Sample counts are the thing to check first.** One clip per volume means the FVD sample count *is*
+the case count: 1,000 cases give 1,000 clips against 400 feature dimensions, where StyleGAN-V
+quotes 2,048. FID is comfortable by comparison — ~158 slices per case, so ~158k rows against 2,048
+dimensions. Below a few hundred samples an FVD stops ordering reliably: measured on single-scale
+synthetic volumes, noise at sigma 0.05/0.2/0.8 scored 3159/2841/840, i.e. backwards, and
+identically so at N=8 and N=96.
 
-| metric | what it is |
-|---|---|
-| `MSE_mean` / `PSNR_mean` / `SSIM_mean` | per case on the normalized pair, then averaged |
-| `FID_2p5D_XY` / `_XZ` / `_YZ` | Frechet distance over squeezenet1_1 (512-d) features of every 4th slice, per array axis |
-| `FID_2p5D_Avg` | mean of the three |
-| `FID_T` | a literal copy of `FID_2p5D_YZ` — see below |
-| `dice` | a literal copy of `SSIM_mean` — the platform's primary-metric shim, not real Dice |
-| `n_total_files` etc. | cases seen, scored, missing, and excluded by modality |
+`IS` is compressed for a different reason — ImageNet's 1,000 classes do not describe an MR slice,
+and the posteriors carry 3.7 of a possible 6.9 nats — so it sits near 1.6–1.8 and is never a
+natural-image number. Read it against another MR run or not at all.
 
-`FID_T` is not a second computation. The official code slices array axis 0 under the label `YZ`, so
-that number already **is** slice-axis FID on the container's own backbone; `FID_T` exposes it under
-the name the paper uses, and the two are asserted equal. It is also the only official plane worth
-quoting: `_XY` and `_XZ` slice along axes whose images *contain* the slice axis, so a 38-slice
-reformat and a 200-slice one get squashed to 224² by very different factors, and those two planes
-measure that distortion as much as they measure anatomy.
+### The container metrics, and why they stay separate
+
+[`challenge_metrics.py`](challenge_metrics.py) is computed and logged, but it is **not** a
+reference for anything: a squeezenet1_1 2.5D FID that nobody publishes against, `stride=4` slice
+sampling, a per-slice intensity window, and per-case MSE/PSNR/SSIM against one particular patient's
+scan, which a report-to-volume model has no reason to reproduce. They are reported because they are
+cheap and were the challenge's own numbers, and they are read as such.
+
+What may never happen is the reverse of the old arrangement: **none of those habits may reach
+[`paper_metrics.py`](paper_metrics.py)**, whose entire value is that FID/FVD/IS there are the
+standard protocols unmodified. Concretely — `compute_basic_metrics` and `FIDAccumulator` are handed
+`real` and `produced` exactly as they arrived, the reference-protocol metrics are handed the
+canonicalized pair, and `PAPER_KEYS`/`CHALLENGE_KEYS` record which family each key belongs to, which
+is what says the arrays it was computed on. `test_the_challenge_family_scores_the_released_pair_not_the_canonicalized_one`
+is the guard.
+
+`dice` and `FID_T` are gone: both were aliases rather than computations (`dice` a copy of
+`SSIM_mean` for the platform's primary-metric slot, `FID_T` a copy of `FID_2p5D_YZ` under the
+paper's name). With a reference-protocol slice-axis `FID` now present, a second one under a third
+name is only confusing. `challenge_metrics.py` still computes everything it ever did.
 
 ### The geometry contract
 
@@ -234,7 +278,7 @@ measure that distortion as much as they measure anatomy.
 |---|---|---|
 | in-plane | resampled to 1 mm and cropped/padded to 256² with preprocessing's own 15 mm posterior shift, **anti-aliased** | already 1 mm / 256² — untouched |
 | slice axis | resampled to 1 mm at its **native extent** (143–200 slices over MR-RATE) | untouched; the stop token decides the length |
-| intensity | `_normalize01` after the geometry | `_normalize01` after the geometry |
+| intensity | `normalize01` (0.5/99.5 percentile) after the geometry, then uint8 | the same |
 
 Three deliberate choices in there:
 
@@ -246,13 +290,16 @@ Three deliberate choices in there:
   Resampling runs finer → coarser on both axes: the ground truth is in-plane finer than 1 mm
   (matrices 186–1024), the generation is finer along z (always 1 mm against a 0.5–6.8 mm reference).
   So nothing is invented on either side.
-- **The in-plane resize is anti-aliased**, because a native ground truth shrinks by up to 2.7× on
-  the way to 224² while a generated volume never shrinks at all. Un-filtered decimation folds that
-  difference into the real features as false structure — measured, at 512→224 anti-aliasing changes
-  the pixel std from 0.191 to 0.084, against 0.192 → 0.167 at 256→224. `antialias=` exists only for
-  bilinear/bicubic 2D, so in-plane is a 2D resize over the slice batch and the slice axis is
-  area-averaged separately (`adaptive_avg_pool3d`), which is anyway the right operation rather than
-  a filter: a thick MR slice *is* approximately the integral of the tissue over its thickness.
+- **This in-plane resize is anti-aliased, and the feature extractors' own resizes are not.** They
+  are different operations. Here a native ground truth shrinks by up to 2.7× on the way to 256²
+  while a generated volume is not resized at all, and un-filtered decimation would fold that
+  asymmetry into the real features as false structure — measured, at 512→224 anti-aliasing changes
+  the pixel std from 0.191 to 0.084, against 0.192 → 0.167 at 256→224. By the time a slice reaches
+  Inception or the I3D both sides are 256² and get the identical un-filtered bilinear resize their
+  references specify. `antialias=` exists only for bilinear/bicubic 2D, so in-plane is a 2D resize
+  over the slice batch and the slice axis is area-averaged separately (`adaptive_avg_pool3d`),
+  which is anyway the right operation rather than a filter: a thick MR slice *is* approximately the
+  integral of the tissue over its thickness.
 
 **Read this before quoting the paper FVD.** 58% of MR-RATE is acquired above 1.5 mm slice spacing
 (median 4.05 mm), and `preprocess_volume` trilinearly upsampled those to 1 mm *for training*. So on
@@ -270,38 +317,57 @@ raises on them rather than pooling a partial number. Re-run the array.
 cached on Helma, and a compute node can fetch it itself in ~2 s. Set `MRFLOW_I3D_PATH` to a
 pre-baked copy on a node with no outbound route.
 
-**Scope.** Only T1w/T2w/FLAIR/SWI are scored, matching the organizers' decision. Other modalities
-are counted in `n_excluded_out_of_scope_modality` and skipped before generation.
+**Scope.** Only T1w/T2w/FLAIR/SWI are scored. That was the challenge organizers' decision and is
+now ours (`IN_SCOPE_MODALITIES` in [`__init__.py`](__init__.py)), kept unchanged so a number stays
+comparable with the `R2V-MR-Generation` runs. Other modalities are counted in
+`n_excluded_out_of_scope_modality` and skipped before generation.
 
-**Missing cases are dropped from the MSE/PSNR/SSIM means**, not penalized with a worst-case value —
-that is what the official aggregation actually does, despite what its per-case record suggests.
+**A missing case contributes no samples to the distances** — there is nothing to penalize a
+distribution distance with — and is **dropped from the MSE/PSNR/SSIM means** rather than given a
+worst-case value, which is what the official aggregation actually does. Watch `n_missing_outputs`
+and the per-side sample counts.
 
-**`METRIC_KEYS` is also the reporting order** — `HEADLINE_KEYS` first (`FVD_f16`, `FVD_f64`, `FID`,
-`FID_2p5D_Avg`, `IS_mean`, `PSNR_mean`, `MSE_mean`, `SSIM_mean`), then whatever each family has
-left: the strata splits and sample counts, the per-plane FIDs and `dice`, and the file counts. It
-drives the console dump, `metrics.json` and the W&B table at once.
+**`METRIC_KEYS` is also the reporting order** — `HEADLINE_KEYS` first (`FVD_f16`, `FID`, `IS_mean`,
+`FVD_f64`, then `FID_2p5D_Avg`, `PSNR_mean`, `SSIM_mean`, `MSE_mean`: the reference protocols lead,
+`FVD_f16` first because it is the one computed by an unmodified reference end to end), then the
+remainder of `PAPER_KEYS`, the remainder of `CHALLENGE_KEYS`, then the file counts. It drives the
+console dump, `metrics.json` and the W&B table at once.
 
 One caveat on the counts: `n_total_files` counts eligible MR-RATE series from `list_series` (report
 present, not derived, not a localizer, no duplicate acquisitions), not files in the platform's
 ground-truth directory. And **`n_scored_files` counts in-scope cases, not successfully scored ones**
-— it is `n_total - n_excluded`, so a missing case is included in it. The means average over
-`n_scored_files - n_missing_outputs`.
+— it is `n_total - n_excluded`, so a missing case is included in it. `n_scored_files -
+n_missing_outputs` is how many volumes actually reached a metric.
 
-**Do not "improve" [`challenge_metrics.py`](challenge_metrics.py).** All of it is the leaderboard's
-arithmetic. The only sanctioned additions are marked in the file: `raw_features`/`finalize_pooled`
-for cross-shard FID pooling, and `_matrix_sqrt`, which drops a `sqrtm` kwarg scipy ≥ 1.17 removed.
-[`paper_metrics.py`](paper_metrics.py) imports `_normalize01` and `_matrix_sqrt` from it so there is
-one definition of each; everything else there is ours and may be changed freely.
+**Do not edit [`fid_inception.py`](fid_inception.py).** It is pytorch-fid v0.3.0 verbatim, and the
+point of copying it is that our FID is the same arithmetic on the same weights as every published
+FID. It carries exactly one marked edit — a `_sqrtm` shim dropping the `disp=` kwarg scipy ≥ 1.17
+removed (this venv is on 1.18, so the original raises).
+
+**Do not "improve" [`challenge_metrics.py`](challenge_metrics.py) either.** All of it is the
+leaderboard's own arithmetic, quirks included. The only sanctioned additions are marked in the file:
+`raw_features`/`finalize_pooled` for cross-shard FID pooling, and `_matrix_sqrt`, which drops the
+same `sqrtm` kwarg.
 
 ## Output
 
 ```
 <output_dir>/eval/<regime>-<split>/
-├── shard-0000.pt ...        per-shard scores + FID features (input to --combine)
+├── shard-0000.pt ...        per-shard scores + accumulated features (input to --combine)
 ├── metrics.json             {"metrics": {...}, "per_case": [...], regime, split, ckpt}
-└── examples/                a few ground-truth | generated mp4s (--examples)
+├── generated/               every rollout as fp16 .npy, plus index-NNNN.json per shard
+└── examples/                one ground-truth | generated mp4 per bucket (--examples)
 ```
 
-W&B gets a `challenge_metrics` table, the same values in the run summary and as scalars, and the
+**`generated/` is on by default** (`--no-cache_generated` turns it off). Generation is the
+expensive half of an evaluation — 20 blocks of 201 Euler steps per case — while every metric
+downstream is minutes of feature extraction, so keeping the rollouts makes the next change to a
+metric a rescore rather than another GPU-week. ~21 MB per case, so ~21 GB and 1,000 inodes for a
+1,000-case run, well inside this account's 102,400 on `/hnvme`. fp16 is finer than the uint8 every
+feature extractor quantizes to anyway (max error 2.4e-4 against a 3.9e-3 quantization step). Each
+`index-NNNN.json` carries the modality, plane, spacing, archive and member for its shard's cases —
+everything needed to rebuild a pair without re-deriving the population.
+
+W&B gets a `metrics` table, the same values in the run summary and as scalars, and the
 example videos — matching the `R2V-MR-Generation` baseline's panels so the two models' runs read
 side by side.

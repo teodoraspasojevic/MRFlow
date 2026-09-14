@@ -137,6 +137,7 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
             atol=1e-5,
             rtol=1e-5,
             adjoint_params=val_denoiser.parameters(),
+            options={"max_num_steps": config.validation.get("max_solver_steps", 4096)},
         )[-1]
 
     with torch.no_grad():
@@ -280,6 +281,8 @@ def main():
         config.max_grad_norm = float("inf")
 
     infinite_loader = cycle(train_dataloader)
+    skipped_steps = 0
+    consecutive_skips = 0
     progress_bar = tqdm(
         range(0, config.max_train_steps),
         initial=initial_global_step,
@@ -351,8 +354,29 @@ def main():
                         denoiser.parameters(), config.max_grad_value
                     )
                 lr_scheduler.step()
-            optimizer.step()
+
+            skip_update = accelerator.sync_gradients and not torch.isfinite(grad_norm)
+            if not skip_update:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+
+            if skip_update:
+                skipped_steps += 1
+                consecutive_skips += 1
+                logger.warning(
+                    f"Non-finite grad norm at step {global_step}; update skipped "
+                    f"({consecutive_skips} in a row, {skipped_steps} total)."
+                )
+                # Every rank sees the same all-reduced norm, so they all skip together. Skipping
+                # forever means the weights themselves are nan: die so the chain's afternotok leg
+                # resumes from the last good checkpoint instead of burning the rest of the budget.
+                if consecutive_skips >= config.get("max_consecutive_skipped_steps", 25):
+                    raise RuntimeError(
+                        f"{consecutive_skips} consecutive non-finite gradients at step "
+                        f"{global_step} -- the model has diverged."
+                    )
+            elif accelerator.sync_gradients:
+                consecutive_skips = 0
 
             logs = {
                 "step_loss": loss.detach().item(),
@@ -370,6 +394,7 @@ def main():
                         "train_loss": loss.mean().item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "grad_norm": grad_norm.item(),
+                        "skipped_steps": skipped_steps,
                         "mean_latent": videos.mean().item(),
                         "std_latent": videos.std().item(),
                         # Realized rates, so a mis-specified condition_states block is visible.
@@ -384,14 +409,24 @@ def main():
                 and accelerator.is_main_process
                 and global_step % config.validation.steps == 0
             ):
-                log_validation(
-                    config,
-                    ema_denoiser or denoiser,
-                    accelerator,
-                    dtype,
-                    val_dataset,
-                    step=global_step,
-                )
+                # Monitoring only -- a solver failure here costs a preview video, not 7 hours
+                # of training. dopri5 asserts "underflow in dt" the moment the velocity field
+                # returns nan, and that assert used to be fatal on rank 0.
+                try:
+                    log_validation(
+                        config,
+                        ema_denoiser or denoiser,
+                        accelerator,
+                        dtype,
+                        val_dataset,
+                        step=global_step,
+                    )
+                except Exception:
+                    logger.error(
+                        f"Validation failed at step {global_step}; training continues.",
+                        exc_info=True,
+                    )
+                    torch.cuda.empty_cache()
 
             if (
                 accelerator.sync_gradients
