@@ -31,7 +31,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=06:00:00
+# 4:30 rather than 6:00, measured: over 734 completed eval tasks the median is 3.25 h, p90 3.52 h
+# and the worst ever 3.95 h, with zero timeouts. A shorter limit backfills into more gaps, so the
+# array starts sooner. A --combine pass only adds moments and wants minutes -- but it falls back to
+# rescoring every cached volume when a shard's feature file is missing, so give those 2 h, not 10 m.
+#SBATCH --time=04:30:00
 #SBATCH --job-name=mrflow_eval
 #SBATCH --output=logs/eval_%A_%a.out
 #SBATCH --error=logs/eval_%A_%a.err
