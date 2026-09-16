@@ -300,7 +300,7 @@ checkpointing_steps: 2_000
 # checkpointing_steps regardless; retention only controls deletion, and cleanup_checkpoints always
 # keeps `last_checkpoint` on top of this list, so crash recovery tracks checkpointing_steps
 # however sparse the list is.
-checkpoints_to_keep: [10000, 20000, 50000, 100000, 150000, 200000]
+checkpoints_to_keep: [10000, 20000, 40000, 60000, 80000, 90000, 100000]
 
 # Random init: load_init_weights returns immediately on a falsy path, leaving the weights that
 # DiffuserSTDiT.initialize_weights() set in __init__. resume_from_checkpoint still applies, so a
