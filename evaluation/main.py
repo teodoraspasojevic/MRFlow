@@ -33,6 +33,15 @@ cannot move a number -- and it costs seconds rather than a second pass over the 
 What survives a run: `generated/*.npy`, the manifests, `metrics.json`. That is what makes a later
 metric change a rescore (`--combine` with the feature files gone re-reads the cached volumes)
 instead of another generation pass.
+
+**Scoring something that is not MRFlow.** `score_cached` reads only the manifests and the cached
+volumes, so a baseline that writes those two things is scored by the identical extractors, geometry
+and ground truth -- see `baselines/README.md`. Two flags exist for that comparison:
+
+    --cases   roll out a population frozen to a file instead of deriving one, so every model in a
+              baseline table provably ran the same case list rather than each re-deriving it.
+    --label   what produced the volumes, for a `--combine` over a baseline's output. Without it a
+              baseline logs under MRFlow's guidance scales, which are not its settings.
 """
 
 import argparse
@@ -121,6 +130,31 @@ def select_cases(series, n_per_bucket):
     return selected
 
 
+def load_frozen_cases(path, split):
+    """A population frozen by `baselines/common/cases.py`, checked against the split asked for.
+
+    The rows carry every field `run_shard` reads off a `list_series` entry -- modality, plane,
+    study_uid, series_id, archive, member -- so a frozen list is a drop-in for a derived one and
+    nothing downstream needs to know which it got.
+
+    Read here with plain `json` rather than through `baselines.common.cases`, so `evaluation/`
+    keeps no dependency on `baselines/` (the arrow points the other way). That module's `load_cases`
+    is the same read, kept stdlib-only because a baseline adapter has to call it from a venv where
+    `echosyn` does not import.
+
+    The split check is the point of doing this in a function: a val list under `--split test` would
+    otherwise score a different population in silence, and every count in the output would still
+    look right.
+    """
+    with open(path) as handle:
+        payload = json.load(handle)
+    if payload.get("split") != split:
+        raise SystemExit(f"{path} holds the '{payload.get('split')}' population but --split is "
+                         f"'{split}' -- these are different case lists")
+    print(f"[cases] {payload['n_cases']} frozen {split} cases from {path}")
+    return payload["cases"]
+
+
 def cache_generated(root, bucket, case_id, produced):
     """The generated volume as fp16 `.npy`, one file per case. Returns the file name.
 
@@ -199,6 +233,18 @@ def parse_args():
                         help="Cases per (modality, plane) bucket, applied before sharding. "
                              "100 reproduces the R2V-MR-Generation population (1,000 scored "
                              "cases). Default: the whole split.")
+    parser.add_argument("--cases", type=str, default=None,
+                        help="A frozen population (baselines/cases-*.json) to roll out instead of "
+                             "deriving one. What makes a baseline table comparable: every model "
+                             "reads the same file rather than each re-deriving a list that a "
+                             "changed parquet could move underneath it. Mutually exclusive with "
+                             "--n_per_bucket, which is how a population is built in the first "
+                             "place.")
+    parser.add_argument("--label", type=str, default=None,
+                        help="What produced the volumes being scored, e.g. 'generatect @2a81135'. "
+                             "For a baseline scored through --combine: it replaces the guidance "
+                             "scales in the W&B run name, which describe MRFlow's config and say "
+                             "nothing about a baseline, and it is recorded in metrics.json.")
     parser.add_argument("--max_blocks", type=int, default=None,
                         help="Rollout budget. Default: max_slices / target_nframes.")
     parser.add_argument("--examples", type=int, default=2,
@@ -252,6 +298,9 @@ def parse_args():
     args = parser.parse_args()
     if not args.combine and not args.ckpt:
         parser.error("--ckpt is required unless --combine")
+    if args.cases and args.n_per_bucket:
+        parser.error("--cases is a population that has already been selected; --n_per_bucket "
+                     "would select a second one from it")
     return args
 
 
@@ -277,11 +326,14 @@ def build_generator(config, ckpt, device, args):
 def run_shard(config, args, out, device):
     """Generate and score this shard's slice of the split; write its state for `--combine`."""
     mri = config.mri
-    series = list_series(mri.raw_root, args.split, 1,
-                         mri.get(f"max_series_{args.split}"), config.seed)
-    # Before the shard slice, so every task carves its cases out of the same selected population.
-    if args.n_per_bucket:
-        series = select_cases(series, args.n_per_bucket)
+    if args.cases:
+        series = load_frozen_cases(args.cases, args.split)
+    else:
+        series = list_series(mri.raw_root, args.split, 1,
+                             mri.get(f"max_series_{args.split}"), config.seed)
+        # Before the shard slice, so every task carves its cases out of the same population.
+        if args.n_per_bucket:
+            series = select_cases(series, args.n_per_bucket)
     series = series[args.shard::args.num_shards][:args.limit]
     # After the slice, so a shard only promises examples from buckets it will actually reach --
     # which matters under a small --limit, where a task sees only the head of the list.
@@ -402,6 +454,23 @@ def combine_shards(out):
     return result
 
 
+def manifest_generators(out):
+    """The distinct `generator` labels this results dir's manifests carry.
+
+    `run_shard` does not write the field -- an MRFlow run is described by its `ckpt` -- while
+    `baselines/common/ingest.py` always does. Reading it back means a baseline's `metrics.json`
+    says what produced it even if nobody passed `--label`, so provenance cannot be lost between
+    generating a set of volumes and scoring it weeks later.
+    """
+    labels = []
+    for path in sorted(glob(os.path.join(out, "shard-*.json"))):
+        with open(path) as handle:
+            label = json.load(handle).get("generator")
+        if label and label not in labels:
+            labels.append(label)
+    return labels
+
+
 def score_cached(config, args, out, device):
     """Every metric, recomputed from the volumes the shards cached. Nothing is generated here.
 
@@ -451,14 +520,21 @@ def log_wandb(config, args, metrics, out):
     a column of identical names -- and at 1.0/1.0 the sampler takes its single-conditional
     short-circuit, i.e. no guidance at all, which is worth being able to see at a glance."""
     guidance = config.guidance
+    # A baseline is named by what produced it. The guidance scales belong to MRFlow's own config
+    # and would be read as the baseline's sampler settings, which they are not -- a run called
+    # `...-mod3-rep7-...` next to a GenerateCT row is worse than no label at all.
+    name = f"eval-{args.label}-{args.split}" if args.label else (
+        f"eval-{args.regime}-{args.split}"
+        f"-mod{guidance.modality_cfg_scale:g}-rep{guidance.report_cfg_scale:g}"
+        f"-{config.wandb_args.name}")
     run = wandb.init(
         project=config.wandb_args.project,
-        name=f"eval-{args.regime}-{args.split}"
-             f"-mod{guidance.modality_cfg_scale:g}-rep{guidance.report_cfg_scale:g}"
-             f"-{config.wandb_args.name}",
+        name=name,
         group=config.wandb_args.group,
         mode="disabled" if args.no_wandb else os.environ.get("WANDB_MODE", "online"),
         config={"regime": args.regime, "split": args.split, "ckpt": args.ckpt,
+                "label": args.label, "cases": args.cases,
+                "generators": manifest_generators(out),
                 "max_blocks": args.max_blocks, "n_per_bucket": args.n_per_bucket,
                 "modality_cfg_scale": guidance.modality_cfg_scale,
                 "report_cfg_scale": guidance.report_cfg_scale},
@@ -506,7 +582,8 @@ def main():
         print("[combine] no shard feature files -- rescoring from the cached volumes")
         result = score_cached(config, args, out, device)
     result.update({"regime": args.regime, "split": args.split, "ckpt": args.ckpt,
-                   "extractors": signature()})
+                   "label": args.label, "cases": args.cases,
+                   "generators": manifest_generators(out), "extractors": signature()})
     with open(os.path.join(out, "metrics.json"), "w") as f:
         json.dump(result, f, indent=2)
 
