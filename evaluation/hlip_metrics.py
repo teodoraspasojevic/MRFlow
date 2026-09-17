@@ -4,35 +4,49 @@ Every other metric here compares distributions, or compares a rollout with one p
 scan. These ask the question the task actually poses. They are the only metrics in the project that
 read the conditioning at all.
 
-**Three text variants, scored side by side and never mixed.** They differ in what the text is and
-in what makes a retrieval hit correct:
+**Two text variants, scored side by side and never mixed.** Both are HLIP's own MR-RATE wording,
+because the checkpoint below was trained on MR-RATE with exactly these templates, and both are
+identified by `study_uid` -- one study's report is one report however many series it has:
 
-    hlip_condition_*    the exact string the generator was conditioned on: acquisition markers
-                        (`[MODALITY] .. [PLANE] ..`) followed by the bracketed `[FINDINGS]` and
-                        `[IMPRESSION]` sections. **This is not MR-RATE's `report` column** -- it is
-                        those two sections plus markers, assembled by `encode_conditioning`. Its
-                        identity is the `conditioning_uid`: one acquisition condition of one study.
-    hlip_findings_*     `"This study looks like: " + findings`, HLIP's own MR-RATE template.
-                        Identity is `study_uid`.
-    hlip_impression_*   `"This study shows: " + impression`, HLIP's own MR-RATE template.
-                        Identity is `study_uid`.
+    hlip_findings_*     `"This study looks like: " + findings`
+    hlip_impression_*   `"This study shows: " + impression`
 
-Each emits `_volume_cosine_mean` / `_std`, `_to_volume_r{1,5,10}` and the same within-stratum, plus
-its own counts. **There is no fallback between findings and impression**: a case missing a section
-is excluded from that variant alone and counted in `n_hlip_<variant>_excluded_no_text`.
+**Read `impression` as the primary number.** Measured on 57 real MR-RATE val series, a matched
+impression clears the shuffled mean by 4.1 sigma where findings manages 1.4. Upstream's own
+zero-shot prompts are all `"This study shows: ..."` ones and its findings head is trained through
+the `logit_bias` stand-in `train.py` marks FIXME, so the impression head is the better-exercised of
+the two. `findings` is kept because it is a second, independent reading of the same volume.
 
-HLIP was trained on MR-RATE with `--text-process-cfg "sentence and findings"`, i.e. a single
-impression sentence against the joined findings -- so `findings` and `impression` are close to the
-text distribution its tower saw, while `condition` deliberately is not. Compare a model against
-another model on the same variant; do not compare variants with each other.
+Each emits `_volume_cosine_mean` / `_std`, `_to_volume_r{1,5,10}`, the same within-stratum, and its
+own counts. **There is no fallback between findings and impression**: a case missing a section is
+excluded from that variant alone and counted in `n_hlip_<variant>_excluded_no_text`.
 
-Model: HLIP (github.com/zch0414/hlip, TMLR 2026), the released brain-MRI checkpoint
-`zch0414/clip-vit_large-scan_study-dualdinotxt1568` pinned at `HLIP_REVISION`. The build follows
-that repo's model card exactly -- its vendored `hlip` package registers the visual encoder with
-timm, its `model_configs/*.json` is the architecture, its tokenizer files are the tokenizer -- and
-the checkpoint is loaded over a randomly initialised skeleton (`pretrained_image=False,
-pretrained_text=False`, so no ImageNet or BiomedBERT weights are fetched and then overwritten).
-`load_hlip` **raises unless every parameter came from the checkpoint**.
+The generator's own conditioning string used to be scored here as a third variant. It is gone: it
+is deliberately outside the text distribution HLIP's tower was trained on (bracketed section
+markers, both sections concatenated, acquisition markers up front), and 42.7% of those strings ran
+past the 256-token context, so the number was a truncation artifact as much as a model score.
+Compare a model against another model on the same variant; do not compare variants with each other.
+
+Model: HLIP (github.com/zch0414/hlip, TMLR 2026), the **MR-RATE-trained** release
+`zch0414/clip-vit_base-scan_study-dualdinotxt1568` pinned at `HLIP_REVISION` -- upstream trains
+this one on the MR-RATE training split with `--text-process-cfg "sentence and findings"`, which is
+where `TEMPLATES` comes from. The larger `clip-vit_large-scan_study-*` release is a stronger brain
+MRI tower but was trained on institutional data and only *evaluated* on MR-RATE; in-domain is worth
+more here than raw strength. The build follows the model card exactly -- its vendored `hlip`
+package registers the visual encoder with timm, its `model_configs/*.json` is the architecture, its
+tokenizer files are the tokenizer -- and the checkpoint is loaded over a randomly initialised
+skeleton (`pretrained_image=False, pretrained_text=False`, so no ImageNet or BiomedBERT weights are
+fetched and then overwritten). `load_hlip` **raises unless every parameter came from the
+checkpoint**.
+
+**`dualdinotxt` means two image embeddings, and each variant must be scored against its own.** The
+visual head emits `num_prefix_tokens = 2` (the trunk's `cls_token` and `reg_token`), and upstream
+trains them against different text with two separate contrastive losses -- `image_features[:, 0]`
+against the impression sentence, `image_features[:, 1]` against the findings
+(`src/hlip_train/train.py`, `image_features_sentence` / `image_features_report`). `VARIANTS` holds
+that mapping. Crossing them compares a text with a projection that was never trained on it, which
+is silent: the cosines stay in range and merely mean less. Upstream's zero-shot scripts index
+`[:, 0]` unconditionally because every prompt they ship is a `"This study shows: ..."` one.
 
 Image preprocessing is the official checkpoint loader's, not a reimplementation: pad to square,
 bilinear resize to 256^2, then **full-depth deterministic resampling of the whole slice axis to
@@ -40,7 +54,11 @@ bilinear resize to 256^2, then **full-depth deterministic resampling of the whol
 is dropped, cropped away or sampled out. 48 is an architectural constant, not a policy choice: the
 checkpoint's `img_size=(48, 224, 224)` at patch `(6, 16, 16)` is what makes its 1568 visual tokens.
 Then a centre crop to 224^2 and the *scalar* means of the ImageNet channel statistics, which is how
-HLIP normalises a one-channel scan.
+HLIP normalises a one-channel scan. What it does **not** pin is the intensity mapping: upstream's
+scans arrive as uint8 tensors built by data-processing code the repo has since removed, so our
+0.5/99.5 percentile window over nonzero voxels is not provably the same transform. It is the same
+transform on every model scored here, so comparisons hold; absolute cosines are not comparable to
+upstream's published numbers.
 
 Two things these metrics are not:
 
@@ -52,23 +70,20 @@ Two things these metrics are not:
 
 **Retrieval identity is an id, never the text.** Two different studies whose reports happen to read
 alike are two different answers, and merging them on string equality would silently forgive a wrong
-retrieval. Queries are distinct ids; candidates are every generated volume in the run; a candidate
-is a positive when its id matches the query's, so the diagonal counts and an id covering several
-volumes has several positives. `_within_stratum` restricts candidates to the query's own **full
-acquisition stratum -- modality *and* plane** -- so the acquisition markers in `condition` cannot
-solve retrieval by naming the contrast and the orientation.
+retrieval. Queries are distinct `study_uid`s; candidates are every generated volume in the run; a
+candidate is a positive when its study matches the query's, so the diagonal counts and a study with
+several series has several positives. `_within_stratum` restricts candidates to the query's own
+**full acquisition stratum -- modality *and* plane**.
 
 When a run holds fewer than K candidates `R@K` is computed at `min(K, n_candidates)` and is
 uninformative; read `n_hlip_<variant>_candidates` first.
 
-Tokenizer truncation is reported per variant. Measured on 300 val series, **42.7% of `condition`
-strings run past HLIP's 256-token context** (median 238 tokens, p90 403, max 655) and lose their
-tail; `findings` and `impression` are shorter. `n_hlip_<variant>_token_collisions` additionally
-counts ids whose *truncated* token sequence is shared with a different id -- retrieval cannot tell
-those apart, so a nonzero count caps the achievable R@K.
+Tokenizer truncation is counted per variant against HLIP's 256-token context; both templates here
+are short enough that it is rare. `n_hlip_<variant>_token_collisions` additionally counts ids whose
+*truncated* token sequence is shared with a different id -- retrieval cannot tell those apart, so a
+nonzero count caps the achievable R@K.
 """
 
-import hashlib
 import importlib
 import json
 import sys
@@ -77,32 +92,32 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from echosyn.common.mrrate import acquisition_prefix, format_report
-
-HLIP_REPO = "zch0414/clip-vit_large-scan_study-dualdinotxt1568"
-HLIP_REVISION = "183bae10b472004007251daa91b3382a07bcae6e"
-HLIP_MODEL = "ablate_seqposemb_clip_vit_large_multiscan_h2_dualdinotxt1568"
+HLIP_REPO = "zch0414/clip-vit_base-scan_study-dualdinotxt1568"
+HLIP_REVISION = "6e4b8ab1a1330c59f64a72773c454e513591cf89"
+HLIP_MODEL = "ablate_seqposemb_clip_vit_base_multiscan_h2_dualdinotxt1568"
 
 EMBED_DIM = 768
+NUM_IMAGE_TOKENS = 2   # cls + reg, trained against the impression and the findings respectively
 NUM_SLICES = 48   # the checkpoint's img_size is (48, 224, 224) at patch (6, 16, 16) -> 1568 tokens
 RESIZE = 256
 CROP = 224
 RECALL_K = (1, 5, 10)
 
-# The three text variants: how the string is built, and what makes a hit correct. `condition` is
-# identified by the acquisition condition it was generated from; the two HLIP-native templates are
-# identified by the study, because one study's report is one report however many series it has.
-VARIANTS = {"condition": "cond_uid", "findings": "study_uid", "impression": "study_uid"}
+# The two text variants, and **which image prefix token each is scored against** -- see the module
+# docstring. Both are identified by `study_uid`.
+VARIANTS = {"findings": 1, "impression": 0}
 
 # HLIP's own MR-RATE wording. Upstream is inconsistent about the space after the colon
-# (`get_sentence` has one, `get_findings` does not); both are spaced here.
+# (`get_sentence` has one, `get_findings` and `get_impressions` do not); both are spaced here.
+# `impression` takes the whole section, which is upstream's `get_impressions` rather than the single
+# sentence its `sentence and findings` config samples at training time.
 TEMPLATES = {"findings": "This study looks like: ", "impression": "This study shows: "}
 
 
 def score_keys():
     """The scores, most important first: the paired cosine and the retrieval each variant is read
     by, then the harder within-stratum retrieval, then the spread and the positives per query.
-    Grouped by metric across the three variants, so the same number is read side by side."""
+    Grouped by metric across the variants, so the same number is read side by side."""
     k = [f"hlip_{v}_volume_cosine_mean" for v in VARIANTS]
     k += [f"hlip_{v}_to_volume_r{n}" for v in VARIANTS for n in RECALL_K]
     k += [f"hlip_{v}_to_volume_r{n}_within_stratum" for v in VARIANTS for n in RECALL_K]
@@ -122,21 +137,9 @@ def metric_keys():
     return score_keys() + count_keys()
 
 
-def conditioning_uid(study_uid, modality, plane):
-    """A stable id for one acquisition condition of one study.
-
-    `run_shard` writes this into the manifest so the id a score is computed against is the one
-    generation recorded, not something re-derived later from fields that might have moved.
-    """
-    return hashlib.sha1(f"{study_uid}|{modality}|{plane}".encode()).hexdigest()[:16]
-
-
-def variant_text(variant, report, modality, plane):
+def variant_text(variant, report):
     """The string for one variant, or None when the report has no text for it -- never a fallback
     to the other section."""
-    if variant == "condition":
-        body = format_report(report)
-        return f"{acquisition_prefix(modality, plane)}\n{body}" if body.strip() else None
     section = (report.get(variant) or "").strip()
     return TEMPLATES[variant] + section if section else None
 
@@ -210,7 +213,7 @@ def preprocess_scan(volume):
 
 
 class HlipAccumulator:
-    """One volume embedding per case, and up to three text embeddings beside it.
+    """Both image embeddings per case, and up to two text embeddings beside them.
 
     **One generated series is a study holding exactly one scan**: `[B, 1, 1, 48, 224, 224]`. The
     released checkpoint is built with `max_num_scans=0`, so it carries no per-scan position
@@ -220,8 +223,8 @@ class HlipAccumulator:
     pad: `_scan2study` averages prefix tokens over the scan axis, so an empty slot would drag the
     study embedding. Real and generated volumes take this identical one-scan path.
 
-    The image is encoded once and shared by all three variants -- a ViT-L over 1568 tokens is the
-    expensive half; three text encodes are nearly free. Cases are buffered to `batch_size` and the
+    The image is encoded once and both of its prefix tokens kept -- a ViT over 1568 tokens is the
+    expensive half; two text encodes are nearly free. Cases are buffered to `batch_size` and the
     buffer holds preprocessed scans (9.6 MB each), never volumes.
     """
 
@@ -238,17 +241,16 @@ class HlipAccumulator:
         self._excluded = dict.fromkeys(VARIANTS, 0)
         self._truncated = dict.fromkeys(VARIANTS, 0)
 
-    def add(self, report, modality, plane, study_uid, cond_uid, fake):
-        """One generated volume, the ids that say what a correct retrieval is, and whichever of the
-        three texts its report supports."""
-        texts = {v: variant_text(v, report, modality, plane) for v in VARIANTS}
+    def add(self, report, modality, plane, study_uid, fake):
+        """One generated volume, the study it belongs to, and whichever of the two texts its report
+        supports."""
+        texts = {v: variant_text(v, report) for v in VARIANTS}
         for v, text in texts.items():
             if text is None:
                 self._excluded[v] += 1
             elif len(self.tokenizer.tokenizer.encode(text)) > self.tokenizer.context_length:
                 self._truncated[v] += 1   # past HLIP's context: the tail never reaches the tower
-        self._meta.append({"study_uid": str(study_uid), "cond_uid": str(cond_uid),
-                           "stratum": f"{modality}__{plane}"})
+        self._meta.append({"study_uid": str(study_uid), "stratum": f"{modality}__{plane}"})
         self._pending.append((preprocess_scan(fake), texts))
         if len(self._pending) >= self.batch_size:
             self._flush()
@@ -259,9 +261,9 @@ class HlipAccumulator:
             return
         row0 = sum(a.shape[0] for a in self._image)
         scans = torch.stack([scan for scan, _ in self._pending]).unsqueeze(1).to(self.device)
-        # [B, n_scans=1, 1, D, H, W] -- one scan per study, never padded.
-        self._image.append(_unit(self.model(image=scans)["image_features"][:, 0, :])
-                           .float().cpu().numpy())
+        # [B, n_scans=1, 1, D, H, W] -- one scan per study, never padded. Out comes
+        # [B, 2, EMBED_DIM]: both prefix tokens, each scored by the variant trained against it.
+        self._image.append(_unit(self.model(image=scans)["image_features"]).float().cpu().numpy())
 
         for v in VARIANTS:
             rows = [row0 + i for i, (_, t) in enumerate(self._pending) if t[v] is not None]
@@ -279,7 +281,8 @@ class HlipAccumulator:
         self._flush()
         empty = np.zeros((0, EMBED_DIM), np.float32)
         return {
-            "image": np.concatenate(self._image) if self._image else empty,
+            "image": (np.concatenate(self._image) if self._image
+                      else np.zeros((0, NUM_IMAGE_TOKENS, EMBED_DIM), np.float32)),
             "meta": list(self._meta),
             "text": {v: {"row": t["row"], "tokens": t["tokens"],
                          "vec": np.concatenate(t["vec"]) if t["vec"] else empty}
@@ -319,23 +322,23 @@ def merge_states(states):
 def summarize(state):
     """Every HLIP number, or nan throughout if the tower was switched off (`state` is None).
 
-    Each variant is scored independently: its own queries, its own exclusions, its own truncation.
-    Candidates are always **all** generated volumes in the run -- a volume whose report lacked an
-    impression is still a candidate that an impression query could wrongly retrieve.
+    Each variant is scored independently, against its own image token: its own queries, its own
+    exclusions, its own truncation. Candidates are always **all** generated volumes in the run -- a
+    volume whose report lacked an impression is still a candidate an impression query could wrongly
+    retrieve.
     """
     if state is None:
         return {k: (0 if k.startswith("n_") else float("nan")) for k in metric_keys()}
 
-    image, meta = state["image"], state["meta"]
     metrics = {}
-    for variant, id_field in VARIANTS.items():
-        metrics.update(_variant_metrics(variant, state["text"][variant], image, meta, id_field,
-                                        state["excluded"][variant],
-                                        state["truncated"][variant]))
+    for variant, token in VARIANTS.items():
+        metrics.update(_variant_metrics(variant, state["text"][variant],
+                                        state["image"][:, token, :], state["meta"],
+                                        state["excluded"][variant], state["truncated"][variant]))
     return metrics
 
 
-def _variant_metrics(variant, text, image, meta, id_field, n_excluded, n_truncated):
+def _variant_metrics(variant, text, image, meta, n_excluded, n_truncated):
     prefix, n_cand = f"hlip_{variant}", len(meta)
     out = {f"{prefix}_volume_cosine_mean": float("nan"),
            f"{prefix}_volume_cosine_std": float("nan"),
@@ -350,7 +353,7 @@ def _variant_metrics(variant, text, image, meta, id_field, n_excluded, n_truncat
         return out
 
     rows = np.array(text["row"])
-    ident = np.array([m[id_field] for m in meta])
+    ident = np.array([m["study_uid"] for m in meta])
     stratum = np.array([m["stratum"] for m in meta])
 
     paired = (text["vec"] * image[rows]).sum(axis=1)
@@ -358,7 +361,7 @@ def _variant_metrics(variant, text, image, meta, id_field, n_excluded, n_truncat
     out[f"{prefix}_volume_cosine_std"] = float(np.std(paired))
     out[f"n_{prefix}_token_collisions"] = _n_collisions(text["tokens"], ident[rows])
 
-    # One query per distinct id, its first text standing for it.
+    # One query per distinct study, its first text standing for it.
     first = {}
     for i, key in enumerate(ident[rows]):
         first.setdefault(key, i)
@@ -370,7 +373,7 @@ def _variant_metrics(variant, text, image, meta, id_field, n_excluded, n_truncat
     out.update({f"{prefix}_to_volume_r{k}": v for k, v in
                 recall_at_k(similarity, positive).items()})
 
-    # The full acquisition stratum -- modality *and* plane -- so the markers cannot answer it.
+    # The full acquisition stratum -- modality *and* plane.
     same = stratum[None, :] == stratum[rows][q][:, None]
     out.update({f"{prefix}_to_volume_r{k}_within_stratum": v for k, v in
                 recall_at_k(np.where(same, similarity, -np.inf), positive & same).items()})
@@ -389,11 +392,11 @@ def _n_collisions(tokens, ident):
 def recall_at_k(similarity, positive, ks=RECALL_K):
     """`{K: R@K}`: the fraction of query rows whose top-K columns hold at least one positive.
 
-    `positive` is a boolean matrix rather than an assumed diagonal, because one conditioning string
-    can have more than one correct volume -- and the diagonal itself is a positive, never excluded.
-    K is capped at the number of candidates, so a run with 4 volumes reports `R@5 = R@10 = 1.0`:
-    **R@5 and R@10 say nothing below 5 and 10 candidates**, and `n_hlip_candidates` is what tells
-    you. A production pool should be hundreds; the smoke run checks plumbing only.
+    `positive` is a boolean matrix rather than an assumed diagonal, because one study can have more
+    than one correct volume -- and the diagonal itself is a positive, never excluded. K is capped at
+    the number of candidates, so a run with 4 volumes reports `R@5 = R@10 = 1.0`: **R@5 and R@10 say
+    nothing below 5 and 10 candidates**, and `n_hlip_<variant>_candidates` is what tells you. A
+    production pool should be hundreds; the smoke run checks plumbing only.
     """
     order = np.argsort(-similarity, axis=1)
     hits = np.take_along_axis(positive, order, axis=1)
@@ -403,9 +406,11 @@ def recall_at_k(similarity, positive, ks=RECALL_K):
 
 def signature():
     return {"repo": HLIP_REPO, "revision": HLIP_REVISION, "model": HLIP_MODEL,
-            "num_slices": NUM_SLICES, "crop": CROP, "pooling": "image_features[:, 0]",
+            "trained_on": "MR-RATE train split, --text-process-cfg 'sentence and findings'",
+            "num_slices": NUM_SLICES, "crop": CROP,
+            # Which image prefix token each variant is scored against: the two are trained by
+            # separate losses, so this is part of what the number means.
+            "pooling": {v: f"image_features[:, {t}]" for v, t in VARIANTS.items()},
             "scans_per_study": 1, "padding": "none (checkpoint has no scan mask)",
-            # What the text tower is given, recorded because it is the one choice a reader of these
-            # numbers most needs to know: the generator's own conditioning string, no HLIP template.
-            "text_source": "generator_conditioning: acquisition_prefix + [FINDINGS]/[IMPRESSION]",
-            "text_template": None}
+            "text_source": "HLIP MR-RATE templates over the study's own report sections",
+            "text_template": dict(TEMPLATES)}

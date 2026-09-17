@@ -36,6 +36,7 @@ instead of another generation pass.
 """
 
 import argparse
+import hashlib
 import json
 import os
 from glob import glob
@@ -54,7 +55,7 @@ from echosyn.common.mrrate import (build_text_encoder, encode_conditioning, enco
 from auto_regressive_generate import LatentAutoregressiveGenerator
 from evaluation import (METRIC_KEYS, EvalAccumulator, comparison_frames,
                         merge_states, metrics_from, signature)
-from evaluation.hlip_metrics import conditioning_uid, warn_if_not_independent
+from evaluation.hlip_metrics import warn_if_not_independent
 
 
 ### Inference regimes ###
@@ -138,6 +139,16 @@ def pick_example_buckets(series, shard, n):
     """The `(modality, plane)` buckets this shard writes an example video for."""
     buckets = sorted({f"{e['modality']}__{e['plane']}" for e in series})
     return {buckets[(shard + i) % len(buckets)] for i in range(n)} if buckets and n else set()
+
+
+def conditioning_uid(study_uid, modality, plane):
+    """A stable id for one acquisition condition of one study -- what this rollout was asked for.
+
+    Manifest provenance only: no metric reads it. It is written at generation time so a later pass
+    can group or re-run cases by the condition they came from without re-deriving it from fields
+    that might have moved.
+    """
+    return hashlib.sha1(f"{study_uid}|{modality}|{plane}".encode()).hexdigest()[:16]
 
 
 def save_case(root, bucket, case_id, real, produced, report, entry, spacing):
@@ -296,8 +307,8 @@ def run_shard(config, args, out, device):
         bucket = f"{entry['modality']}__{entry['plane']}"
         record = {"case_id": case_id, "bucket": bucket, "modality": entry["modality"],
                   "plane": entry["plane"], "study_uid": entry["study_uid"],
-                  # what a correct HLIP retrieval is, recorded at generation time rather than
-                  # re-derived at scoring time from fields that might have moved
+                  # which acquisition condition this rollout was generated from, recorded here
+                  # rather than re-derived later from fields that might have moved
                   "conditioning_uid": conditioning_uid(entry["study_uid"], entry["modality"],
                                                        entry["plane"]),
                   "archive": entry["archive"], "member": entry["member"]}
@@ -337,7 +348,7 @@ def run_shard(config, args, out, device):
             continue
 
         accumulator.add(case_id, bucket, entry["modality"], real, produced, spacing,
-                        entry["plane"], report, entry["study_uid"], record["conditioning_uid"])
+                        entry["plane"], report, entry["study_uid"])
         record["status"] = "generated"
         record["spacing"] = [float(v) for v in spacing]
         record["generated"] = cache_generated(os.path.join(out, "generated"), bucket, case_id,
@@ -419,8 +430,7 @@ def score_cached(config, args, out, device):
                                            case["plane"])
         report = read_report(case["archive"], case["study_uid"])
         accumulator.add(case["case_id"], case["bucket"], case["modality"], real, produced,
-                        spacing, case["plane"], report, case["study_uid"],
-                        case["conditioning_uid"])
+                        spacing, case["plane"], report, case["study_uid"])
     return accumulator.results()
 
 

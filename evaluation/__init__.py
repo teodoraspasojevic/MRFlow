@@ -11,7 +11,7 @@ See `evaluation/README.md` for the pipeline and what each metric means.
                           ResNet-50) -- the CCELLA / Alignment-to-Synthesis protocol, on the same
                           canonicalized pair.
     hlip_metrics.py       `hlip_*`: report-to-volume agreement and retrieval under the released
-                          HLIP brain-MRI checkpoint. The only metric that reads the conditioning.
+                          MR-RATE-trained HLIP checkpoint. The only metrics that read the report.
     fid_inception.py      pytorch-fid v0.3.0, vendored verbatim. Do not edit.
     medicalnet_resnet.py  MedicalNet's 3D ResNet encoder, vendored. Do not edit.
     challenge_metrics.py  the VLM3D scoring container, vendored. MSE/PSNR/SSIM and the squeezenet
@@ -114,8 +114,8 @@ class EvalAccumulator:
     Pairs arrive one at a time and are released as soon as `add` returns -- only feature rows stay
     in memory, and they never reach disk.
 
-    `use_hlip=False` drops the HLIP tower, which is by far the heaviest extractor here and a 1.5 GB
-    download; its keys then read nan.
+    `use_hlip=False` drops the HLIP tower, which is by far the heaviest extractor here and a
+    ~1.6 GB download; its keys then read nan.
     """
 
     def __init__(self, device="auto", batch_size=32, hlip_batch_size=8, use_hlip=True):
@@ -138,13 +138,12 @@ class EvalAccumulator:
         return (modality or "").lower() in ALLOWED_MODALITIES
 
     def add(self, case_id, bucket, modality, real, produced, spacing, plane, report,
-            study_uid, conditioning_uid):
+            study_uid):
         """A successfully generated pair. Out-of-scope modalities are counted but never scored.
 
         `spacing` is the ground truth's native (S, R, A) voxel size and `plane` its acquisition
-        plane; together they say how to canonicalize it. `report`, `study_uid` and
-        `conditioning_uid` are for HLIP: the report builds its three text variants, and the two ids
-        say what a correct retrieval is for each.
+        plane; together they say how to canonicalize it. `report` and `study_uid` are for HLIP: the
+        report builds its two text variants, and the study id says what a correct retrieval is.
         """
         self.n_total += 1
         if not self.is_scored(modality):
@@ -169,8 +168,8 @@ class EvalAccumulator:
         self._fid_3d.add_pair(gt, gen, plane)
         self._fid_rad.add_pair(gt, gen, plane)
         if self._hlip is not None:
-            # The generation only, against the exact string it was conditioned on.
-            self._hlip.add(report, modality, plane, study_uid, conditioning_uid, gen)
+            # The generation only, against its study's own report.
+            self._hlip.add(report, modality, plane, study_uid, gen)
 
         # `slice_mm` is the ground truth's native slice spacing -- recorded per case because it
         # says whether its 1 mm z detail was acquired or interpolated. It drives no metric.
