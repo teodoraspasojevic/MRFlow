@@ -26,10 +26,17 @@
 #
 # **--n_per_bucket, never --limit, for any number you intend to compare.** `select_cases` runs
 # before the shard slice and uses no RNG, and per-case noise is seeded from the case id rather than
-# its position, so `--split test --n_per_bucket 100` selects the identical 1,010 cases (1,000
-# scored) with identical noise at ANY task count -- R2V-MR-Generation's population case for case.
-# `--limit` has none of that: it applies per shard *after* the interleave, so the case set changes
-# with the task count and two runs are not comparable.
+# its position, so `--split val --n_per_bucket 100` selects the identical 1,002 cases with identical
+# noise at ANY task count -- the exact population the checkpoint selection under
+# <eval>/ckptsel/*/checkpoint-* was scored on. `--limit` has none of that: it applies per shard
+# *after* the interleave, so the case set changes with the task count and two runs are not
+# comparable.
+#
+# **This sweep never runs on test, and forces val if asked to.** Guidance scales are a
+# hyper-parameter: choosing them on the split the paper reports is selection on the test set, and
+# the reported numbers stop being held out. Checkpoint selection already ran on val at
+# --n_per_bucket 100, so a val sweep picks the cfg pair on the same 1,002 cases the checkpoint was
+# picked on, and test stays untouched for the one final scoring run.
 #
 # **Cost, measured rather than budgeted.** A full-body rollout of a real test case is 11.8 s/block
 # over 9-13 blocks -- ~141 s, or ~3.3 min per case including scoring, at cfg 1/1 without compile.
@@ -38,24 +45,31 @@
 # script's 6 h-per-task limit fits ~31 cases at TASKS=32 with room to spare, and --compile defaults
 # on here, so expect less than the above.
 #
-# Two stages are still worth considering, because model selection on the split you report is a
-# methodological problem even when the compute is affordable:
+# **Every cell runs the full 1,002-case val population** (N_PER_BUCKET=100, TASKS=32 -- the
+# defaults), so a cell is directly comparable with the checkpoint sweep and not only with the other
+# cells. At the per-cell cost above that is ~1,330 GPU-hours for the 16-cell product (one cheap
+# unguided cell plus 15 guided) and ~820 for the 10-cell list. Trim CELLS before trimming the
+# population: a cheaper sweep on fewer cases changes what the numbers mean, a cheaper sweep on
+# fewer cells does not.
 #
-#   # stage 1 -- rank the grid, ~100 val cases per cell (the defaults)
+#   # the full grid on the selection population
 #   bash slurms/mrflow_cfg_sweep.sh $CONFIG $CKPT $BASE/sweep
 #
-#   # stage 2 -- the winner only, on the exact population every other model was scored on
-#   SPLIT=test N_PER_BUCKET=100 TASKS=32 MOD_SCALES=4 REP_SCALES=7 \
-#       bash slurms/mrflow_cfg_sweep.sh $CONFIG $CKPT $BASE/final
+#   # one cell, e.g. re-running a winner after a metric change
+#   MOD_SCALES=4 REP_SCALES=7 bash slurms/mrflow_cfg_sweep.sh $CONFIG $CKPT $BASE/final
 #
-# Running all 16 cells at SPLIT=test N_PER_BUCKET=100 works and is comparable everywhere, it just
-# costs the full ~2,900 GPU-hours and picks the cfg pair on test.
+# **At the full population both numbers order; on a reduced one, rank on FID -- this reversed when
+# the metrics moved to their reference protocols.** FVD now takes one clip per volume (StyleGAN-V's
+# own protocol) rather than ~17-21 overlapping windows, so the clip count *is* the case count: 1,002
+# cases give ~1,000 samples against 400 feature dimensions, usable but below the 2,048 StyleGAN-V
+# quotes. Cut the population to N_PER_BUCKET=10 and it is ~100 samples against 400 -- a rank-
+# deficient covariance that cannot order anything. fid_2d_inception went the other way, every slice
+# instead of every 4th, so even ~100 cases give ~16,000 rows against 2,048 dimensions.
 #
-# **Rank on FVD_f16, not FID.** At N_PER_BUCKET=10 (~100 scored cases) a case yields ~17-21 f16
-# clips, so FVD_f16 rests on ~2,000 samples against 400 feature dimensions -- thin but usable for
-# ordering. FID sees ~4,000 slices against 2,048 dimensions, which is too close to the dimension to
-# rank on. Absolute values from a 100-case sweep are not comparable to the 1,000-case run either;
-# only the ordering carries over.
+# So a cheap ordering pass with N_PER_BUCKET=10 (a tenth of the population, so ~130 GPU-hours
+# for the 16-cell grid) is still possible, but
+# read only the FID ordering off it, and not the absolute values: those are not comparable to a
+# 1,000-case run.
 #
 # Cost: the 1/1 cell is cheaper per block than the rest, because at
 # modality_cfg_scale == report_cfg_scale == 1 the sampler takes its single-conditional
@@ -83,11 +97,19 @@ REP_SCALES=${REP_SCALES:-"1 4 7 10"}
 # An explicit cell list wins over the product, so a non-rectangular grid needs no loop surgery.
 CELLS=${CELLS:-}
 SPLIT=${SPLIT:-val}
+if [ "$SPLIT" = "test" ]; then
+    echo "SPLIT=test refused: guidance scales are chosen here, and choosing them on the reported" >&2
+    echo "split is selection on test. Running on val instead -- the same population the checkpoint" >&2
+    echo "selection used. Score the winner on test with slurms/mrflow_eval_helma.sh." >&2
+    SPLIT=val
+fi
 # --n_per_bucket rather than --limit: it caps each (modality, plane) bucket *before* the shards are
 # cut, so the case list is identical at any task count and stays modality-balanced. --limit slices
 # a seed-shuffled list instead, so its modality mix is whatever the split happens to give.
-N_PER_BUCKET=${N_PER_BUCKET:-10}
-TASKS=${TASKS:-8}
+N_PER_BUCKET=${N_PER_BUCKET:-100}
+# 32 to match the checkpoint sweep's array size. Everything but IS is task-count invariant, and at
+# ~31 cases per task a guided cell lands around 3 h, inside the eval script's 4:30 limit.
+TASKS=${TASKS:-32}
 DRY_RUN=${DRY_RUN:-0}
 
 EVAL=slurms/mrflow_eval_helma.sh
@@ -141,4 +163,4 @@ echo "$n_cells cells, $((n_cells * (TASKS + 1))) jobs (split $SPLIT, n_per_bucke
 echo "$TASKS tasks/cell). Results land in $BASE/mod*-rep*/metrics.json"
 echo "Compare with: for f in $BASE/mod*-rep*/metrics.json; do echo -n \"\$f \"; \\"
 echo "  python -c 'import json,sys; m=json.load(open(sys.argv[1]))[\"metrics\"]; \\"
-echo "  print(m[\"FVD_f16\"], m[\"FID\"], m[\"n_scored_files\"])' \$f; done | sort -k2 -n"
+echo "  print(m[\"FVD_f16\"], m[\"fid_2d_inception\"], m[\"n_scored_files\"])' \$f; done | sort -k2 -n"
