@@ -12,13 +12,26 @@ output scoreable: the frozen population, the geometry conversion, the ingest, an
 baseline recording how its volumes were produced.
 
 ```
-common/cases.py        WHICH series to generate -> cases-test-n100.json   (committed)
+common/cases.py        WHICH series to generate -> cases-<split>-n100.json  (committed)
 common/prompts.py      the REPORT TEXT for those series -> $WS/prompts-*.json  (never committed)
 common/canonicalize.py an external model's volume -> MRFlow's output grid
 common/ingest.py       a baseline's NIfTI -> generated/*.npy + shard-NNNN.json
-cases-test-n100.json   the frozen population: 1,010 test cases (1,000 scored + 10 MRA excluded)
-<baseline>/            provenance, run scripts and notes, one per baseline
+cases-test-n100.json   the frozen test population: 1,010 cases (1,000 scored + 10 MRA excluded)
+cases-val-n100.json    the frozen val population: 1,002 cases (1,000 scored + 2 MRA excluded) --
+                       case for case the set MRFlow's checkpoint and cfg selection ran on, so a
+                       hyper-parameter chosen for a baseline is chosen the way MRFlow's was
+<baseline>/            provenance and notes, one per baseline
 ```
+
+**The shell scripts live in [`slurms/`](../slurms), with every other job in this repo.**
+`baseline_score.sh` submits and `baseline_score_job.sh` is the job that ingests and scores;
+generation is per baseline (`r2v_run_shards.sh`), as is any sweep over its settings
+(`r2v_cfg_sweep.sh`). What stays here is the Python and the frozen populations.
+
+**Guidance scales are chosen on val, never on test.** A baseline's inference settings are a
+hyper-parameter like any other, and tuning them on the split the paper reports makes the reported
+numbers selection-contaminated. `cases-val-n100.json` exists for that: sweep there, then score the
+winner once on `cases-test-n100.json`.
 
 **Ground truth is never preprocessed by a baseline and never written to disk.** A baseline
 generates and stops. `score_cached` re-reads each reference straight out of the MR-RATE archives
@@ -49,9 +62,13 @@ exactly those two things plus the raw archives the manifest points at — no con
 no model — so scoring a baseline is the same `--combine` pass that rescores MRFlow:
 
 ```bash
-sbatch slurms/mrflow_eval_helma.sh <any mrflow config> none \
-    --split test --combine --out <out> --label "<name> <settings> @<commit>"
+slurms/baseline_score.sh <run-tag> "<name> <settings> @<commit>"          # test, the default
+SPLIT=val slurms/baseline_score.sh <run-tag> "<name> <settings> @<commit>"
 ```
+
+`baseline_score.sh` only submits; `baseline_score_job.sh` is the job, and it ingests, drops the
+NIfTIs and scores in one go. **Ingest runs inside that job, not on the login node** -- it reads and writes ~24 MB per
+case over a thousand cases, and a sweep needs the whole chain to be one `--dependency` target.
 
 `--label` is what keeps the W&B table readable: without it a baseline run is named from
 `config.guidance`, i.e. MRFlow's sampler settings, which are not the baseline's. It also lands in
@@ -62,6 +79,7 @@ Three steps get you there, and only the middle one is baseline-specific:
 
 ```bash
 # 1. the population, once, shared by every baseline and by MRFlow itself
+#    (--split val --out baselines/cases-val-n100.json for the tuning population)
 python -m baselines.common.cases --config lvfm/configs/mrflow_STDiT-L2_16f8.yaml \
     --split test --n_per_bucket 100 --out baselines/cases-test-n100.json
 #    MRFlow then rolls out over that same file rather than re-deriving one:
@@ -74,11 +92,10 @@ python -m baselines.common.prompts --cases baselines/cases-test-n100.json \
 
 # 2. generate, in THAT baseline's venv, writing <case_id>.nii.gz per case
 #    reads the two JSONs above and nothing else from MRFlow
-sbatch baselines/<name>/run_shards.sh ...
+sbatch slurms/<name>_run_shards.sh ...
 
-# 3. ingest, back in the MRFlow venv
-python -m baselines.common.ingest --cases baselines/cases-test-n100.json \
-    --nifti <nifti dir> --out <results dir> --label "<name> <settings> @<commit>"
+# 3. ingest and score, back in the MRFlow venv
+slurms/baseline_score.sh <run-tag> "<name> <settings> @<commit>"
 ```
 
 ## Four rules that make the table readable
@@ -112,8 +129,9 @@ argument and a line in its own README, never a second copy of this code.
 
 ## Still to wire up
 
-- The per-baseline generation drivers and `run_shards.sh`. Each baseline's README says what its
-  driver has to do; none is written yet.
+- The GenerateCT and Text2CT generation drivers and their `slurms/<name>_run_shards.sh`. Each
+  baseline's README says what its driver has to do; `nvidia_r2v`'s is written, the other two
+  are not.
 - `--combine` still requires an MRFlow `--config`, because it reads `wandb_args` for the project
   and group and validates the label mapping. Harmless for a baseline — nothing from that config
   reaches a metric — but it does mean a baseline is scored with an MRFlow config path on the

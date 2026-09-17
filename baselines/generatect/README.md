@@ -38,7 +38,7 @@ transformer needs an 80 GB A100 for inference maps onto one h200 per task here.
 
 ## Adapter: what still has to be written
 
-`run_shards.sh` + a driver that, for each case of `baselines/cases-test-n100.json`, builds the
+`slurms/generatect_run_shards.sh` + a driver that, for each case of `baselines/cases-test-n100.json`, builds the
 prompt from that study's report with **GenerateCT's own** text formatting, runs the transformer and
 then the super-resolution stage, and saves `<case_id>.nii.gz`. Its own venv in the workspace; no
 MRFlow import on this side.

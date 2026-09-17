@@ -38,6 +38,6 @@ either way.
 
 ## Adapter: what still has to be written
 
-`run_shards.sh` + a driver that, for each case of `baselines/cases-test-n100.json`, encodes that
+`slurms/text2ct_run_shards.sh` + a driver that, for each case of `baselines/cases-test-n100.json`, encodes that
 study's report with **Text2CT's own** 3D-CLIP encoder, samples, decodes through its VAE, and saves
 `<case_id>.nii.gz` with a correct affine. Its own venv in the workspace.

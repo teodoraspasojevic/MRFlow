@@ -2,13 +2,15 @@
 #
 # Generate the frozen population with an R2V adapter, one array task per shard.
 #
-#   sbatch --array=0-15 baselines/nvidia_r2v/run_shards.sh A
-#   sbatch --array=0-15 baselines/nvidia_r2v/run_shards.sh E
+#   sbatch --array=0-15 slurms/r2v_run_shards.sh A
+#   sbatch --array=0-15 slurms/r2v_run_shards.sh E
 #
 # Anything after the arm is passed through to generate.py (--limit, --seed, --overwrite, ...).
+# R2V_CASES/R2V_PROMPTS select a different population and R2V_TAG the run directory, which is what
+# `r2v_cfg_sweep.sh` uses to give every (arm, report cfg) cell its own volumes.
 #
 # Writes $OUT/nifti/<case_id>.nii.gz. Score them with:
-#   baselines/score.sh nvidia_r2v_arm<X>_cfg<N> "<label>"
+#   slurms/baseline_score.sh nvidia_r2v_arm<X>_cfg<N> "<label>"
 #
 # **No separate venv.** Measured 2026-09-16: the whole `mrrate_r2v` stack -- monai 1.6.0,
 # transformers 5.14.1, its MAISI UNet and the three text encoders -- imports cleanly in the MRFlow
@@ -29,10 +31,10 @@
 #SBATCH --error=logs/r2v_gen_%A_%a.err
 
 unset SLURM_EXPORT_ENV
-cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/../..}"
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 mkdir -p logs
 
-ARM=${1:?usage: run_shards.sh <A|E> [extra generate.py flags]}
+ARM=${1:?usage: r2v_run_shards.sh <A|E> [extra generate.py flags]}
 shift
 
 WS=/hnvme/workspace/y100dc19-mrflow-final
@@ -40,8 +42,9 @@ VENV=$WS/venv
 UPSTREAM=$WS/baselines/upstream
 NVIDIA_WS=${R2V_WORKSPACE:-/hnvme/workspace/y100dc19-nvidia-mri-brain}
 
-CASES=baselines/cases-test-n100.json
-PROMPTS=$WS/baselines/prompts-test-n100.json
+# The population defaults to the committed test one; a sweep points both at the val pair instead.
+CASES=${R2V_CASES:-baselines/cases-test-n100.json}
+PROMPTS=${R2V_PROMPTS:-$WS/baselines/prompts-test-n100.json}
 
 case "$ARM" in
     A) TAG=nvidia_r2v_armA_cfg7 ;;
