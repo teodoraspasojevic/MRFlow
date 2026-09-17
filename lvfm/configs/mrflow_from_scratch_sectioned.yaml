@@ -70,31 +70,32 @@
 #                                  this model has only ever been shown to work at 2048
 #   lr           1e-4 -> 2e-4      CTFlow's scratch value at this effective batch
 #   warmup       500 -> 2000       "the trunk is pretrained, not random" no longer holds
-#   max_steps    60k -> 100k       a fine-tune converges in 60k; a scratch run does not. 100k is
+#   max_steps    60k -> 200k       a fine-tune converges in 60k; a scratch run does not. 200k is
 #                                  a budget, not a convergence point -- see below
 #   accum        1 -> 2            CTFlow's own microbatching. Safe again as of d5303d7, which
 #                                  gated the max_train_steps break on sync_gradients; before that
 #                                  fix accum > 1 could break mid-accumulation and skip the final
 #                                  checkpoint
 #
-# BUDGET. 100k steps x 2048 is 205M samples, ~101 h on 16 nodes, ~6,500 GPU-hours, 5 legs of the
-# partition's 24 h cap. That is 15% of the 1.39B samples CTFlow's released checkpoint saw, so this
+# BUDGET. 200k steps x 2048 is 410M samples, ~202 h on 16 nodes, ~12,900 GPU-hours, 9 legs of the
+# partition's 24 h cap. That is 29% of the 1.39B samples CTFlow's released checkpoint saw, so this
 # is a budget rather than a convergence point -- report it that way.
 #
 #   steps    samples    % of CTFlow   wall clock   legs   GPU-hours
 #   680k      1.39B         100%         686 h      29      43,900   CTFlow's own horizon
 #   400k       819M          59%         403 h      17      25,800
-#   200k       410M          29%         202 h       9      12,900
-#   100k       205M          15%         101 h       5       6,500   <- set here, retained ckpt
+#   200k       410M          29%         202 h       9      12,900   <- set here, retained ckpt
+#   100k       205M          15%         101 h       5       6,500   evaluated, resume point
 #
 # The horizon is the ONE knob that is safe to move. Because ref_steps is pinned at 1e6 rather than
 # linked to it, every truncation follows the identical lr curve, so a checkpoint at 100k is the
-# same model a 680k run would have had at 100k. Both 100k and 200k are in checkpoints_to_keep, and
-# extending later is `max_steps` plus a resume -- nothing else changes. Do NOT instead move nodes:
+# same model a 680k run would have had at 100k -- which is what makes the 100k -> 200k extension a
+# plain resume: the second half follows the same curve the first did, so the checkpoint series
+# stays one comparable sequence. Nothing but `max_steps` changes. Do NOT instead move nodes:
 # that changes the effective batch and voids lr 2e-4 with it.
 #
 # The flip side of that pinning: this run barely anneals. Inverse-sqrt decay at ref_steps 1e6 puts
-# the lr at 91% of base at 100k and 85% at 200k, so the final checkpoint here is taken at 91% of
+# the lr at 91% of base at 100k and 85% at 200k, so the final checkpoint here is taken at 85% of
 # base -- mid-plateau, not at the end of a decay. That is not an oversight -- CTFlow's own 680k
 # checkpoint was still at 65%, so the model this one is compared against was made the same way.
 #
@@ -125,7 +126,7 @@ globals:
   resolution: 256               # in-plane image size fed to the VAE
   latent_res: 32                # 256 / 8, the FLUX f8 in-plane latent size
   latent_channels: 16
-  max_steps: 100_000
+  max_steps: 200_000
 
 max_train_steps: ${globals.max_steps}
 gradient_accumulation_steps: 2   # CTFlow's own microbatching: 16/GPU x 4 x 16 nodes x 2 = 2048
@@ -321,12 +322,14 @@ wandb_args:
 # 40-minute recovery window, and an interrupted leg wastes that window x 64 GPUs -- 43 GPU-hours at
 # 2000, 107 at 5000.
 checkpointing_steps: 2_000
-# Nine retained checkpoints, 69 GB, dense early where a scratch run changes fastest. Every entry
+# Ten retained checkpoints, 77 GB, dense early where a scratch run changes fastest and again at
+# the end of the 200k horizon. The four at or below 100k are the evaluated series and the resume
+# point -- dropping them from this list would delete them at the next checkpointing step. Every entry
 # must be a multiple of checkpointing_steps or it is silently never created. Saves happen every
 # checkpointing_steps regardless; retention only controls deletion, and cleanup_checkpoints always
 # keeps `last_checkpoint` on top of this list, so crash recovery tracks checkpointing_steps
 # however sparse the list is.
-checkpoints_to_keep: [10000, 20000, 40000, 60000, 80000, 90000, 100000]
+checkpoints_to_keep: [10000, 20000, 50000, 100000, 120000, 140000, 160000, 180000, 190000, 200000]
 
 # Random init: load_init_weights returns immediately on a falsy path, leaving the weights that
 # DiffuserSTDiT.initialize_weights() set in __init__. resume_from_checkpoint still applies, so a
