@@ -7,9 +7,9 @@ std far from 1.0 means data and noise are mixed at mismatched scale.
 
 Diagnostic only. Do NOT copy the measured moments into the config while `init_from` points at a
 CTFlow checkpoint -- the trunk was trained with exactly 0.3611/0.1159, and substituting measured
-statistics made zero-shot transfer worse (0.106 -> 0.116, tools/ctflow_transfer_check.py).
+statistics made zero-shot transfer worse (0.106 -> 0.116, ablations/ctflow_transfer_check.py).
 
-    python tools/latent_stats.py --config lvfm/configs/mrflow_STDiT-L2_16f8.yaml \
+    python ablations/latent_stats.py --config lvfm/configs/mrflow_STDiT-L2_16f8.yaml \
         --split train --limit 200
 """
 

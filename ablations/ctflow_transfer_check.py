@@ -11,7 +11,7 @@ Read the relative column: it is the MSE divided by the target velocity's own mag
 the "predict zero" baseline and anything above 1.0 means the checkpoint is worse than useless as an
 initialization.
 
-    python tools/ctflow_transfer_check.py --config lvfm/configs/mrflow_STDiT-L2_16f8.yaml --n 20
+    python ablations/ctflow_transfer_check.py --config lvfm/configs/mrflow_STDiT-L2_16f8.yaml --n 20
 """
 
 import argparse

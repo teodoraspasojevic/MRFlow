@@ -7,7 +7,7 @@ Volumes reach the VAE as [1, T, S, S] in [0, 1], the same range CTFlow normalize
 not cosmetic: the CTFlow checkpoint this fine-tunes from transfers 27x better to [0, 1] latents than
 to [-1, 1] ones at matched latent scale, and standardizing cannot close the gap -- the VAE encoder
 is nonlinear, so an affine change in pixel space is not an affine change in latent space
-(tools/ctflow_transfer_check.py). MRI has no Hounsfield scale, so there is no HU window and no
+(ablations/ctflow_transfer_check.py). MRI has no Hounsfield scale, so there is no HU window and no
 `* 306` (CTFlow's factor rescales its (-1000, 1400) window to the challenge's (-1000, 1000)):
 intensities are normalized per volume over *nonzero* voxels only, because MR-RATE images are defaced
 and zero-padded and background would otherwise dominate every percentile.
@@ -391,11 +391,14 @@ def load_native_volume(nii_bytes, plane):
 
 
 def preprocess_volume(nii_bytes, plane, target_spacing=(1.0, 1.0, 1.0), inplane_size=256,
-                      posterior_shift_mm=15.0, max_slices=320, min_slices=32):
+                      posterior_shift_mm=15.0, max_slices=320, min_slices=32, normalize=True):
     """MR-RATE NIfTI bytes -> ([1, T, S, S] float32 in [0, 1], native (D, H, W) spacing in mm).
 
     RAS canonicalize -> trilinear resample to `target_spacing` -> intensity normalize -> permute
     so the acquisition plane's slice axis leads -> center crop/pad in-plane to S x S -> cap T.
+
+    `normalize=False` skips only the intensity step, so a brain mask reaches the same grid as its
+    volume through this function rather than through a second copy of the geometry.
 
     The native spacing is returned because it goes into the conditioning text; it describes the
     acquisition, not the resampled output (which is `target_spacing` for every volume).
@@ -411,7 +414,8 @@ def preprocess_volume(nii_bytes, plane, target_spacing=(1.0, 1.0, 1.0), inplane_
         data = F.interpolate(torch.from_numpy(data)[None, None], size=shape,
                              mode="trilinear", align_corners=False)[0, 0].numpy()
 
-    data = _normalize(data)
+    if normalize:
+        data = _normalize(data)
 
     order = plane_order(plane)
     data = np.ascontiguousarray(data.transpose(order))
