@@ -5,7 +5,7 @@
 
 **Why freeze it at all.** `evaluation/main.py` derives its case list at runtime, from `list_series`
 at a fixed seed plus `select_cases`. That is reproducible for one model run today, but a baseline
-table is built over weeks: MRFlow generated in March, GenerateCT in April, Text2CT in May. A
+table is built over weeks: MRFlow generated in one month, the NVIDIA arms in the next, Text2CT after. A
 changed `series.parquet`, a changed `mri.max_series_test` or a changed `list_series` would move the
 population underneath the table with nothing in any output to say so -- every row would still be
 labelled "1,000 test cases" and the FIDs would no longer be comparable. A committed JSON makes the

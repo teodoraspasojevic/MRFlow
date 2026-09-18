@@ -2,7 +2,7 @@
 
 End-to-end 3D latent diffusion: a generation-oriented 3D-CLIP text encoder, a volumetric VAE, and
 cross-attention conditioning in latent space — explicitly no cascaded super-resolution, which is
-its stated advantage over GenerateCT. Architecturally the closest of the three to MRFlow, and the
+its stated advantage over earlier text-to-CT work. Architecturally the closest to MRFlow, and the
 most interesting comparison for that reason.
 
     upstream   https://github.com/danielemolino/Text2CT  @ 887caa9 (2026-09-15)
@@ -26,7 +26,7 @@ Two things it says that change the work:
 
 ## What has to happen before it is a baseline
 
-**Chest CT → MR-RATE brain MRI fine-tuning**, as with GenerateCT. Three components could each be
+**Chest CT → MR-RATE brain MRI fine-tuning.** Three components could each be
 frozen or trained (3D-CLIP, VAE, diffusion UNet); the honest default is to fine-tune the diffusion
 model and keep the released encoder and VAE, and to state it. That is also **exactly MRFlow's own
 recipe** — a CTFlow trunk fine-tuned on MR-RATE with a frozen CXR-BERT and a frozen FLUX VAE — so
@@ -46,10 +46,16 @@ weights). So despite the `-mr-brain` naming only NVIDIA's *UNet* is MR-specific,
 frozen reconstruction ceiling on MR-RATE **is** the one our challenge model already established.
 Its decode path confirms the input convention transfers: `diff_model_demo.py:194` maps
 `[0, 1] → [-1000, 1000]` HU only at decode, so the latent space is over `[0, 1]` volumes, which is
-what `preprocess_volume` already produces for MR. Note the consequence for the table — two of three
-baselines now share a latent space and a decoder, and MRFlow's is the odd one out (FLUX), so a
-reconstruction-ceiling row per autoencoder is worth one job to pre-empt "how much of the margin is
-the VAE?".
+what `preprocess_volume` already produces for MR.
+
+**That ceiling has been measured, and it is low.** `ablations/vae_ceiling.py` over the 1,002-case val
+population: MAISI reconstructs MR-RATE at **26.19 dB / 0.465 SSIM** against FLUX's **36.70 dB / 0.982**,
+distributions non-overlapping, the gap present in every modality and inside the brain mask, and not a
+precision artifact. MAISI compresses 16x per voxel (4x4x4 spatial, 4 channels) where FLUX compresses
+4x (8x8 spatial, 16 channels, no depth compression at all). Both baselines therefore generate against
+a ceiling ~10.5 dB below MRFlow's, which has to be declared — and reframed, because it is the
+mechanism rather than only a confound: monolithic 3D generation *forces* a depth-compressing 3D VAE,
+while block-autoregressive generation is what permits a 2D one.
 
 **The four conditioning inputs you inherit with the UNet**, from `configs/config_rflow.json`:
 

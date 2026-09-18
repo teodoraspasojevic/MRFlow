@@ -4,10 +4,10 @@ Every baseline MRFlow is compared against, scored by `evaluation/main.py` on the
 same ground truth and the same extractors.
 
 **This directory holds our code only.** The baselines themselves are cloned unmodified into the
-workspace and pinned by commit below. They are not vendored here and not submodules: the three
-upstream stacks cannot share a venv (GenerateCT wants an A100-era torch and its own two packages,
-Text2CT a MONAI/MAISI stack, NV-Generate-MR-Brain its `.sif` containers), so one clone per venv in
-the workspace is the only arrangement that runs. What lives here is the thin layer that makes their
+workspace and pinned by commit below. They are not vendored here and not submodules: the two
+upstream stacks cannot share a venv (Text2CT wants a pre-v5 transformers for its vendored CLIP,
+NV-Generate-MR-Brain its `.sif` containers), so one clone per venv in the workspace is the only
+arrangement that runs. What lives here is the thin layer that makes their
 output scoreable: the frozen population, the geometry conversion, the ingest, and one directory per
 baseline recording how its volumes were produced.
 
@@ -45,7 +45,6 @@ Upstream trees and weights: `/hnvme/workspace/y100dc19-mrflow-final/baselines/up
 | baseline | upstream | commit | cloned |
 |---|---|---|---|
 | `nvidia_r2v` | [teodoraspasojevic/R2V-MR-Generation](https://github.com/teodoraspasojevic/R2V-MR-Generation) | `ad5dca1` (2026-09-08) | 2026-09-16 |
-| `generatect` | [ibrahimethemhamamci/GenerateCT](https://github.com/ibrahimethemhamamci/GenerateCT) | `2a81135` (2024-07-03) | 2026-09-16 |
 | `text2ct` | [danielemolino/Text2CT](https://github.com/danielemolino/Text2CT) | `887caa9` (2026-09-15) | 2026-09-16 |
 
 ## The contract
@@ -109,12 +108,12 @@ plus 10 MRA, which are carried rather than dropped so `n_excluded_out_of_scope_m
 reports them.
 
 **A baseline uses its own preprocessing, its own text encoder and its own geometry.** Sharing our
-dataset code for *generation* would mean measuring GenerateCT-running-on-MRFlow's-pipeline, which
-is not GenerateCT. What is shared is narrow and deliberate: which cases, the raw report text handed
+dataset code for *generation* would mean measuring Text2CT-running-on-MRFlow's-pipeline, which is
+not Text2CT. What is shared is narrow and deliberate: which cases, the raw report text handed
 to each model, and the ground truth — and the last is safe by construction, because the evaluation
 reads GT itself from the archives and no baseline ever supplies its own reference.
 
-**NIfTI is the handoff.** All three upstream repos already write it, and its affine carries spacing
+**NIfTI is the handoff.** Both upstream repos already write it, and its affine carries spacing
 and orientation, so `ingest.py` reads a baseline's output with `read_canonical` — the *same*
 function the ground-truth path uses — rather than each adapter restating what its model's axes
 mean. It also means the generation side needs no MRFlow import at all. The intermediate NIfTIs are
@@ -129,9 +128,8 @@ argument and a line in its own README, never a second copy of this code.
 
 ## Still to wire up
 
-- The GenerateCT and Text2CT generation drivers and their `slurms/<name>_run_shards.sh`. Each
-  baseline's README says what its driver has to do; `nvidia_r2v`'s is written, the other two
-  are not.
+- The Text2CT generation driver and its `slurms/text2ct_run_shards.sh`. That baseline's README says
+  what the driver has to do; `nvidia_r2v`'s conditioned and unconditional drivers are written.
 - `--combine` still requires an MRFlow `--config`, because it reads `wandb_args` for the project
   and group and validates the label mapping. Harmless for a baseline — nothing from that config
   reaches a metric — but it does mean a baseline is scored with an MRFlow config path on the

@@ -17,7 +17,7 @@ holds only ids and paths; this is the half that cannot be.
 `clinical_information`, `technique`, `findings`, `impression`. Composing them is each baseline's
 own job and differs per model: MRFlow joins `[FINDINGS]`/`[IMPRESSION]` behind an acquisition
 prefix, R2V arm A does the same through its own formatter, R2V arm E encodes findings, impression
-and acquisition as three separate tokens, GenerateCT builds a T5 prompt. Handing over a
+and acquisition as three separate tokens, Text2CT joins findings and impression into one string. Handing over a
 pre-composed string would force one model's formatting onto the others, which is exactly what a
 baseline must not inherit.
 

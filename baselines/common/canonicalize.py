@@ -1,7 +1,7 @@
 """An external model's volume on the grid `evaluation/main.py` caches MRFlow's own rollouts in.
 
 The one conversion every baseline needs and the one place it happens. A baseline generates on
-whatever grid it was trained on -- GenerateCT on 201x512x512, NV-Generate-MR-Brain on a per-bucket
+whatever grid it was trained on -- Text2CT on 512x512x128, NV-Generate-MR-Brain on a per-bucket
 FOV at roughly 1 mm, Text2CT on its VAE's own latent-derived shape -- while a cached MRFlow volume
 is 1 mm isotropic, plane-first and 256^2 in-plane. `canonicalize_generated` assumes that shape and
 only windows intensity, so a baseline that skipped this would be scored on a different geometry

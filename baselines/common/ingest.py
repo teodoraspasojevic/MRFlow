@@ -1,8 +1,8 @@
 """A baseline's NIfTI output -> the cache `evaluation/main.py --combine` scores.
 
     python -m baselines.common.ingest --cases baselines/cases-test-n100.json \
-        --nifti $WS/baselines/runs/generatect/nifti --out $WS/baselines/runs/generatect \
-        --label generatect@2a81135
+        --nifti $WS/baselines/runs/text2ct/nifti --out $WS/baselines/runs/text2ct \
+        --label text2ct@887caa9
 
 Writes `<out>/generated/<bucket>-<case_id>.npy` and `<out>/shard-NNNN.json`, which is the entire
 contract `score_cached` reads -- it needs no config, no checkpoint and no model, only those two
@@ -40,7 +40,7 @@ from evaluation.paper_metrics import normalize01
 
 def find_volume(nifti_dir, case_id):
     """The baseline's file for a case, or None. `<case_id>.nii.gz` is the contract; `.nii` is
-    accepted because two of the three upstream savers write uncompressed by default."""
+    accepted because some upstream savers write uncompressed by default."""
     for suffix in (".nii.gz", ".nii"):
         path = os.path.join(nifti_dir, case_id + suffix)
         if os.path.exists(path):
