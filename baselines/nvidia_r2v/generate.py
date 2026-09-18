@@ -47,14 +47,16 @@ from types import SimpleNamespace
 # wrong number.
 SCORED_MODALITIES = ("t1w", "t2w", "flair", "swi")
 
-# Per arm: the run directory, and the report guidance scale that arm was tuned to. Both were
-# selected on FID_2p5D over the same 1,000 test cases -- see README.md. Everything else
-# (30 steps, modality guidance 10.0) is shared, and is NVIDIA's own default.
+# Per arm: the run directory, and the report guidance scale that arm was tuned to. **Both were
+# chosen on the 1,002-case val population, ranked on FVD_f16** -- see README.md. The challenge's
+# own A=7 / E=3 were picked on test, which is selection on the reported split; the val sweep
+# reproduced A=7 and moved E to 4. Everything else (30 steps, modality guidance 10.0) is shared,
+# and is NVIDIA's own default.
 ARMS = {
     "A": {"run": "r2v_final_A_cxr_bert_cls", "checkpoint": "adapter_last.pt",
           "report_guidance_scale": 7.0, "report_format": "findings_impression_meta"},
     "E": {"run": "r2v_final_E_report2ct_style_meta", "checkpoint": "adapter_last.pt",
-          "report_guidance_scale": 3.0, "report_format": None},
+          "report_guidance_scale": 4.0, "report_format": None},
 }
 
 WORKSPACE = os.environ.get("R2V_WORKSPACE", "/hnvme/workspace/y100dc19-nvidia-mri-brain")

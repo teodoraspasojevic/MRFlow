@@ -48,7 +48,7 @@ PROMPTS=${R2V_PROMPTS:-$WS/baselines/prompts-test-n100.json}
 
 case "$ARM" in
     A) TAG=nvidia_r2v_armA_cfg7 ;;
-    E) TAG=nvidia_r2v_armE_cfg3 ;;
+    E) TAG=nvidia_r2v_armE_cfg4 ;;
     *) echo "unknown arm '$ARM' (expected A or E)" >&2; exit 1 ;;
 esac
 # R2V_TAG redirects the whole run elsewhere, so a smoke test cannot leave volumes in the real run

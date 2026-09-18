@@ -43,6 +43,26 @@ metrics.json are skipped, so re-running resumes a partial sweep. Score the winne
 `report_guidance_scale=1` is the plain report-conditioned term, not the report switched off — that
 is `0`, which collapses to NVIDIA's official modality-only arithmetic and is not in the grid.
 
+**Outcome of the val sweep, and the final configuration.** Ranked on `FVD_f16` — the one metric
+computed by an unmodified reference protocol end to end — the scales are **A = 7** (reproducing the
+challenge's own pick) and **E = 4** (the challenge picked 3). These are now the defaults in
+`ARMS`, so a run with no `--report_guidance_scale` generates the chosen configuration.
+
+The choice is not unanimous and it is worth knowing why. Across the sweep the temporal and the
+volumetric metrics pull in opposite directions: FVD improves with guidance up to a point, while
+`fid_3d_medicalnet` degrades monotonically with it in both arms (A: 1.16 → 1.65 → 8.41 → 23.65 over
+rep 1/4/7/10). Guidance sharpens each slice at the cost of through-plane consistency. On FID alone
+A = 4 and E = 1 would win instead.
+
+The two arms also behave very differently. A's `fid_2d_inception` spans 24.2–27.8 across the whole
+grid; E's spans 24.5–**57.2**, and E collapses past rep 4 (SSIM 0.435 → 0.321 → 0.196). One token
+can only add a per-channel bias, so amplifying it does little harm; three tokens of real
+conditioning can be over-amplified into artifacts. E is the stronger conditioning story and the
+more fragile setting.
+
+Final test-split results are generated with those scales into
+`$WS/baselines/runs/nvidia_r2v_arm{A_cfg7,E_cfg4}/`.
+
 ## Checkpoints
 
     adapters   /hnvme/workspace/y100dc19-nvidia-mri-brain/runs/r2v_final_{A_cxr_bert_cls,E_report2ct_style_meta}/adapter_last.pt
@@ -97,8 +117,8 @@ sbatch --array=0-15 slurms/r2v_run_shards.sh A
 sbatch --array=0-15 slurms/r2v_run_shards.sh E
 
 # ingest + score, once the array is done
-slurms/baseline_score.sh nvidia_r2v_armA_cfg7 "nvidia_r2v armA cfg7 @ad5dca1"
-slurms/baseline_score.sh nvidia_r2v_armE_cfg3 "nvidia_r2v armE cfg3 @ad5dca1"
+slurms/baseline_score.sh nvidia_r2v_armA_cfg7 "nvidia_r2v armA cfg7 mod10 test @ad5dca1"
+slurms/baseline_score.sh nvidia_r2v_armE_cfg4 "nvidia_r2v armE cfg4 mod10 test @ad5dca1"
 ```
 
 For the val sweep both halves are one command — `bash slurms/r2v_cfg_sweep.sh` submits
