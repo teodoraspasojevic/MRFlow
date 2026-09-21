@@ -9,6 +9,7 @@
 #
 #   1. ingest   <run>/nifti/*.nii.gz -> <run>/generated/*.npy + shard-0000.json
 #   2. rm       the NIfTIs, ~24 MB and one inode per case, disposable once the manifest exists
+#   2b. examples <run>/examples/*.mp4, which log_wandb picks up at combine time
 #   3. combine  every metric over those volumes -> <run>/metrics.json
 #
 # Ingest reads 1,010 volumes at ~24 MB and writes as many again, which is why it is here rather
@@ -77,6 +78,15 @@ echo "=== 2/3  drop the NIfTIs"
 # scales -- and it lives in the NIfTI directory. Keep it; the 24 MB volumes are what goes.
 mv -f "$OUT"/nifti/_generate-*.json "$OUT"/ 2>/dev/null || true
 rm -rf "$OUT/nifti"
+
+# **Example videos, before scoring.** MRFlow writes these during its rollout pass and `log_wandb`
+# globs `<out>/examples/*.mp4` at combine time; a baseline never runs that pass, so without this its
+# W&B run has the metrics table and no pictures. Built from the cached volumes with the evaluation's
+# own `comparison_frames`/`save_as_mp4`, so the artifact is identical and `evaluation/` is unchanged.
+# Never fatal: a missing video must not cost a scored run.
+echo "=== 2b/3 example videos"
+$VENV/bin/python -m baselines.common.examples --out "$OUT" || \
+    echo "WARNING: example videos failed; scoring anyway" >&2
 
 echo "=== 3/3  score"
 # --ckpt is required positionally and is meaningless for a baseline; --label names the run.
