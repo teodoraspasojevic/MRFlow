@@ -1,0 +1,92 @@
+# Text2CT adapted to MR-RATE -- the recommended fine-tune.
+#
+# Compute-matched to MRFlow's own adaptation (`experiments/mrflow_from_ct_checkpoint`, job 798342):
+# 60,000 optimizer updates at an effective global batch of 128, lr 1e-4, warmup 500, bf16,
+# grad clip 1.0. That is 13.3 epochs over the 575,328-series train split there and
+# 60000 * 128 / N_train here -- the *step count* is what is matched, not the epoch count, because
+# one MRFlow sample is a 16-slice block pair while one sample here is a whole volume.
+#
+# Only the diffusion UNet trains. The VAE and the 3D-CLIP report encoder are frozen and, in the
+# default cached-artifact mode, the encoder is not even resident.
+
+text2ct_root: /hnvme/workspace/y100dc19-mrflow-final/baselines/upstream/Text2CT
+model_def: configs/config_rflow.json
+
+weights:
+  unet: models/unet_rflow_200ep.pt
+  vae: models/autoencoder_epoch273.pt
+  clip: models/CLIP3D_Finding_Impression_30ep.pt
+
+mrrate:
+  raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
+  # null keeps MR-RATE's duplicate acquisitions of one contrast and plane (`t1w-raw-axi-2`, `-3`,
+  # ...), which is exactly the population MRFlow's own fine-tune trained on: 575,328 train series.
+  # Same population, same optimizer-step count, same effective batch -> 13.35 epochs on both sides.
+  # Measured cost of that choice: 0.75 TB of latents and ~221 GPU-h of preprocessing. Two cheaper
+  # populations, both a deviation to declare: max_repeats 1 -> 478,135 series (0.63 TB, 16.1
+  # epochs); max_series_train 200000 -> 0.26 TB, 38.4 epochs.
+  max_repeats: null
+  max_series_train: null
+  max_series_val: 2000
+  seed: 42                     # must match MRFlow's, so the two see the same shuffle
+
+# 512 x 512 x 128 reproduces the released UNet's own latent shape, (4, 128, 128, 32) -- the grid it
+# was trained at, rather than MRFlow's evaluation grid. The spacing is NOT the CT's 0.75/0.75/3.0:
+# that is a 384 mm field of view, ~40% air for a brain. 0.5/0.5/1.5 puts the same latent over
+# 256 x 256 x 192 mm, covering 91.5% of MR-RATE brains at a median 84% fill. slice_mm is the one
+# free parameter: 2.0 covers 99.7% but fills only 63% and upsamples 2x at ingest.
+volume:
+  inplane_mm: 0.5
+  slice_mm: 1.5
+  inplane_size: 512
+  num_slices: 128
+  posterior_shift_mm: 15.0     # MR-RATE is defaced; a plain center crop loses posterior brain
+  percentiles: [0.5, 99.5]
+  min_native_slices: 32
+
+data:
+  cache_root: /hnvme/workspace/y100dc19-mrflow-final/baselines/text2ct_cache
+  report_sections: [findings, impression]
+  modality_prefix: false      # the report string is exactly upstream's; modality is a class id
+  text_max_length: 512
+  limit_train: null
+  limit_val: 512
+  num_workers: 8
+  load_text_encoder: false
+
+model:
+  modality_init: ct_row        # MR rows start from the trained CT row -> step 0 == pretrained
+  scale_factor: 1.0287         # CT-derived; kept under a fine-tune, as MRFlow keeps FLUX's factors
+
+train:
+  max_steps: 60000
+  # 8 x accum 2 x 8 GPUs = effective 128, the recommended row of the README's table. Measured on one
+  # h200 at this grid: 0.672 s/micro-step and 80.6 GiB peak, and throughput has saturated by 8
+  # (11.9 of a ceiling 12.2 samples/s). On an 80 GiB card use 4 x accum 4 -- 41.8 GiB, same
+  # effective batch, same 60,000 steps.
+  micro_batch_size: 8
+  gradient_accumulation_steps: 2
+  optimizer: adamw
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  loss: l1                     # upstream's objective
+  scheduler: cosine
+  warmup_steps: 500
+  min_lr: 1.0e-6
+  precision: bf16
+  max_grad_norm: 1.0
+  seed: 42
+  log_every: 50
+  val_every: 2000
+  val_batches: 32
+  checkpoint_every: 2000
+  keep_checkpoints: 4
+  num_workers: 8
+
+cfg:
+  report_dropout_prob: 0.1     # upstream's conditional_free_guidance
+  guidance_scale: 5.0          # upstream's sampling default; unused during training
+  modality_dropout_prob: 0.0   # modality is required metadata, supplied in both CFG branches
+  modality_guidance_scale: 1.0
+
+output_dir: /hnvme/workspace/y100dc19-mrflow-final/baselines/runs/text2ct_mrrate_ft

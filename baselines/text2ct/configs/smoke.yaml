@@ -1,0 +1,38 @@
+# A bounded self-check config: tiny grid, tiny cache, three steps. Used by the test suite and by
+# `fine_tune.py --smoke`. Nothing here is a training recommendation.
+
+text2ct_root: /hnvme/workspace/y100dc19-mrflow-final/baselines/upstream/Text2CT
+
+mrrate:
+  raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
+  max_repeats: 1
+  max_series_train: 64
+  max_series_val: 16
+  seed: 42
+
+# The smallest grid that still satisfies `sample.py`'s check_input, so the smoke path exercises the
+# same validation the real config does. Coarse on purpose: this is a self-check, not a recipe.
+volume:
+  inplane_mm: 1.0
+  slice_mm: 2.0
+  inplane_size: 256
+  num_slices: 128
+  posterior_shift_mm: 15.0
+
+data:
+  cache_root: /hnvme/workspace/y100dc19-mrflow-final/baselines/text2ct_cache_smoke
+  limit_val: 4
+  num_workers: 0
+
+train:
+  max_steps: 4
+  micro_batch_size: 1
+  gradient_accumulation_steps: 2
+  warmup_steps: 1
+  val_every: 0
+  checkpoint_every: 2
+  keep_checkpoints: 2
+  log_every: 1
+  num_workers: 0
+
+output_dir: /hnvme/workspace/y100dc19-mrflow-final/baselines/runs/text2ct_smoke
