@@ -1,0 +1,71 @@
+# CCELLA adapted to MR-RATE -- the run.
+#
+# Step budget is this repository's fairness contract for a baseline: 60,000 optimizer updates,
+# the same number MRFlow's own fine-tune took (`experiments/mrflow_from_ct_checkpoint`) and the
+# same number `baselines/text2ct/configs/mrrate_finetune.yaml` pins to. The step count is what is
+# matched, not the epoch count -- one MRFlow sample is a 16-slice block pair while one sample here
+# is a whole volume.
+#
+# Everything under `volume:` and `text:` is upstream CCELLA's own preprocessing constant; see
+# volume.py and text.py, which name the upstream line each one came from.
+
+mrrate:
+  # null keeps MR-RATE's duplicate acquisitions of one contrast and plane (`t1w-raw-axi-2`, ...),
+  # which is the population MRFlow and Text2CT both train on: 575,328 train series.
+  max_repeats: null
+  max_series_train: null
+  max_series_val: 2000
+  seed: 42
+
+volume:
+  # 256 x 256 x 224 at 1 mm RAS -> latent 4 x 64 x 64 x 56. Every axis is divisible by 32 (MAISI
+  # downsamples 4x, the UNet a further 8x).
+  #
+  # Measured on 400 MR-RATE brain masks: a centred crop keeps the whole brain for 99.5% of series
+  # at I-S 224 and only 95.8% at I-S 192, while the in-plane axes are not binding at all (192x224
+  # scores exactly the same as 256x256). 256 in depth buys nothing over 224. The 256^2 in-plane is
+  # kept because it is MRFlow's own evaluation grid, which makes `canonicalize_external` a pure
+  # depth operation at scoring time.
+  grid: [256, 256, 224]
+  spacing_mm: [1.0, 1.0, 1.0]
+  percentile_lower: 0.0
+  percentile_upper: 99.5
+  clip: true
+
+text:
+  encoder: google/flan-t5-xxl
+  hidden_size: 4096
+  max_length: 512
+  sections: [findings, impression]
+
+data:
+  cache_root: /hnvme/workspace/y100dc19-mrflow-final/baselines/ccella_cache
+  num_workers: 8
+
+model:
+  latent_channels: 4
+  pos_weight_cap: 20.0
+  text_class_pred_weight: 1.0e-4      # upstream's lambda, unchanged -- see the README
+
+train:
+  max_train_steps: 60000
+  checkpoint_steps: [20000, 40000, 50000, 55000, 60000]
+  micro_batch_size: 4
+  lr: 1.0e-4                          # upstream's
+  num_train_timesteps: 1000           # upstream's DDPM schedule
+  seed: 42
+  log_every: 10
+  output_dir: /hnvme/workspace/y100dc19-mrflow-final/baselines/ccella_runs/ccella_mrrate
+
+validation:
+  every: 2500                         # divides every checkpoint interval (20k/10k/5k)
+  samples: 4
+  subset: 256
+  visualize: true
+  inference_steps: 50                 # preview only; a scored rollout uses upstream's 1000
+
+wandb:
+  project: MRFlow
+  group: baselines
+  name: ccella_mrrate
+  id: ccella_mrrate

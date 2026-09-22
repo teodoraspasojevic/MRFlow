@@ -1,0 +1,423 @@
+{
+ "label_source": {
+  "id": "mrrate-merged-majority-3model-14group",
+  "root": "/home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE/contrastive-pretraining/scripts/eval_labels/splits_merged_majority",
+  "sha256": "e27ecebd7b671ebfbb9822ae0321f86a55768860bfc7b174cc58c100508a1b55",
+  "n_labels": 14,
+  "label_order": [
+   "PP_Cerebrovascular",
+   "PP_Neoplastic",
+   "PP_Neurodegenerative",
+   "PP_Spinal",
+   "PP_Cystic_developmental",
+   "PP_Infectious",
+   "PP_Inflammatory",
+   "PP_Unspecific_bucket",
+   "BP_Atrophies",
+   "BP_Contrast_enhancing_intracranial",
+   "BP_Infectious_lesions",
+   "BP_Edematous_lesions",
+   "BP_Hemorrhagic_lesions",
+   "BP_Cystic_lesions"
+  ],
+  "duplicate_column_pairs": [
+   [
+    "PP_Neurodegenerative",
+    "BP_Atrophies"
+   ],
+   [
+    "PP_Neoplastic",
+    "BP_Contrast_enhancing_intracranial"
+   ],
+   [
+    "PP_Infectious",
+    "BP_Infectious_lesions"
+   ]
+  ],
+  "n_rows": 97896,
+  "values": "binary 0/1, fully resolved upstream -- no NaN, no uncertain, no masked cell",
+  "missingness": "per study only: a study absent from the CSV has no label vector",
+  "join_key": "study_uid"
+ },
+ "raw_root": "/hnvme/workspace/y100dc19-MR-Rate-raw",
+ "splits": {
+  "train": {
+   "n_studies_total": 88985,
+   "n_studies_with_report": 88864,
+   "n_studies_with_all_14_labels": 88582,
+   "pct_studies_with_all_14_labels": 99.683,
+   "n_studies_with_partial_labels": 0,
+   "n_studies_with_no_labels": 282,
+   "n_studies_with_37_label_json": 88582,
+   "label_positives": {
+    "PP_Cerebrovascular": {
+     "n_positive": 8916,
+     "prevalence_pct": 10.0653
+    },
+    "PP_Neoplastic": {
+     "n_positive": 7382,
+     "prevalence_pct": 8.3335
+    },
+    "PP_Neurodegenerative": {
+     "n_positive": 16595,
+     "prevalence_pct": 18.7341
+    },
+    "PP_Spinal": {
+     "n_positive": 1814,
+     "prevalence_pct": 2.0478
+    },
+    "PP_Cystic_developmental": {
+     "n_positive": 8353,
+     "prevalence_pct": 9.4297
+    },
+    "PP_Infectious": {
+     "n_positive": 4349,
+     "prevalence_pct": 4.9096
+    },
+    "PP_Inflammatory": {
+     "n_positive": 2721,
+     "prevalence_pct": 3.0717
+    },
+    "PP_Unspecific_bucket": {
+     "n_positive": 36692,
+     "prevalence_pct": 41.4215
+    },
+    "BP_Atrophies": {
+     "n_positive": 16595,
+     "prevalence_pct": 18.7341
+    },
+    "BP_Contrast_enhancing_intracranial": {
+     "n_positive": 7382,
+     "prevalence_pct": 8.3335
+    },
+    "BP_Infectious_lesions": {
+     "n_positive": 4349,
+     "prevalence_pct": 4.9096
+    },
+    "BP_Edematous_lesions": {
+     "n_positive": 7599,
+     "prevalence_pct": 8.5785
+    },
+    "BP_Hemorrhagic_lesions": {
+     "n_positive": 6745,
+     "prevalence_pct": 7.6144
+    },
+    "BP_Cystic_lesions": {
+     "n_positive": 7768,
+     "prevalence_pct": 8.7693
+    }
+   },
+   "positive_labels_per_study": {
+    "0": 36569,
+    "1": 15066,
+    "2": 12696,
+    "3": 12759,
+    "4": 3412,
+    "5": 5309,
+    "6": 1539,
+    "7": 864,
+    "8": 290,
+    "9": 52,
+    "10": 24,
+    "11": 2
+   },
+   "n_studies_all_negative": 36569,
+   "pct_studies_all_negative": 41.283
+  },
+  "val": {
+   "n_studies_total": 3781,
+   "n_studies_with_report": 3775,
+   "n_studies_with_all_14_labels": 3764,
+   "pct_studies_with_all_14_labels": 99.709,
+   "n_studies_with_partial_labels": 0,
+   "n_studies_with_no_labels": 11,
+   "n_studies_with_37_label_json": 3764,
+   "label_positives": {
+    "PP_Cerebrovascular": {
+     "n_positive": 345,
+     "prevalence_pct": 9.1658
+    },
+    "PP_Neoplastic": {
+     "n_positive": 292,
+     "prevalence_pct": 7.7577
+    },
+    "PP_Neurodegenerative": {
+     "n_positive": 600,
+     "prevalence_pct": 15.9405
+    },
+    "PP_Spinal": {
+     "n_positive": 51,
+     "prevalence_pct": 1.3549
+    },
+    "PP_Cystic_developmental": {
+     "n_positive": 355,
+     "prevalence_pct": 9.4315
+    },
+    "PP_Infectious": {
+     "n_positive": 178,
+     "prevalence_pct": 4.729
+    },
+    "PP_Inflammatory": {
+     "n_positive": 71,
+     "prevalence_pct": 1.8863
+    },
+    "PP_Unspecific_bucket": {
+     "n_positive": 1487,
+     "prevalence_pct": 39.5058
+    },
+    "BP_Atrophies": {
+     "n_positive": 600,
+     "prevalence_pct": 15.9405
+    },
+    "BP_Contrast_enhancing_intracranial": {
+     "n_positive": 292,
+     "prevalence_pct": 7.7577
+    },
+    "BP_Infectious_lesions": {
+     "n_positive": 178,
+     "prevalence_pct": 4.729
+    },
+    "BP_Edematous_lesions": {
+     "n_positive": 265,
+     "prevalence_pct": 7.0404
+    },
+    "BP_Hemorrhagic_lesions": {
+     "n_positive": 249,
+     "prevalence_pct": 6.6153
+    },
+    "BP_Cystic_lesions": {
+     "n_positive": 327,
+     "prevalence_pct": 8.6876
+    }
+   },
+   "positive_labels_per_study": {
+    "0": 1673,
+    "1": 664,
+    "2": 522,
+    "3": 486,
+    "4": 132,
+    "5": 190,
+    "6": 48,
+    "7": 38,
+    "8": 7,
+    "9": 4
+   },
+   "n_studies_all_negative": 1673,
+   "pct_studies_all_negative": 44.447
+  },
+  "test": {
+   "n_studies_total": 5568,
+   "n_studies_with_report": 5561,
+   "n_studies_with_all_14_labels": 5550,
+   "pct_studies_with_all_14_labels": 99.802,
+   "n_studies_with_partial_labels": 0,
+   "n_studies_with_no_labels": 11,
+   "n_studies_with_37_label_json": 5550,
+   "label_positives": {
+    "PP_Cerebrovascular": {
+     "n_positive": 586,
+     "prevalence_pct": 10.5586
+    },
+    "PP_Neoplastic": {
+     "n_positive": 438,
+     "prevalence_pct": 7.8919
+    },
+    "PP_Neurodegenerative": {
+     "n_positive": 1042,
+     "prevalence_pct": 18.7748
+    },
+    "PP_Spinal": {
+     "n_positive": 90,
+     "prevalence_pct": 1.6216
+    },
+    "PP_Cystic_developmental": {
+     "n_positive": 508,
+     "prevalence_pct": 9.1532
+    },
+    "PP_Infectious": {
+     "n_positive": 252,
+     "prevalence_pct": 4.5405
+    },
+    "PP_Inflammatory": {
+     "n_positive": 90,
+     "prevalence_pct": 1.6216
+    },
+    "PP_Unspecific_bucket": {
+     "n_positive": 2304,
+     "prevalence_pct": 41.5135
+    },
+    "BP_Atrophies": {
+     "n_positive": 1042,
+     "prevalence_pct": 18.7748
+    },
+    "BP_Contrast_enhancing_intracranial": {
+     "n_positive": 438,
+     "prevalence_pct": 7.8919
+    },
+    "BP_Infectious_lesions": {
+     "n_positive": 252,
+     "prevalence_pct": 4.5405
+    },
+    "BP_Edematous_lesions": {
+     "n_positive": 415,
+     "prevalence_pct": 7.4775
+    },
+    "BP_Hemorrhagic_lesions": {
+     "n_positive": 419,
+     "prevalence_pct": 7.5495
+    },
+    "BP_Cystic_lesions": {
+     "n_positive": 473,
+     "prevalence_pct": 8.5225
+    }
+   },
+   "positive_labels_per_study": {
+    "0": 2371,
+    "1": 920,
+    "2": 743,
+    "3": 835,
+    "4": 184,
+    "5": 355,
+    "6": 86,
+    "7": 40,
+    "8": 14,
+    "9": 1,
+    "10": 1
+   },
+   "n_studies_all_negative": 2371,
+   "pct_studies_all_negative": 42.721
+  }
+ },
+ "population": {
+  "train": {
+   "n_eligible_series": 575328,
+   "n_series_resolving_to_a_14_vector": 574171,
+   "pct_series_resolving": 99.799,
+   "n_series_without_labels": 1157,
+   "n_distinct_studies": 82150,
+   "series_per_study_max": 83,
+   "n_buckets_modality_plane": 15
+  },
+  "val": {
+   "n_eligible_series": 23358,
+   "n_series_resolving_to_a_14_vector": 23320,
+   "pct_series_resolving": 99.837,
+   "n_series_without_labels": 38,
+   "n_distinct_studies": 3342,
+   "series_per_study_max": 34,
+   "n_buckets_modality_plane": 11
+  },
+  "test": {
+   "n_eligible_series": 34452,
+   "n_series_resolving_to_a_14_vector": 34402,
+   "pct_series_resolving": 99.855,
+   "n_series_without_labels": 50,
+   "n_distinct_studies": 4890,
+   "series_per_study_max": 21,
+   "n_buckets_modality_plane": 12
+  }
+ },
+ "consistency": {
+  "n_study_uids_in_labels_not_in_mrrate_index": 0,
+  "n_study_uids_in_label_splits_disagreeing_with_mrrate_split": 0,
+  "n_duplicate_study_uid_rows_in_label_csv": 0,
+  "duplicate_columns_identical_in_data": {
+   "PP_Neurodegenerative==BP_Atrophies": true,
+   "PP_Neoplastic==BP_Contrast_enhancing_intracranial": true,
+   "PP_Infectious==BP_Infectious_lesions": true
+  },
+  "n_studies_with_report_but_no_labels": 304,
+  "n_studies_with_labels_but_no_report": 0
+ },
+ "train_pos_weight": {
+  "cap": 20.0,
+  "n_train_studies": 88582,
+  "per_label": {
+   "PP_Cerebrovascular": {
+    "n_positive": 8916,
+    "prevalence_pct": 10.0653,
+    "pos_weight": 8.9352,
+    "capped": false
+   },
+   "PP_Neoplastic": {
+    "n_positive": 7382,
+    "prevalence_pct": 8.3335,
+    "pos_weight": 10.9997,
+    "capped": false
+   },
+   "PP_Neurodegenerative": {
+    "n_positive": 16595,
+    "prevalence_pct": 18.7341,
+    "pos_weight": 4.3379,
+    "capped": false
+   },
+   "PP_Spinal": {
+    "n_positive": 1814,
+    "prevalence_pct": 2.0478,
+    "pos_weight": 20.0,
+    "capped": true
+   },
+   "PP_Cystic_developmental": {
+    "n_positive": 8353,
+    "prevalence_pct": 9.4297,
+    "pos_weight": 9.6048,
+    "capped": false
+   },
+   "PP_Infectious": {
+    "n_positive": 4349,
+    "prevalence_pct": 4.9096,
+    "pos_weight": 19.3684,
+    "capped": false
+   },
+   "PP_Inflammatory": {
+    "n_positive": 2721,
+    "prevalence_pct": 3.0717,
+    "pos_weight": 20.0,
+    "capped": true
+   },
+   "PP_Unspecific_bucket": {
+    "n_positive": 36692,
+    "prevalence_pct": 41.4215,
+    "pos_weight": 1.4142,
+    "capped": false
+   },
+   "BP_Atrophies": {
+    "n_positive": 16595,
+    "prevalence_pct": 18.7341,
+    "pos_weight": 4.3379,
+    "capped": false
+   },
+   "BP_Contrast_enhancing_intracranial": {
+    "n_positive": 7382,
+    "prevalence_pct": 8.3335,
+    "pos_weight": 10.9997,
+    "capped": false
+   },
+   "BP_Infectious_lesions": {
+    "n_positive": 4349,
+    "prevalence_pct": 4.9096,
+    "pos_weight": 19.3684,
+    "capped": false
+   },
+   "BP_Edematous_lesions": {
+    "n_positive": 7599,
+    "prevalence_pct": 8.5785,
+    "pos_weight": 10.6571,
+    "capped": false
+   },
+   "BP_Hemorrhagic_lesions": {
+    "n_positive": 6745,
+    "prevalence_pct": 7.6144,
+    "pos_weight": 12.133,
+    "capped": false
+   },
+   "BP_Cystic_lesions": {
+    "n_positive": 7768,
+    "prevalence_pct": 8.7693,
+    "pos_weight": 10.4035,
+    "capped": false
+   }
+  }
+ },
+ "constant_or_near_constant_labels": []
+}

@@ -1,0 +1,45 @@
+# A few dozen series on a small grid, for the smoke tests. Not a training configuration.
+#
+# `text.encoder: __zeros__` is a stub that emits zeros and downloads nothing. Its name goes into
+# `cache_meta.json`, so a cache built from this config is *refused* by `mrrate_ccella.yaml` --
+# a smoke cache can never be mistaken for a real one.
+
+mrrate:
+  max_repeats: 1
+  max_series_train: 64
+  max_series_val: 32
+  seed: 42
+
+volume:
+  grid: [64, 64, 64]           # divisible by 32; latent 4 x 16 x 16 x 16
+  spacing_mm: [2.0, 2.0, 2.0]  # coarse on purpose, so a smoke shard preprocesses in seconds
+  min_native_voxels: 16
+
+text:
+  encoder: __zeros__
+  hidden_size: 4096            # must equal diffusion_unet_def.input_dim
+  max_length: 512
+
+data:
+  cache_root: /hnvme/workspace/y100dc19-mrflow-final/baselines/ccella_smoke/cache
+  num_workers: 2
+
+train:
+  max_train_steps: 8
+  checkpoint_steps: [4, 8]
+  micro_batch_size: 2
+  seed: 0
+  log_every: 1
+  output_dir: /hnvme/workspace/y100dc19-mrflow-final/baselines/ccella_smoke/run
+
+validation:
+  every: 4
+  samples: 2
+  subset: 8
+  visualize: true
+  inference_steps: 2
+
+wandb:
+  mode: disabled
+  name: ccella_smoke
+  id: ccella_smoke

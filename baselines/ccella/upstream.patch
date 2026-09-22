@@ -1,0 +1,79 @@
+diff --git a/scripts/diff_model_train_all.py b/scripts/diff_model_train_all.py
+index 0a1f42a..69d1ce3 100644
+--- a/scripts/diff_model_train_all.py
++++ b/scripts/diff_model_train_all.py
+@@ -396,6 +396,7 @@ def train_one_epoch(
+     tfevents_dir: str,
+     text_class_weight: float | None,
+     text_class_loss: torch.nn.Module | None,
++    step_hook=None,
+ ) -> torch.Tensor:
+     """
+     Train the model for one epoch.
+@@ -426,7 +427,7 @@ def train_one_epoch(
+         logger.info(f"Epoch {epoch + 1}, lr {current_lr}.")
+ 
+     _iter = 0
+-    loss_torch = torch.zeros(2, dtype=torch.float, device=device)
++    loss_torch = torch.zeros(5, dtype=torch.float, device=device)
+ 
+     if not text_maisi:
+         unet.train()
+@@ -481,11 +482,12 @@ def train_one_epoch(
+                         timesteps=timesteps,
+                         spacing_tensor=spacing_tensor,
+                         text_encoding=text_encoding,
++                        modality_id=train_data["modality_id"].to(device),
+                     )
+                     if text_class_loss is not None:
+                         class_loss = text_class_loss(class_pred, pirads_tensor)
+                         isnull = train_data["text_isnull"].to(device)
+-                        isnull_unsqueeze = isnull.unsqueeze(1).repeat(1,2)
++                        isnull_unsqueeze = isnull.unsqueeze(1).repeat(1, class_loss.shape[-1])
+                         if torch.sum(1 - isnull) > 0:
+                             class_loss = torch.sum(class_loss * (1 - isnull_unsqueeze)) / torch.sum(1 - isnull)
+                         else:
+@@ -507,12 +509,13 @@ def train_one_epoch(
+                 )
+ 
+             loss = loss_pt(noise_pred.float(), noise.float())
++            diffusion_loss = loss.detach()
+             if class_loss is not None and torch.sum(1 - isnull) > 0:
+                 loss += text_class_weight * class_loss
+ 
+         scaler.scale(loss).backward()
+         scaler.unscale_(optimizer) # unscale the gradients of optimizer's assigned params in-place
+-        torch.nn.utils.clip_grad_norm_(unet.parameters(), 1)  # clip gradient
++        grad_norm = torch.nn.utils.clip_grad_norm_(unet.parameters(), 1)  # clip gradient
+         scaler.step(optimizer)
+         scaler.update()
+ 
+@@ -520,6 +523,9 @@ def train_one_epoch(
+ 
+         loss_torch[0] += loss.item()
+         loss_torch[1] += 1.0
++        loss_torch[2] += diffusion_loss.item()
++        loss_torch[3] += float(class_loss.item()) if class_loss is not None else 0.0
++        loss_torch[4] += float(isnull.sum().item()) if class_loss is not None else 0.0
+ 
+         if local_rank == 0:
+             logger.info(
+@@ -531,6 +537,18 @@ def train_one_epoch(
+             tensorboard_writer.add_scalar("lr_iter", current_lr,total_step)
+             total_step+=1
+ 
++        if step_hook is not None:
++            if step_hook({
++                "loss": loss.detach(),
++                "diffusion_loss": diffusion_loss,
++                "class_loss": class_loss.detach() if class_loss is not None else None,
++                "grad_norm": grad_norm,
++                "n_masked": int(isnull.sum().item()) if class_loss is not None else 0,
++                "batch_size": int(images.shape[0]),
++                "lr": [g["lr"] for g in optimizer.param_groups],
++            }) is False:
++                break
++
+     if dist.is_initialized():
+         dist.all_reduce(loss_torch, op=torch.distributed.ReduceOp.SUM)
+ 
