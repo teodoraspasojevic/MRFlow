@@ -200,6 +200,37 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
     return videos
 
 
+def restore_last_checkpoint(config, accelerator, ema_denoiser, lr_scheduler, logger):
+    """Reload the newest checkpoint into the running process: weights, optimizer, EMA, scheduler.
+
+    The same restore `load_checkpoint` does at startup, minus the exit. A leg that trips the
+    divergence guard used to raise so the chain's `afternotok` leg would resume from here -- which
+    costs days in the queue for a job that still has most of its 24 h left. Returns the restored
+    step.
+    """
+    dirs = [d for d in os.listdir(config.output_dir) if d.startswith("checkpoint-")]
+    if not dirs:
+        raise RuntimeError("Non-finite gradients with no checkpoint to fall back to.")
+    path = max(dirs, key=lambda d: int(d.split("-")[1]))
+
+    accelerator.load_state(os.path.join(config.output_dir, path))
+    if ema_denoiser is not None:
+        ema_tmp = ema_denoiser.__class__.from_pretrained(
+            os.path.join(config.output_dir, path, "denoiser_ema"),
+            model_cls=accelerator._models[0].__class__,
+        )
+        ema_denoiser.__dict__.update(ema_tmp.__dict__)
+        ema_denoiser.to(accelerator.device)
+
+    step = int(path.split("-")[1])
+    # The scheduler is built after prepare() and is never checkpointed, so fast-forward it by hand
+    # exactly as the startup path does, or the reload restarts warmup and the decay clock.
+    lr_scheduler.last_epoch = step - 1
+    lr_scheduler.step()
+    logger.warning(f"Reloaded {path} in place; continuing from step {step}.")
+    return step
+
+
 def main():
     print("Code starting...")
 
@@ -280,6 +311,8 @@ def main():
     infinite_loader = cycle(train_dataloader)
     skipped_steps = 0
     consecutive_skips = 0
+    recoveries = 0
+    recovery_step = 0
     progress_bar = tqdm(
         range(0, config.max_train_steps),
         initial=initial_global_step,
@@ -364,16 +397,46 @@ def main():
                     f"Non-finite grad norm at step {global_step}; update skipped "
                     f"({consecutive_skips} in a row, {skipped_steps} total)."
                 )
-                # Every rank sees the same all-reduced norm, so they all skip together. Skipping
-                # forever means the weights themselves are nan: die so the chain's afternotok leg
-                # resumes from the last good checkpoint instead of burning the rest of the budget.
+                # Every rank sees the same all-reduced norm, so they all skip together. A skip
+                # freezes the weights, so when the weight state itself is what overflows, skipping
+                # can never clear it -- measured, the skips then run until the guard fires. Reload
+                # the last checkpoint in place rather than exiting: the state that blew up is the
+                # only thing that has to go, and keeping the allocation saves the queue wait the
+                # chain's afternotok leg would otherwise cost.
                 if consecutive_skips >= config.get("max_consecutive_skipped_steps", 25):
-                    raise RuntimeError(
+                    recoveries += 1
+                    max_recoveries = config.get("max_recoveries", 3)
+                    if recoveries > max_recoveries:
+                        raise RuntimeError(
+                            f"{consecutive_skips} consecutive non-finite gradients at step "
+                            f"{global_step}, {recoveries - 1} reloads deep -- the model is dead."
+                        )
+                    logger.warning(
                         f"{consecutive_skips} consecutive non-finite gradients at step "
-                        f"{global_step} -- the model has diverged."
+                        f"{global_step}; reload {recoveries} of {max_recoveries}."
                     )
+                    global_step = restore_last_checkpoint(
+                        config, accelerator, ema_denoiser, lr_scheduler, logger
+                    )
+                    # A checkpoint carries the RNG and sampler state that led into the blow-up, so
+                    # a plain reload would replay straight back into it. Reseed to take a different
+                    # draw; every rank reseeds identically, as at startup.
+                    set_seed(config.seed + 1000 * recoveries)
+                    recovery_step = global_step
+                    consecutive_skips = 0
+                    infinite_loader = cycle(train_dataloader)
+                    optimizer.zero_grad(set_to_none=True)
+                    progress_bar.reset()
+                    progress_bar.update(global_step)
+                    torch.cuda.empty_cache()
+                    continue
             elif accelerator.sync_gradients:
                 consecutive_skips = 0
+                # A reload that carried the run a whole checkpoint interval past the blow-up
+                # worked. Refill the budget, so unrelated spikes hours apart cannot add up to a
+                # kill while the run is plainly training.
+                if recoveries and global_step - recovery_step >= config.checkpointing_steps:
+                    recoveries = 0
 
             logs = {
                 "step_loss": loss.detach().item(),
@@ -392,6 +455,7 @@ def main():
                         "lr": lr_scheduler.get_last_lr()[0],
                         "grad_norm": grad_norm.item(),
                         "skipped_steps": skipped_steps,
+                        "recoveries": recoveries,
                         "mean_latent": videos.mean().item(),
                         "std_latent": videos.std().item(),
                         # Realized rates, so a mis-specified condition_states block is visible.
