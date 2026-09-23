@@ -3,7 +3,8 @@
 #SBATCH --partition=h200
 #SBATCH --gres=gpu:h200:1
 #SBATCH --time=12:00:00
-#SBATCH --output=%x-%A_%a.out
+#SBATCH --requeue
+#SBATCH --output=/hnvme/workspace/y100dc19-mrflow-final/baselines/ccella_runs/logs/%x-%A_%a.out
 #
 # MR-RATE -> the CCELLA zip cache. One array task per shard.
 #
@@ -23,7 +24,13 @@ CONFIG="${1:?usage: preprocess.sh <config.yaml> <split> [extra args...]}"
 SPLIT="${2:?usage: preprocess.sh <config.yaml> <split> [extra args...]}"
 shift 2
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# sbatch runs a spooled copy of this script, so BASH_SOURCE does not point into the repo.
+# SLURM_SUBMIT_DIR is where `sbatch` was invoked, which the documented usage says is the repo root.
+REPO="${MRFLOW_REPO:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}}"
+if [ ! -d "$REPO/baselines/ccella" ]; then
+    echo "cannot locate the MRFlow repo (tried '$REPO'). Submit from the repo root, or set MRFLOW_REPO." >&2
+    exit 2
+fi
 source /hnvme/workspace/y100dc19-mrflow-final/venv/bin/activate
 cd "$REPO"
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"

@@ -627,3 +627,24 @@ def test_the_validation_subset_is_deterministic_and_rank_independent(tmp_path):
     assert len(first) == 4
     assert first == sorted(first, key=lambda r: r["sample_id"])
     _ = rows
+
+
+def test_shards_partition_by_study_so_a_report_is_encoded_once():
+    """A study's series must not be split across shards.
+
+    `list_series` shuffles series, so slicing that list directly scatters a study's ~7 series over
+    every shard and `ShardStore`'s per-shard dedup stops working: measured on the train split that
+    is 543,917 report encodes against 82,150 distinct studies, i.e. 2.28 TB instead of 336 GB.
+    """
+    from baselines.ccella.prepare_data import shard_slice
+
+    series = [{"study_uid": f"S{i // 7}", "series_id": f"x{i}"} for i in range(700)]
+    seen, total = set(), 0
+    for shard in range(8):
+        rows = shard_slice(series, shard, 8)
+        total += len(rows)
+        studies = {r["study_uid"] for r in rows}
+        assert not (studies & seen), "a study was split across two shards"
+        seen |= studies
+    assert total == len(series), "sharding lost or duplicated series"
+    assert len(seen) == 100, "every study must land in exactly one shard"

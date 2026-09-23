@@ -13,7 +13,7 @@ mrrate:
 volume:
   grid: [64, 64, 64]           # divisible by 32; latent 4 x 16 x 16 x 16
   spacing_mm: [2.0, 2.0, 2.0]  # coarse on purpose, so a smoke shard preprocesses in seconds
-  min_native_voxels: 16
+  min_extent_voxels: 16
 
 text:
   encoder: __zeros__

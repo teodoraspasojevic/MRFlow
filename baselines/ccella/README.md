@@ -90,7 +90,7 @@ three values** changed:
 | D1 | binary PI-RADS, softmax + `FocalLoss(alpha=0.75, use_softmax=True)` | 14 non-exclusive groups, `BCEWithLogitsLoss(pos_weight, reduction="none")` | 41.4% of train studies carry `PP_Unspecific_bucket` and 18.7% `PP_Neurodegenerative`, often together, up to 11 at once. A softmax forces a simplex and turns "which ones" into "which one". Unreduced output keeps upstream's masking lines and its `sum over classes / n_unmasked` reduction working verbatim. |
 | D2 | `pirads` multiplied by `1e2` in the dataloader | the **target** is left at 0/1; `spacing` keeps the `* 1e2` | a BCE target must lie in `[0, 1]`. Upstream's scale is harmless on a softmax cross-entropy target (it just multiplies the term by 100) but is undefined for BCE. The *conditioning* vector keeps the `* 1e2` scale, so the U-Net's input distribution is unchanged. |
 | D3 | `text_class_pred_weight = 1e-4` against a 2-class target scaled by 100 | **unchanged at 1e-4**, against 14 unscaled BCE terms | not tuned, and deliberately not tuned on any split. The two effective magnitudes land within about 2x of each other: upstream ≈ `1e-4 x 100 x 2 x focal(~0.1)` ≈ 1e-3 per sample, here ≈ `1e-4 x 14 x BCE(~0.3)` ≈ 4e-4. Both losses are logged separately so the actual ratio is visible in W&B. |
-| D4 | volumes already resampled to a fixed size outside the pipeline | trilinear to 1 mm isotropic + centred crop/pad to `192 x 224 x 192` | MR-RATE ships native-space volumes in tars; upstream's README states the fixed size as a precondition, so for this dataset it has to be made explicit. |
+| D4 | volumes already resampled to a fixed size outside the pipeline | trilinear to 1 mm isotropic + centred crop/pad to `256 x 256 x 224` | MR-RATE ships native-space volumes in tars; upstream's README states the fixed size as a precondition, so for this dataset it has to be made explicit. |
 | D5 | per-case voxel size as the `spacing` condition | the **native acquisition** spacing | ours is fixed at 1 mm by construction and would carry no information; native spacing is what varies and what says a 5 mm-slice acquisition stays blurred through-plane. |
 | D6 | one `.nii.gz` per latent, one `.npy` per report, in a directory tree | zip shards | 575,328 series is over half a million inodes against an 81,000 hard limit on `/hnvme`. |
 | D7 | latents and embeddings stored fp32 | stored fp16, cast to float on load | halves ~1 TB to ~0.5 TB. FLAN-T5 hidden states and MAISI latents both sit well inside fp16 range. |
@@ -245,6 +245,7 @@ tokens (median 327, p95 613) and are truncated head-first, upstream's `truncatio
 ```
 tar member -> nib.as_closest_canonical (== Orientationd axcodes="RAS")
            -> trilinear to 1 mm isotropic                     [D4]
+           -> guard: any resampled axis < 32 voxels -> skip    (AFTER the resample, see below)
            -> centred crop/pad to 256 x 256 x 224             [D4]
            -> ScaleIntensityRangePercentiles(0, 99.5, b_min=0, b_max=1, clip=True)   (upstream's)
            -> autoencoder.encode_stage_2_inputs               (upstream's, frozen MAISI)
@@ -256,6 +257,11 @@ tar member -> nib.as_closest_canonical (== Orientationd axcodes="RAS")
 - Padding is zero and happens before the percentile scaling, as it must, since upstream also scales
   over its own already-cropped fixed-size volume. With `lower=0` the low anchor is the minimum,
   which background already is.
+- **The short-volume guard runs *after* the resample, never before.** A 26-slice axial stack at
+  6 mm is 156 mm of anatomy and is perfectly usable; judging it on its native slice count discards
+  ~a third of MR-RATE (measured: 30-38% of series rejected). On the 1 mm grid `min_extent_voxels`
+  is therefore also a threshold in millimetres, and it matches MRFlow's `mri.preprocess.min_slices`.
+  With the guard in the right place, **0 of 2,000 val series are skipped**.
 - **The grid was chosen by measurement, not by analogy.** Brain-mask bounding boxes over 400
   sampled train series give a brain extent of (p95 / max) 150 / 176 mm L-R, 174 / 256 mm P-A and
   147 / 256 mm I-S, with the brain centre offset from the FOV centre by -21..0 mm P-A (MR-RATE is
@@ -311,6 +317,13 @@ manifest**.
   member's bytes contiguous so a read is one seek.
 - Reports are per study because a FLAN-T5-XXL hidden state is 4.19 MB and MR-RATE averages ~7
   series per study: per-series would cost 2.3 TB instead of 344 GB.
+- **Shards are split by study, not by series**, and that is what makes the point above true.
+  `list_series` shuffles series, so slicing that list directly scatters a study's ~7 series over
+  every shard and the per-shard dedup stops working -- measured on the train split, 64 contiguous
+  series slices touch **543,917** studies between them against **82,150** distinct ones, i.e. 6.6x
+  the FLAN-T5 forwards and **2.28 TB** of embeddings instead of 336 GB. `shard_slice` groups first,
+  which keeps the determinism and the mixing at the cost of unequal series counts per shard
+  (measured 4,304 / 9,345 / 10,828 min / median / max).
 - **The fingerprint** records the upstream commit, the volume block, the text/tokenizer block, the
   autoencoder sha256, the latent channel count, the label source id, the **label order** and the
   sha256 of the label CSV. `check_cache_meta` names every differing key and refuses to train; a

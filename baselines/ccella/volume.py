@@ -113,9 +113,15 @@ def preprocess_volume(nii_bytes, config):
     """MR-RATE NIfTI bytes -> (volume on the fixed grid in `[0, 1]`, native spacing in mm)."""
     spec = config["volume"]
     volume, spacing = read_ras(nii_bytes)
-    if min(volume.shape) < spec["min_native_voxels"]:
-        raise VolumeUnusable(f"native shape {volume.shape} is below min_native_voxels")
     volume = resample_isotropic(volume, spacing, spec["spacing_mm"])
+    # **After** the resample, never before. A 26-slice axial stack at 6 mm is 156 mm of anatomy and
+    # is perfectly usable; judging it on its native slice count would throw away a third of MR-RATE.
+    # On the 1 mm grid this threshold is therefore also a threshold in millimetres, and it matches
+    # MRFlow's own `mri.preprocess.min_slices`.
+    if min(volume.shape) < spec["min_extent_voxels"]:
+        raise VolumeUnusable(
+            f"resampled shape {volume.shape} has an axis below min_extent_voxels "
+            f"{spec['min_extent_voxels']} (native {[round(v, 2) for v in spacing]} mm)")
     volume = crop_pad(volume, spec["grid"])
     if not np.isfinite(volume).all():
         raise VolumeUnusable("non-finite voxels after resampling")

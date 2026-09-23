@@ -56,7 +56,10 @@ DEFAULTS = {
         "percentile_lower": 0.0,      # upstream: lower=0
         "percentile_upper": 99.5,     # upstream: upper=99.5
         "clip": True,
-        "min_native_voxels": 32,
+        # Applied AFTER the resample, so on the 1 mm grid it is also a threshold in mm. Matches
+        # MRFlow's `mri.preprocess.min_slices`. Judging a volume on its NATIVE slice count instead
+        # discards ~a third of MR-RATE, because a 26-slice 6 mm stack is 156 mm of anatomy.
+        "min_extent_voxels": 32,
     },
 
     "text": {

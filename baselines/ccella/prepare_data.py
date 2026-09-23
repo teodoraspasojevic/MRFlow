@@ -30,8 +30,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -82,9 +84,23 @@ def build_encoder(config, device):
 
 
 def shard_slice(items, shard, num_shards):
-    """Contiguous slice. `list_series` already shuffled deterministically, so every task is mixed."""
-    per = (len(items) + num_shards - 1) // num_shards
-    return items[shard * per:(shard + 1) * per]
+    """Split by **study**, not by series, so a report is encoded and stored exactly once.
+
+    `list_series` shuffles series deterministically, which scatters a study's ~7 series across every
+    shard. Slicing that list directly would make `ShardStore`'s per-shard report dedup almost
+    useless: measured on the train split, 64 contiguous series slices touch 543,917 studies between
+    them against 82,150 distinct ones -- 6.6x the FLAN-T5 forwards and 2.28 TB of report embeddings
+    instead of 336 GB.
+
+    Grouping first keeps the determinism (study order follows the shuffled series order) and keeps
+    the shards mixed, at the cost of shards no longer holding exactly equal series counts.
+    """
+    by_study = OrderedDict()
+    for item in items:
+        by_study.setdefault(item["study_uid"], []).append(item)
+    studies = list(by_study)
+    per = (len(studies) + num_shards - 1) // num_shards
+    return [item for study in studies[shard * per:(shard + 1) * per] for item in by_study[study]]
 
 
 def prepare_shard(config, split, shard, num_shards, limit=None, overwrite=False):
@@ -110,6 +126,15 @@ def prepare_shard(config, split, shard, num_shards, limit=None, overwrite=False)
 
     autoencoder = build_autoencoder(config, device)
     encode_text, tok_settings = build_encoder(config, device)
+
+    # Slurm sends SIGTERM before SIGKILL when a preempt-partition job is evicted. Turning it into
+    # SystemExit lets the `except BaseException` below run `store.abort()`, so an evicted task
+    # removes its own half-written archives instead of leaving ~13 GB of `.tmp` behind.
+    def _abort_on_signal(signum, _frame):
+        raise SystemExit(f"signal {signum} (preemption?): aborting this shard")
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _abort_on_signal)
 
     store = ShardStore(cache_root, split, shard)
     rows, skipped, masked, reports = [], 0, 0, {}
