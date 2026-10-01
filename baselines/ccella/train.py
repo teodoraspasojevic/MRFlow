@@ -241,6 +241,9 @@ class Trainer:
 
         if self.global_step in self.checkpoint_steps:
             self.save_checkpoint()
+        elif (self.config["train"]["rolling_checkpoint_every"]
+              and self.global_step % self.config["train"]["rolling_checkpoint_every"] == 0):
+            self.save_rolling_checkpoint()
 
         return self.global_step < self.max_steps
 
@@ -251,8 +254,11 @@ class Trainer:
     def _validate(self):
         from .validate import run_validation
 
+        # Scoring every `validation.every`; the video only every `visualize_every`, because it
+        # costs a full 1000-step sampling chain (~200 s) and MONAI's DDPM cannot be strided.
+        visualize = self.global_step % self.config["validation"]["visualize_every"] == 0
         try:
-            metrics, media = run_validation(self)
+            metrics, media = run_validation(self, visualize=visualize)
         except Exception as exc:                      # validation is monitoring, never fatal
             self.logger.warning("validation failed at step %d: %s", self.global_step, exc)
             return
@@ -266,11 +272,11 @@ class Trainer:
     def _path(self, step):
         return os.path.join(self.output_dir, f"checkpoint-{step}.pt")
 
-    def save_checkpoint(self):
+    def save_checkpoint(self, path=None, overwrite=False):
         if not self.is_main:
             return
-        path = self._path(self.global_step)
-        if os.path.exists(path) and not self.args.overwrite_checkpoints:
+        path = path or self._path(self.global_step)
+        if os.path.exists(path) and not (overwrite or self.args.overwrite_checkpoints):
             raise FileExistsError(
                 f"{path} already exists. Refusing to overwrite a checkpoint: pass "
                 f"--overwrite_checkpoints if that is really what you want.")
@@ -295,10 +301,30 @@ class Trainer:
         os.replace(tmp, path)
         self.logger.info("saved %s", path)
 
+    def save_rolling_checkpoint(self):
+        """Crash recovery only. Named with its step so `latest` needs no file read, and the previous
+        one is removed, so this costs one checkpoint of disk rather than sixty."""
+        if not self.is_main:
+            return
+        import glob
+
+        previous = glob.glob(os.path.join(self.output_dir, "checkpoint-latest-*.pt"))
+        self.save_checkpoint(path=os.path.join(
+            self.output_dir, f"checkpoint-latest-{self.global_step}.pt"), overwrite=True)
+        for old_path in previous:
+            os.remove(old_path)
+
     def _maybe_resume(self):
         target = self.args.resume
         if not target:
             return
+        if target != "latest" and not os.path.exists(target):
+            # `--resume` takes an optional value, so `--resume train.max_train_steps=120` silently
+            # reads that override as a checkpoint path. Fail loudly instead.
+            raise FileNotFoundError(
+                f"--resume was given {target!r}, which is neither 'latest' nor an existing "
+                f"checkpoint. Note --resume takes an OPTIONAL value: put it last, or write "
+                f"--resume=latest, so a following --set override is not swallowed as its value.")
         path = target if target != "latest" else _latest_checkpoint(self.output_dir)
         if path is None:
             self.logger.info("no checkpoint to resume from; starting at step 0")
@@ -331,11 +357,18 @@ class Trainer:
 
 
 def _latest_checkpoint(output_dir):
-    steps = []
+    """The furthest-along checkpoint, retained or rolling. Both carry their step in the name, so
+    this needs no file read."""
+    best = None
     for name in os.listdir(output_dir) if os.path.isdir(output_dir) else []:
-        if name.startswith("checkpoint-") and name.endswith(".pt"):
-            steps.append(int(name[len("checkpoint-"):-len(".pt")]))
-    return os.path.join(output_dir, f"checkpoint-{max(steps)}.pt") if steps else None
+        if not (name.startswith("checkpoint-") and name.endswith(".pt")):
+            continue
+        stem = name[len("checkpoint-"):-len(".pt")].removeprefix("latest-")
+        if not stem.isdigit():
+            continue
+        if best is None or int(stem) > best[0]:
+            best = (int(stem), os.path.join(output_dir, name))
+    return best[1] if best else None
 
 
 def _train_study_uids(config):
@@ -356,7 +389,10 @@ def main():
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--limit", type=int, default=None, help="cap the training rows (smoke only)")
     parser.add_argument("--overwrite_checkpoints", action="store_true")
-    parser.add_argument("--set", nargs="*", default=[], dest="overrides")
+    # nargs="*" is greedy, so --set MUST come last: anything after it is read as another override
+    # and the following flag loses its value.
+    parser.add_argument("--set", nargs="*", default=[], dest="overrides",
+                        metavar="KEY=VALUE", help="dotted config overrides; must be the LAST flag")
     args = parser.parse_args()
 
     config = load_config(args.config, args.overrides)

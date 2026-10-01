@@ -48,9 +48,22 @@ model:
   text_class_pred_weight: 1.0e-4      # upstream's lambda, unchanged -- see the README
 
 train:
-  max_train_steps: 60000
-  checkpoint_steps: [20000, 40000, 50000, 55000, 60000]
-  micro_batch_size: 4
+  max_train_steps: 150000
+  checkpoint_steps: [20000, 40000, 60000, 80000, 100000, 120000, 140000, 145000, 150000]
+  # 16 x 8 GPUs = effective batch 128. MRFlow's own fine-tune and baselines/text2ct are pinned at
+  # 60,000 updates at that batch; this run goes to 150,000 (33.4 epochs) deliberately. Training a
+  # baseline *longer* than the model it is a baseline for is the safe direction -- it cannot be
+  # read as handicapping it -- and the checkpoint is selected on val, never on test.
+  # There is no gradient accumulation here --
+  # upstream's train_one_epoch steps the optimizer every iteration -- so the micro batch IS the
+  # per-GPU batch and this number is what sets the effective one.
+  #
+  # Measured on one h200 at latent 4 x 64 x 64 x 56 (job 894895):
+  #    bs  4: 167 ms/step  23.9 vol/s  22.6 GiB   ->  eff 32,  2.8 h
+  #    bs  8: 273 ms/step  29.4 vol/s  37.5 GiB   ->  eff 64,  4.5 h
+  #    bs 16: 495 ms/step  32.3 vol/s  67.3 GiB   ->  eff 128, 8.3 h   <-- throughput saturates here
+  #    bs 24: 746 ms/step  32.2 vol/s  97.1 GiB   ->  eff 192, 12.4 h
+  micro_batch_size: 16
   lr: 1.0e-4                          # upstream's
   num_train_timesteps: 1000           # upstream's DDPM schedule
   seed: 42
@@ -58,14 +71,24 @@ train:
   output_dir: /hnvme/workspace/y100dc19-mrflow-final/baselines/ccella_runs/ccella_mrrate
 
 validation:
-  every: 2500                         # divides every checkpoint interval (20k/10k/5k)
+  every: 2500                         # scoring: losses, AUROC/AP, per-label table
+  visualize_every: 10000              # the preview video: one full sampling chain, ~200 s
   samples: 4
   subset: 256
   visualize: true
-  inference_steps: 50                 # preview only; a scored rollout uses upstream's 1000
+  # MUST equal train.num_train_timesteps -- MONAI's DDPMScheduler.step uses
+  # alphas_cumprod[timestep - 1], so it removes exactly one timestep of noise per call. A strided
+  # set_timesteps(50) advances the announced timestep by 20 each call, so after 50 calls ~95% of
+  # the noise is still there and the preview decodes to pure noise. Upstream says 1000 for this
+  # same reason. config.validate now refuses anything else.
+  inference_steps: 1000
 
 wandb:
   project: MRFlow
   group: baselines
   name: ccella_mrrate
-  id: ccella_mrrate
+  # A W&B id can never be reused once its run has been DELETED -- wandb.init then fails with
+  # "run <id> was previously created and deleted; try a new run id". So bump the suffix rather
+  # than deleting a run, and give any smoke run its own id (`--set wandb.id=ccella_smoke`) so it
+  # cannot claim this one.
+  id: ccella_mrrate_v1

@@ -8,8 +8,11 @@
 #
 # MR-RATE -> the CCELLA zip cache. One array task per shard.
 #
-#   sbatch --array=0-3  baselines/ccella/slurm/preprocess.sh <config> val
-#   sbatch --array=0-63 baselines/ccella/slurm/preprocess.sh <config> train
+#   NUM_SHARDS=4  sbatch --array=0-3  baselines/ccella/slurm/preprocess.sh <config> val
+#   NUM_SHARDS=64 sbatch --array=0-63 baselines/ccella/slurm/preprocess.sh <config> train
+#
+# To redo a subset, keep NUM_SHARDS identical and list only the shard ids:
+#   NUM_SHARDS=64 sbatch --array=0-11,15-17 baselines/ccella/slurm/preprocess.sh <config> train
 #
 # Let task 0 finish before training: it writes cache_meta.json, and train.py refuses a cache
 # without one. Anything after the split is passed through to prepare_data.py, so --limit and
@@ -35,9 +38,14 @@ source /hnvme/workspace/y100dc19-mrflow-final/venv/bin/activate
 cd "$REPO"
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 
+# NUM_SHARDS is a CONSTANT of the cache, never SLURM_ARRAY_TASK_COUNT. `shard_slice` partitions the
+# study list into exactly this many pieces, so a recovery array that re-runs a subset of shards must
+# use the SAME value -- deriving it from the array's own size silently re-partitions the dataset and
+# produces overlapping shards. (That happened once: a 34-element recovery array rewrote shard 12 as a
+# 1/34 slice, duplicating 13,621 series against shards 22 and 23.)
 python -m baselines.ccella.prepare_data \
     --config "$CONFIG" \
     --split "$SPLIT" \
     --shard "${SLURM_ARRAY_TASK_ID:-0}" \
-    --num_shards "${SLURM_ARRAY_TASK_COUNT:-1}" \
+    --num_shards "${NUM_SHARDS:-64}" \
     "$@"

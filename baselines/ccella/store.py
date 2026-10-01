@@ -221,6 +221,15 @@ def cache_meta(config, label_fingerprint, autoencoder_sha, tokenizer_settings):
     }
 
 
+def read_cache_meta(cache_root):
+    """`cache_meta.json` if it exists, else None."""
+    path = os.path.join(cache_root, CACHE_META_NAME)
+    if not os.path.exists(path):
+        return None
+    with open(path) as handle:
+        return json.load(handle)
+
+
 def write_cache_meta(cache_root, meta):
     os.makedirs(cache_root, exist_ok=True)
     path = os.path.join(cache_root, CACHE_META_NAME)

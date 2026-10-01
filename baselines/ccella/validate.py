@@ -115,12 +115,16 @@ def sample_volumes(trainer, rows, autoencoder):
 
     scheduler = trainer.noise_scheduler
     scheduler.set_timesteps(num_inference_steps=config["validation"]["inference_steps"])
-    trainer.model.eval()
+    # The preview runs on rank 0 only, so it must call the *unwrapped* module: a DDP forward can
+    # enter a collective (buffer broadcast) that the other ranks are not in. This model happens to
+    # have no buffers, so today it is a no-op -- but the hazard is one added buffer away.
+    net = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+    net.eval()
     class_pred = None
     with torch.amp.autocast("cuda", enabled=trainer.device.type == "cuda"):
         for t in scheduler.timesteps:
             timesteps = torch.full((len(batch),), float(t), device=trainer.device)
-            model_output, class_pred = trainer.model(
+            model_output, class_pred = net(
                 x=image, timesteps=timesteps, spacing_tensor=spacing,
                 text_encoding=text, modality_id=modality)
             image, _ = scheduler.step(model_output, t, image)
@@ -128,7 +132,7 @@ def sample_volumes(trainer, rows, autoencoder):
         generated = torch.clip(recon(image, scale_factor=trainer.scale_factor), 0.0, 1.0)
         truth = torch.clip(recon(reference * trainer.scale_factor,
                                  scale_factor=trainer.scale_factor), 0.0, 1.0)
-    trainer.model.train()
+    net.train()
     scheduler.set_timesteps(num_inference_steps=config["train"]["num_train_timesteps"])
     return truth, generated, torch.sigmoid(class_pred.float()).cpu().numpy()
 
@@ -167,7 +171,7 @@ def preview_video(trainer, rows, autoencoder):
                                       fps=trainer.config["validation"]["fps"], format="mp4")}
 
 
-def run_validation(trainer):
+def run_validation(trainer, visualize=True):
     """`(scalar metrics, media)` for one validation pass. Called only from `Trainer._validate`."""
     config = trainer.config
     rows = fixed_validation_subset(config, "val")
@@ -190,7 +194,7 @@ def run_validation(trainer):
         payload[f"val/prevalence/{name}"] = entry["prevalence"]
 
     media = None
-    if config["validation"]["visualize"] and trainer.is_main:
+    if visualize and config["validation"]["visualize"] and trainer.is_main:
         from .volume import build_autoencoder
 
         autoencoder = build_autoencoder(config, trainer.device)

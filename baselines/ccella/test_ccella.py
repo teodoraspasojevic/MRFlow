@@ -477,9 +477,16 @@ def test_a_cache_with_no_fingerprint_is_refused(tmp_path):
 
 ### Configuration and the checkpoint schedule #########################################################
 
-def test_the_sixty_thousand_step_schedule_is_the_specified_one():
-    steps = load_config(RUN_CONFIG)["train"]["checkpoint_steps"]
-    assert steps == [20000, 40000, 50000, 55000, 60000]
+def test_the_configured_run_uses_the_specified_hundred_and_fifty_thousand_step_schedule():
+    config = load_config(RUN_CONFIG)
+    assert config["train"]["max_train_steps"] == 150000
+    assert config["train"]["checkpoint_steps"] == [
+        20000, 40000, 60000, 80000, 100000, 120000, 140000, 145000, 150000]
+
+
+def test_the_sixty_thousand_step_schedule_still_validates():
+    steps = [20000, 40000, 50000, 55000, 60000]
+    assert validate_checkpoint_steps(steps, 60000) == steps
 
 
 def test_the_hundred_and_twenty_thousand_step_schedule_validates():
@@ -648,3 +655,26 @@ def test_shards_partition_by_study_so_a_report_is_encoded_once():
         seen |= studies
     assert total == len(series), "sharding lost or duplicated series"
     assert len(seen) == 100, "every study must land in exactly one shard"
+
+
+def test_a_strided_ddpm_preview_is_refused(tmp_path):
+    """MONAI's DDPMScheduler.step uses `alphas_cumprod[timestep - 1]`, so it removes exactly one
+    timestep of noise per call. `set_timesteps(50)` advances the announced timestep by 20 each
+    call, leaving ~95% of the noise in place -- the preview then decodes to noise. The only valid
+    setting is the full chain, which is what upstream's own config uses."""
+    path = tmp_path / "strided.yaml"
+    path.write_text("validation:\n  inference_steps: 50\n")
+    with pytest.raises(ConfigError, match="must equal train.num_train_timesteps"):
+        load_config(str(path))
+
+
+def test_the_preview_cadence_is_a_multiple_of_the_scoring_cadence(tmp_path):
+    config = load_config(RUN_CONFIG)
+    assert config["validation"]["visualize_every"] == 10000
+    assert config["validation"]["visualize_every"] % config["validation"]["every"] == 0
+    assert config["validation"]["inference_steps"] == config["train"]["num_train_timesteps"]
+
+    path = tmp_path / "bad.yaml"
+    path.write_text("validation:\n  visualize_every: 3000\n")
+    with pytest.raises(ConfigError, match="multiple of"):
+        load_config(str(path))

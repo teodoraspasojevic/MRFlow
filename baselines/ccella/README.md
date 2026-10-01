@@ -426,14 +426,50 @@ python -m baselines.ccella.prepare_data --config baselines/ccella/configs/mrrate
 
 A shard whose manifest exists is skipped; `--overwrite` redoes it, `--limit N` caps it.
 
-### Train
+### Verify, then train
+
+**`verify_cache.py` is the gate and `train.sh` runs it automatically** (skip with `SKIP_VERIFY=1`).
+Nothing else notices an incomplete cache: the dataset globs whatever manifests exist, so 58 of 64
+shards would train quietly on 90% of the data.
 
 ```bash
+python -m baselines.ccella.verify_cache --config baselines/ccella/configs/mrrate_ccella.yaml \
+    --split train --num_shards 64
+#   575,328 distinct series across 64/64 shards (the split holds 575,328)
+#   128 archives opened, all members present
+#   1,157 series have no label row and are masked out of the classification loss
+#   OK -- train cache is a complete, non-overlapping partition
+
 sbatch baselines/ccella/slurm/train.sh baselines/ccella/configs/mrrate_ccella.yaml
 
 # single GPU, no W&B
 python -m baselines.ccella.train --config baselines/ccella/configs/mrrate_ccella.yaml --no_wandb
 ```
+
+**Compute, measured on one h200 at latent `4 x 64 x 64 x 56`** (the real grid, not the smoke one):
+
+| per-GPU batch | ms/step | vol/s | peak | 8 GPUs -> effective batch | 60k steps |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 167 | 23.9 | 22.6 GiB | 32 | 2.8 h |
+| 8 | 273 | 29.4 | 37.5 GiB | 64 | 4.5 h |
+| **16** | **495** | **32.3** | **67.3 GiB** | **128** | **8.3 h** |
+| 24 | 746 | 32.2 | 97.1 GiB | 192 | 12.4 h |
+
+`micro_batch_size: 16` is the configured value: it is the smallest that reaches an **effective
+batch of 128**, and throughput has saturated by then (32.3 of a ceiling 32.3 vol/s). **There is no
+gradient accumulation** -- upstream's `train_one_epoch` steps the optimizer every iteration -- so
+the per-GPU batch *is* what sets the effective one.
+
+**h200 nodes have 4 GPUs, not 8** (`gpu:h200:4`, 128 CPUs), so 8 GPUs is `--nodes=2`. Asking for
+`--gres=gpu:h200:8 --nodes=1` is rejected at submit. `train.sh` defaults to 2 nodes and re-execs
+itself under `srun`, deriving torchrun's `--node_rank` from `SLURM_NODEID` -- the same shape as
+`slurms/mrflow_train_helma.sh`. It also exports the site proxy, without which `wandb.init` hangs
+90 s on a compute node and kills the run.
+
+The configured run is **150,000 steps x 128 = 19.2 M samples = 33.4 epochs**, about 21-25 h of
+wall clock, so expect one resume against the 24 h limit. MRFlow and `baselines/text2ct` are pinned
+at 60,000 updates; going longer here is deliberate -- training a baseline *longer* than the model
+it is a baseline for cannot be read as handicapping it, and the checkpoint is selected on val.
 
 ### Resume
 
@@ -502,8 +538,14 @@ pathology probabilities and the true labels — **never report text, patient id 
 A label with no positives (or no negatives) in the subset is reported as undefined and left out of
 the macro average, and `val/n_labels_scored` says how many survived.
 
-**Checkpoints** at exactly the configured global steps — `[20000, 40000, 50000, 55000, 60000]` for a
-60k run, `[20000, 40000, 60000, 80000, 100000, 110000, 120000]` for 120k. `validate_checkpoint_steps`
+**Checkpoints** at exactly the configured global steps. The configured run is **150,000 steps** with
+`[20000, 40000, 60000, 80000, 100000, 120000, 140000, 145000, 150000]`; `[20000, 40000, 50000,
+55000, 60000]` (60k) and `[20000, 40000, 60000, 80000, 100000, 110000, 120000]` (120k) also
+validate. Alongside them a **rolling `checkpoint-latest-<step>.pt`** is written every
+`rolling_checkpoint_every` (2,500) steps and the previous one deleted — crash recovery only, not
+part of the retained set. It exists because `h200`'s `MaxTime` is 24 h while a 150k-step run is
+~21–25 h: without it a job killed at the wall clock resumes up to 20,000 steps back (~3 h redone).
+`--resume` picks whichever checkpoint is furthest along, retained or rolling. `validate_checkpoint_steps`
 requires strictly increasing, positive, inside the run, and ending on the final step; a nonstandard
 `max_train_steps` needs an explicit schedule rather than a guessed one. Each checkpoint holds the
 full model (U-Net + ELLA + the 14-label heads + the modality embedding), optimizer, scheduler, AMP

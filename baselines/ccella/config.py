@@ -100,17 +100,29 @@ DEFAULTS = {
         "micro_batch_size": 4,
         "lr": 1.0e-4,
         "num_train_timesteps": 1000,
+        # A rolling crash-recovery checkpoint, written every N steps to `checkpoint-latest-<step>.pt`
+        # with the previous one deleted. It is NOT part of `checkpoint_steps`, which stays the
+        # retained schedule. It exists because h200's MaxTime is 24 h while a 150k-step run is
+        # ~21-25 h: without it, a job killed at the wall clock resumes from a retained checkpoint up
+        # to 20,000 steps back, i.e. ~3 h redone. 0 disables it.
+        "rolling_checkpoint_every": 2500,
         "seed": 42,
         "log_every": 10,
         "output_dir": "/hnvme/workspace/y100dc19-mrflow-final/baselines/ccella_runs/ccella_mrrate",
     },
 
     "validation": {
-        "every": 2500,
+        "every": 2500,               # scoring: losses, AUROC/AP, per-label table
+        "visualize_every": 10000,    # the preview video, which costs a full sampling chain
         "samples": 4,
         "subset": 256,
         "visualize": True,
-        "inference_steps": 50,
+        # MUST equal train.num_train_timesteps. MONAI's DDPMScheduler.step hardcodes
+        # `alphas_cumprod[timestep - 1]`, so it only ever removes ONE timestep of noise per call
+        # while a strided `set_timesteps(n)` advances the announced timestep by 1000/n. At n=50
+        # that leaves ~95% of the noise in place and the preview decodes to noise. Upstream's own
+        # config says 1000 for exactly this reason.
+        "inference_steps": 1000,
         "fps": 16,
     },
 
@@ -175,6 +187,18 @@ def validate(config):
     every = config["validation"]["every"]
     if every <= 0:
         raise ConfigError("validation.every must be positive")
+    visualize_every = config["validation"]["visualize_every"]
+    if visualize_every <= 0 or visualize_every % every:
+        raise ConfigError(
+            f"validation.visualize_every ({visualize_every}) must be a positive multiple of "
+            f"validation.every ({every}); the preview is produced by a scoring pass")
+    steps = config["validation"]["inference_steps"]
+    if steps != config["train"]["num_train_timesteps"]:
+        raise ConfigError(
+            f"validation.inference_steps ({steps}) must equal train.num_train_timesteps "
+            f"({config['train']['num_train_timesteps']}). MONAI's DDPMScheduler.step uses "
+            f"alphas_cumprod[timestep - 1], so it removes one timestep of noise per call; a "
+            f"strided chain leaves most of the noise in and the preview decodes to noise.")
     if config["wandb"]["mode"] not in ("online", "offline", "disabled"):
         raise ConfigError(f"unknown wandb.mode {config['wandb']['mode']!r}")
     if config["model"]["pos_weight_cap"] <= 1:
@@ -194,6 +218,7 @@ def validate(config):
 STANDARD_SCHEDULES = {
     60000: [20000, 40000, 50000, 55000, 60000],
     120000: [20000, 40000, 60000, 80000, 100000, 110000, 120000],
+    150000: [20000, 40000, 60000, 80000, 100000, 120000, 140000, 145000, 150000],
 }
 
 

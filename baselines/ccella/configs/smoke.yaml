@@ -28,16 +28,20 @@ train:
   max_train_steps: 8
   checkpoint_steps: [4, 8]
   micro_batch_size: 2
+  # A short diffusion chain so a smoke preview is a handful of forwards rather than 1000.
+  # validation.inference_steps must match it -- MONAI's DDPM cannot be strided.
+  num_train_timesteps: 10
   seed: 0
   log_every: 1
   output_dir: /hnvme/workspace/y100dc19-mrflow-final/baselines/ccella_smoke/run
 
 validation:
   every: 4
+  visualize_every: 4
   samples: 2
   subset: 8
   visualize: true
-  inference_steps: 2
+  inference_steps: 10        # == train.num_train_timesteps, the full chain
 
 wandb:
   mode: disabled

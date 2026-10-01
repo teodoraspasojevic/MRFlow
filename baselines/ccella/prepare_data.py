@@ -44,8 +44,8 @@ if __package__ in (None, ""):
 
 from .config import load_config
 from .labels import label_source_fingerprint, label_vector, read_label_table
-from .store import (MANIFEST_DIR, ShardStore, cache_meta, file_sha256, sample_key, study_key,
-                    write_cache_meta, write_manifest)
+from .store import (MANIFEST_DIR, ShardStore, cache_meta, file_sha256, read_cache_meta,
+                    sample_key, study_key, write_cache_meta, write_manifest)
 from .text import format_report, tokenizer_settings
 from .volume import VolumeUnusable, build_autoencoder, encode_volume, preprocess_volume
 
@@ -114,6 +114,17 @@ def prepare_shard(config, split, shard, num_shards, limit=None, overwrite=False)
     if os.path.exists(manifest_path) and not overwrite:
         print(f"{manifest_path} exists; nothing to do (use --overwrite to redo this shard)")
         return manifest_path
+
+    # The shard partition is a property of the cache, not of this job. A recovery array that
+    # re-runs a subset must use the same `num_shards` as the original, or `shard_slice` hands it a
+    # different slice of the study list and the shards start overlapping.
+    existing = read_cache_meta(cache_root)
+    built_with = (existing or {}).get("num_shards", {}).get(split)
+    if built_with not in (None, num_shards):
+        raise ValueError(
+            f"the {split} split of this cache was built with num_shards={built_with} but this task "
+            f"was given {num_shards}. Re-running a subset of shards MUST keep num_shards identical, "
+            f"otherwise the study list is re-partitioned and shards overlap.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     labels = read_label_table(config["mrrate"]["labels_root"])
@@ -195,6 +206,9 @@ def prepare_shard(config, split, shard, num_shards, limit=None, overwrite=False)
     if shard == 0:
         meta = cache_meta(config, label_source_fingerprint(config["mrrate"]["labels_root"]),
                           file_sha256(config["model"]["autoencoder_path"]), tok_settings)
+        # Per split: train is sharded 64 ways and val 4, and one scalar cannot hold both.
+        # Merge so writing one split's shard 0 does not erase the other's.
+        meta["num_shards"] = {**(existing or {}).get("num_shards", {}), split: num_shards}
         print("cache_meta ->", write_cache_meta(cache_root, meta))
     return manifest_path
 
@@ -221,8 +235,9 @@ def main():
     parser.add_argument("--num_shards", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--set", nargs="*", default=[], dest="overrides",
-                        help="dotted config overrides, e.g. data.cache_root=/tmp/x")
+    parser.add_argument("--set", nargs="*", default=[], dest="overrides", metavar="KEY=VALUE",
+                        help="dotted config overrides, e.g. data.cache_root=/tmp/x; "
+                             "nargs is greedy, so this must be the LAST flag")
     args = parser.parse_args()
 
     config = load_config(args.config, args.overrides)
