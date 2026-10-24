@@ -20,6 +20,18 @@ Roll out MRFlow over an MR-RATE split and score it with **four metric families a
   cost one extra pass over volumes already in memory. They see the pair exactly as the leaderboard
   did.
 
+- **`modality_*`**, from [`modality/`](modality/README.md), opt-in with `--modality_ckpt`: a 3D
+  classifier trained on MR-RATE predicts each generation's contrast (T1w / T2w / SWI / FLAIR) and
+  scores it against the modality it was conditioned on. The ground truth of the same case is
+  scored against its label as the ceiling, with the gap and a paired bootstrap CI. It reads the
+  same canonicalized pair as the reference protocols. `python -m evaluation.modality.consistency`
+  scores an existing run directory without rescoring anything else.
+- **`pathology_*`**, from [`pathology/`](pathology/README.md), opt-in with `--pathology_ckpt`: a
+  multi-label 3D classifier trained on MR-RATE's 14 merged-group report labels (11 distinct)
+  reads the pathology groups off each generation and off its ground truth. Both are scored against
+  the study's labels, with the ground truth as the ceiling, and study-clustered paired CIs on the
+  gap. `python -m evaluation.pathology.consistency` scores an existing run directory.
+
 **The container family is given different arrays from everything else, and that separation is the
 point** — see [the geometry contract](#the-geometry-contract). Nothing from the container may reach
 the reference protocols.
@@ -119,6 +131,8 @@ a quietly smaller evaluation.
 | [`fid_inception.py`](fid_inception.py) | pytorch-fid v0.3.0 verbatim — the TF-ported Inception and its Frechet distance. Do not edit |
 | [`__init__.py`](__init__.py) | `EvalAccumulator` — canonicalizes each pair, accumulates features, `results()` turns them into the metrics dict |
 | [`main.py`](main.py) | the CLI: build a case, generate, score, write `metrics.json`, log to W&B |
+| [`pathology/`](pathology/README.md) | `pathology_*`: the pathology classifier (per-study splits, training, held-out report) and the consistency metric, generated vs ground-truth ceiling |
+| [`modality/`](modality/README.md) | `modality_*`: the modality classifier (splits, training, held-out report) and the consistency metric, generated vs ground-truth ceiling |
 | [`challenge_metrics.py`](challenge_metrics.py) | the VLM3D scoring container, vendored: modality scope, MSE/PSNR/SSIM, streaming 2.5D FID. Do not "improve" it |
 | [`../tests/test_evaluation_metrics.py`](../tests/test_evaluation_metrics.py) | value tests: the reference protocols hold, identical pairs score zero, ladders order, pooling is shard-invariant |
 | [`../tests/test_medical_metrics.py`](../tests/test_medical_metrics.py) | value tests for the medical FIDs and HLIP: shapes, preprocessing symmetry, three-plane slicing, retrieval arithmetic, cache invalidation |

@@ -21,6 +21,12 @@ See `evaluation/README.md` for the pipeline and what each metric means.
                           and `results()` turns what it has seen into the metrics dict.
     main.py               the CLI -- generate and cache every series of a split, then score the
                           cached volumes and log to W&B
+    modality/             `modality_*`: a trained 3D contrast classifier asked whether each
+                          generated volume is the modality it was conditioned on, with the ground
+                          truth scored alongside as the ceiling. Opt-in via `modality_ckpt`.
+    pathology/            `pathology_*`: a trained multi-label classifier asked whether each
+                          generation shows its report's pathology groups, the ground truth again
+                          the ceiling. Opt-in via `pathology_ckpt`.
 
 **The cached rollouts are the only thing this evaluation ever writes to disk. Features are never
 persisted.** One `EvalAccumulator` sees the whole population in one process, so every distance is
@@ -51,6 +57,8 @@ from evaluation.challenge_metrics import (ALLOWED_MODALITIES, FIDAccumulator,
                                           compute_basic_metrics, finalize_pooled)
 from evaluation.hlip_metrics import HlipAccumulator
 from evaluation.medical_fid import PLANES, MedicalNet3dAccumulator, RadImageNet2p5dAccumulator
+from evaluation.modality import consistency as modality_consistency
+from evaluation.pathology import consistency as pathology_consistency
 from evaluation.paper_metrics import (CLIP_CONFIGS, ClipFVDAccumulator, Moments,
                                       Fid2dInceptionAccumulator, InceptionScoreAccumulator,
                                       canonicalize_generated, canonicalize_gt, fvd_pooled,
@@ -67,7 +75,8 @@ SCORE_KEYS = (
     "fid_2p5d_radimagenet_mean", "fid_2p5d_radimagenet_axial",
     "fid_2p5d_radimagenet_coronal", "fid_2p5d_radimagenet_sagittal",
     "FID_2p5D_Avg", "FID_2p5D_XY", "FID_2p5D_XZ", "FID_2p5D_YZ",
-) + hlip_metrics.score_keys() + (
+) + hlip_metrics.score_keys() + modality_consistency.score_keys() + \
+    pathology_consistency.score_keys() + (
     "IS_mean", "IS_std",
     "PSNR_mean", "MSE_mean", "SSIM_mean",
 )
@@ -78,7 +87,8 @@ COUNT_KEYS = (
     "n_fid_2d_inception_slices_real", "n_fid_2d_inception_slices_fake",
     "n_fid_3d_medicalnet_volumes_real", "n_fid_3d_medicalnet_volumes_fake",
 ) + tuple(f"n_fid_2p5d_radimagenet_{p}_{side}"
-            for p in PLANES for side in ("real", "fake")) + hlip_metrics.count_keys() + (
+            for p in PLANES for side in ("real", "fake")) + hlip_metrics.count_keys() + \
+    modality_consistency.count_keys() + pathology_consistency.count_keys() + (
     "n_is_slices",
     "n_total_files", "n_scored_files", "n_missing_outputs",
     "n_excluded_out_of_scope_modality",
@@ -94,6 +104,8 @@ PAPER_KEYS = tuple(k for k in METRIC_KEYS
                    if k.startswith(("FVD_", "IS_", "n_fvd_", "n_is_", "fid_2d_", "n_fid_2d_")))
 MEDICAL_KEYS = tuple(k for k in METRIC_KEYS if "medicalnet" in k or "radimagenet" in k)
 HLIP_KEYS = hlip_metrics.metric_keys()
+MODALITY_KEYS = modality_consistency.metric_keys()
+PATHOLOGY_KEYS = pathology_consistency.metric_keys()
 
 
 def signature():
@@ -116,9 +128,14 @@ class EvalAccumulator:
 
     `use_hlip=False` drops the HLIP tower, which is by far the heaviest extractor here and a
     ~1.6 GB download; its keys then read nan.
+
+    `modality_ckpt` is a trained modality classifier (`evaluation/modality`); without one the
+    `modality_*` keys read nan and nothing else changes. `pathology_ckpt` is the same for the
+    pathology classifier (`evaluation/pathology`) and the `pathology_*` keys.
     """
 
-    def __init__(self, device="auto", batch_size=32, hlip_batch_size=8, use_hlip=True):
+    def __init__(self, device="auto", batch_size=32, hlip_batch_size=8, use_hlip=True,
+                 modality_ckpt=None, pathology_ckpt=None):
         # Every extractor is built here, so `--combine` pays the model-loading cost once.
         self._fid_2p5d = FIDAccumulator(device=device)
         self._fid_2d = Fid2dInceptionAccumulator(device=device, batch_size=batch_size)
@@ -128,6 +145,11 @@ class EvalAccumulator:
         self._fid_rad = RadImageNet2p5dAccumulator(device=device, batch_size=batch_size)
         self._hlip = (HlipAccumulator(device=device, batch_size=hlip_batch_size)
                       if use_hlip else None)
+        self._modality = (modality_consistency.ModalityConsistency(modality_ckpt, device=device)
+                          if modality_ckpt else None)
+        self._pathology = (pathology_consistency.PathologyConsistency(pathology_ckpt,
+                                                                      device=device)
+                           if pathology_ckpt else None)
         self._per_case = []
         self.n_total = 0
         self.n_excluded = 0
@@ -170,6 +192,13 @@ class EvalAccumulator:
         if self._hlip is not None:
             # The generation only, against its study's own report.
             self._hlip.add(report, modality, plane, study_uid, gen)
+        if self._modality is not None:
+            # Both sides of the pair: the generation against its conditioning modality, the
+            # ground truth against its label.
+            self._modality.add(case_id, bucket, modality, gt=gt, gen=gen)
+        if self._pathology is not None:
+            # Both sides against the same target: the study's report-derived labels.
+            self._pathology.add(case_id, bucket, study_uid, gt=gt, gen=gen)
 
         # `slice_mm` is the ground truth's native slice spacing -- recorded per case because it
         # says whether its 1 mm z detail was acquired or interpolated. It drives no metric.
@@ -178,8 +207,13 @@ class EvalAccumulator:
                                "gt_slices_1mm": int(gt.shape[0]),
                                "generated_slices": int(gen.shape[0]), **metrics})
 
-    def add_missing(self, case_id, bucket, modality):
+    def add_missing(self, case_id, bucket, modality, real=None, spacing=None, plane=None,
+                    study_uid=None):
         """A case with no volume -- excluded if out of scope, else missing.
+
+        `real`, when the ground truth could still be read, is used by the modality and pathology
+        metrics only, so their ground-truth ceilings keep every case even when its generation
+        failed. `study_uid` is what the pathology metric looks the labels up by.
 
         It contributes no samples to the distribution metrics, since there is nothing to penalize
         a distance between distributions with, and it is left out of the MSE/PSNR/SSIM means
@@ -193,6 +227,14 @@ class EvalAccumulator:
         else:
             self.n_missing += 1
             status = "missing"
+            gt = (canonicalize_gt(real, spacing, plane)
+                  if real is not None and (self._modality or self._pathology) else None)
+            errors = {"gt_error": "" if real is not None else "ground truth not read",
+                      "gen_error": "no generated volume"}
+            if self._modality is not None:
+                self._modality.add(case_id, bucket, modality, gt=gt, **errors)
+            if self._pathology is not None:
+                self._pathology.add(case_id, bucket, study_uid, gt=gt, **errors)
         self._per_case.append({"case_id": case_id, "bucket": bucket, "status": status})
 
     def state(self):
@@ -214,6 +256,8 @@ class EvalAccumulator:
             "fid_2p5d": self._fid_2p5d.raw_features(),
             "is_logits": self._is.logits(),
             "hlip": self._hlip.state() if self._hlip is not None else None,
+            "modality": self._modality.state() if self._modality is not None else None,
+            "pathology": self._pathology.state() if self._pathology is not None else None,
         }
 
     def results(self):
@@ -240,6 +284,12 @@ def merge_states(states):
         raise ValueError("shards were computed with different feature extractors or preprocessing; "
                          "re-run the array rather than pooling them")
     hlip = [st["hlip"] for st in states if st["hlip"] is not None]
+    modality = [st.get("modality") for st in states]  # absent from shards written before it
+    if any(m is None for m in modality) and any(m is not None for m in modality):
+        raise ValueError("only some shards were scored with a modality classifier")
+    pathology = [st.get("pathology") for st in states]
+    if any(m is None for m in pathology) and any(m is not None for m in pathology):
+        raise ValueError("only some shards were scored with a pathology classifier")
     return {
         "per_case": [r for st in states for r in st["per_case"]],
         "n_total": sum(st["n_total"] for st in states),
@@ -253,6 +303,10 @@ def merge_states(states):
         "fid_2p5d": [st["fid_2p5d"] for st in states],
         "is_logits": np.concatenate([st["is_logits"] for st in states]),
         "hlip": hlip_metrics.merge_states(hlip) if hlip else None,
+        "modality": (modality_consistency.merge_states(modality)
+                     if modality and modality[0] is not None else None),
+        "pathology": (pathology_consistency.merge_states(pathology)
+                      if pathology and pathology[0] is not None else None),
     }
 
 
@@ -310,8 +364,21 @@ def metrics_from(state):
         metrics[f"n_fvd_{name}_clips_real"] = n_real
         metrics[f"n_fvd_{name}_clips_fake"] = n_fake
 
-    return {"metrics": {k: metrics[k] for k in METRIC_KEYS},
-            "per_case": list(state["per_case"])}
+    modality = (modality_consistency.summarize_pairs(state["modality"])
+                if state.get("modality") else None)
+    metrics.update(modality_consistency.scalar_metrics(modality))
+    pathology = (pathology_consistency.summarize_pairs(state["pathology"])
+                 if state.get("pathology") else None)
+    metrics.update(pathology_consistency.scalar_metrics(pathology))
+
+    result = {"metrics": {k: metrics[k] for k in METRIC_KEYS}, "per_case": list(state["per_case"])}
+    if modality is not None:
+        result["modality_consistency"] = {"summary": modality,
+                                          "cases": state["modality"]["records"]}
+    if pathology is not None:
+        result["pathology_consistency"] = {"summary": pathology,
+                                           "cases": state["pathology"]["records"]}
+    return result
 
 
 def comparison_frames(real, produced, spacing, plane):

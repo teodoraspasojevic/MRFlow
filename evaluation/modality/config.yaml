@@ -1,0 +1,33 @@
+# Modality classifier for the modality-consistency metric. See evaluation/modality/README.md.
+# Real Helma paths; runs as-is.
+
+seed: 42
+raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
+data_root: /hnvme/workspace/y100dc19-mrflow-final/modality_classifier/data
+output_dir: /hnvme/workspace/y100dc19-mrflow-final/modality_classifier/runs/modality_net3d
+
+# Every patient of this population is removed from the classifier's test split.
+eval_cases: baselines/cases-test-n100.json
+
+# Series per class and split. Capping per class makes train balanced by construction.
+splits:
+  per_class: {train: 5000, val: 500, test: 1000}
+
+model:
+  widths: [32, 64, 128, 256]
+  dropout: 0.2
+
+train:
+  epochs: 20
+  batch_size: 16
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_epochs: 1
+  num_workers: 16
+  bf16: true
+  augment: true
+  # inverse_frequency | none. Weights are 1 on a balanced train split; kept for other caps.
+  class_weighting: inverse_frequency
+
+# Checkpoint selection on val only: highest balanced accuracy, ties broken by lower NLL.
+select_metric: balanced_accuracy

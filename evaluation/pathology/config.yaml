@@ -1,0 +1,35 @@
+# Pathology classifier for the pathology-consistency metric. See evaluation/pathology/README.md.
+# Real Helma paths; runs as-is.
+
+seed: 42
+raw_root: /hnvme/workspace/y100dc19-MR-Rate-raw
+labels_root: /home/hpc/y100dc/y100dc19/VLM3D-MRI-R2V-MICCAI-26/MR-RATE/contrastive-pretraining/scripts/eval_labels/splits_merged_majority
+data_root: /hnvme/workspace/y100dc19-mrflow-final/pathology_classifier/data
+output_dir: /hnvme/workspace/y100dc19-mrflow-final/pathology_classifier/runs/pathology_net3d
+
+# Every patient of this population is removed from the classifier's test split.
+eval_cases: baselines/cases-test-n100.json
+
+# Series drawn per labelled study. Labels are per study, so val/test take one series each and
+# every study counts once.
+per_study: {train: 2, val: 1, test: 1}
+
+model:
+  widths: [48, 96, 192, 384]
+  dropout: 0.3
+
+train:
+  epochs: 20
+  batch_size: 16
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_epochs: 1
+  num_workers: 24
+  bf16: true
+  augment: true
+  # BCE pos_weight = neg/pos from train, capped. 1 turns it off.
+  pos_weight_cap: 10.0
+
+# Checkpoint selection on val only: highest macro AUROC over labels with >= min_positives
+# positives and negatives, ties broken by lower val BCE.
+min_positives: 10

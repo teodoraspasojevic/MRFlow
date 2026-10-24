@@ -65,6 +65,8 @@ from auto_regressive_generate import LatentAutoregressiveGenerator
 from evaluation import (METRIC_KEYS, EvalAccumulator, comparison_frames,
                         merge_states, metrics_from, signature)
 from evaluation.hlip_metrics import warn_if_not_independent
+from echosyn.common.trimming import TrimPolicy, blank_slices, slice_stats, trim_bounds
+from dataclasses import replace
 
 
 ### Inference regimes ###
@@ -98,6 +100,45 @@ def gt_latent(generator, config, nii_bytes, entry):
                                   **OmegaConf.to_container(config.mri.preprocess, resolve=True))
     latent = encode_volume(generator.vae, volume, config.mri.vae_batch_size)
     return latent.unsqueeze(0).float().to(generator.device)
+
+
+### Trimmed scoring ###
+
+
+def load_trim_version(root):
+    """A trimmed dataset version (lvfm/trim_mrrate.py): sample_id -> audit row, and its policy."""
+    import csv
+    with open(os.path.join(root, "audit", "audit.csv"), newline="") as f:
+        bounds = {r["sample_id"]: r for r in csv.DictReader(f)}
+    policy = json.load(open(os.path.join(root, "provenance.json")))["policy"]
+    return bounds, TrimPolicy(**policy)
+
+
+def trim_native(real, spacing, plane, bound):
+    """Crop a `load_native_volume` ground truth to a trimmed version's slice window.
+
+    The window was found on the 1 mm training grid, so it maps back to native slices by the slice
+    spacing: every native slice that overlaps the retained millimetres is kept."""
+    mm = spacing[plane_order(plane)[0]]
+    if max(1, round(real.shape[0] * mm)) != int(bound["source_slices"]):
+        raise RuntimeError(f"ground truth has {real.shape[0]} x {mm} mm slices, the trim bounds "
+                           f"were computed on {bound['source_slices']} at 1 mm")
+    start = int(np.floor(int(float(bound["trim_start"])) / mm))
+    stop = min(real.shape[0], int(np.ceil(int(float(bound["trim_stop"])) / mm)))
+    return real[start:stop]
+
+
+def trim_generated(produced, policy):
+    """The same blank-end trim the ground truth got, applied to a generated volume.
+
+    Blankness is judged after the training normalization (99.5th percentile of the nonzero voxels
+    -> 1), so `tau` means the same thing on both sides. An all-blank generation is kept whole:
+    dropping it would hide a failure."""
+    nonzero = produced[produced > 0]
+    scale = np.percentile(nonzero, 99.5) if nonzero.size else 1.0
+    blank = blank_slices(slice_stats(produced / max(scale, 1e-6)), policy)
+    start, stop, _ = trim_bounds(blank, replace(policy, all_blank="keep"))
+    return produced[start:stop]
 
 
 ### Case selection ###
@@ -265,6 +306,16 @@ def parse_args():
                         help="Score report-to-volume agreement with the released HLIP brain-MRI "
                              "checkpoint. --no-hlip skips the tower and its 1.5 GB download; the "
                              "hlip_* keys then read nan.")
+    parser.add_argument("--modality_ckpt", type=str, default=None,
+                        help="A trained modality classifier (evaluation/modality, best.pt). Adds "
+                             "the modality_* keys: each generation's predicted contrast against "
+                             "its conditioning modality, and the ground truth's against its label "
+                             "as the ceiling. Off by default; the keys then read nan.")
+    parser.add_argument("--pathology_ckpt", type=str, default=None,
+                        help="A trained pathology classifier (evaluation/pathology, best.pt). Adds "
+                             "the pathology_* keys: how well the report's pathology groups can be "
+                             "read off each generation, against the ground truth as the ceiling. "
+                             "Off by default; the keys then read nan.")
     parser.add_argument("--overwrite", action="store_true", help="Re-run an existing shard.")
     parser.add_argument("--combine", action="store_true",
                         help="Score the volumes already cached in --out into metrics.json and log "
@@ -284,6 +335,19 @@ def parse_args():
                              "compile contributes nothing to the drift). The first two or three "
                              "blocks of a run are still compiling, so pass --no-compile for a "
                              "handful of cases.")
+    parser.add_argument("--score_collapsed", action="store_true",
+                        help="Score a collapsed rollout (its first block is already the stop "
+                             "token) as the untrimmed block it produced, instead of dropping it as "
+                             "missing. The manifest marks such cases `collapsed`; a --combine "
+                             "without this flag drops them again.")
+    parser.add_argument("--gt_bounds", type=str, default=None,
+                        help="A trimmed dataset version (e.g. data/mrflow_flux_trim-v1). With "
+                             "--combine, crops every ground truth to its trimmed slice window and "
+                             "drops the cases that version excludes. Writes metrics_<version>.json.")
+    parser.add_argument("--trim_generated", action="store_true",
+                        help="With --gt_bounds: also trim each generated volume's blank ends with "
+                             "that version's policy, so both sides of every pair get the same rule. "
+                             "Writes metrics_<version>_trimgen.json.")
     parser.add_argument("--ode_steps", type=int, default=201,
                         help="Fixed Euler steps per block. 201 is what every number in this "
                              "project was produced with, so leave it there to stay comparable; "
@@ -298,6 +362,10 @@ def parse_args():
     args = parser.parse_args()
     if not args.combine and not args.ckpt:
         parser.error("--ckpt is required unless --combine")
+    if (args.gt_bounds or args.trim_generated) and not args.combine:
+        parser.error("--gt_bounds/--trim_generated rescore cached volumes; use them with --combine")
+    if args.trim_generated and not args.gt_bounds:
+        parser.error("--trim_generated takes its policy from --gt_bounds")
     if args.cases and args.n_per_bucket:
         parser.error("--cases is a population that has already been selected; --n_per_bucket "
                      "would select a second one from it")
@@ -344,9 +412,13 @@ def run_shard(config, args, out, device):
           f"ode_steps {args.ode_steps}")
 
     generator = build_generator(config, args.ckpt, device, args)
+    # Trim here rather than inside generate(), so a collapsed rollout's raw block is still at hand.
+    generator.trim = False
     tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
     accumulator = EvalAccumulator(device=device, batch_size=args.feature_batch_size,
-                                  hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip)
+                                  hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip,
+                                  modality_ckpt=args.modality_ckpt,
+                                  pathology_ckpt=args.pathology_ckpt)
     generate = REGIMES[args.regime]
     cases = []
     if example_buckets:
@@ -374,6 +446,7 @@ def run_shard(config, args, out, device):
         # different shard count -- draws the same noise and scores the same. Without this, two
         # evaluations of one checkpoint differ by sampling noise alone.
         torch.manual_seed(config.seed + int(case_id, 16) % 2 ** 31)
+        real = spacing = None
         try:
             nii_bytes = read_member(entry["archive"], entry["member"])
             real, spacing = load_native_volume(nii_bytes, entry["plane"])
@@ -386,17 +459,22 @@ def run_shard(config, args, out, device):
 
             labels = (torch.tensor([modality_to_id(entry["modality"])], device=device),
                       torch.tensor([plane_to_id(entry["plane"])], device=device))
-            latent = generate(generator, embedding, labels, args.max_blocks,
-                              lambda: gt_latent(generator, config, nii_bytes, entry))
+            raw = generate(generator, embedding, labels, args.max_blocks,
+                           lambda: gt_latent(generator, config, nii_bytes, entry))
+            latent = generator.trim_stop_frames(raw)
             if latent.shape[2] == 0:
-                raise RuntimeError("every generated slice was a stop frame")
+                if not args.score_collapsed:
+                    raise RuntimeError("every generated slice was a stop frame")
+                latent = raw
+                record["collapsed"] = True
             produced = generator.decode_latent(latent)[0, 0].numpy().astype(np.float32)
         except Exception as e:
             # One unreadable series or collapsed rollout must not lose the shard; the official
             # scoring counts it as a missing output, which is the same penalty the platform applies.
             print(f"[shard {args.shard}] {case_id} failed: {type(e).__name__}: {e}")
             record["status"] = "missing"
-            accumulator.add_missing(case_id, bucket, entry["modality"])
+            accumulator.add_missing(case_id, bucket, entry["modality"], real, spacing,
+                                    entry["plane"], entry["study_uid"])
             continue
 
         accumulator.add(case_id, bucket, entry["modality"], real, produced, spacing,
@@ -489,14 +567,37 @@ def score_cached(config, args, out, device):
     print(f"[score] {len(cases)} cases from {len(manifests)} shards")
 
     accumulator = EvalAccumulator(device=device, batch_size=args.feature_batch_size,
-                                  hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip)
+                                  hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip,
+                                  modality_ckpt=args.modality_ckpt,
+                                  pathology_ckpt=args.pathology_ckpt)
+    bounds, policy = load_trim_version(args.gt_bounds) if args.gt_bounds else (None, None)
     for case in tqdm(cases, disable=None):
-        if case["status"] != "generated":
+        # A case the trimmed version excludes (all-blank, or never encoded) has no ground truth.
+        if bounds is not None and bounds.get(case["case_id"], {}).get("included") != "True":
             accumulator.add_missing(case["case_id"], case["bucket"], case["modality"])
+            continue
+        # A collapsed rollout is scored only under --score_collapsed, as at generation time.
+        if case["status"] != "generated" or (case.get("collapsed") and not args.score_collapsed):
+            real = spacing = None
+            if ((args.modality_ckpt or args.pathology_ckpt)
+                    and EvalAccumulator.is_scored(case["modality"])):
+                # Only the modality and pathology metrics read a missing case's ground truth (their
+                # ceilings keep every case); one that cannot be read is recorded as a failure there.
+                try:
+                    real, spacing = load_native_volume(
+                        read_member(case["archive"], case["member"]), case["plane"])
+                except Exception as e:
+                    print(f"[score] {case['case_id']} ground truth unreadable: {e}")
+            accumulator.add_missing(case["case_id"], case["bucket"], case["modality"], real,
+                                    spacing, case["plane"], case["study_uid"])
             continue
         produced = np.load(os.path.join(out, "generated", case["generated"])).astype(np.float32)
         real, spacing = load_native_volume(read_member(case["archive"], case["member"]),
                                            case["plane"])
+        if bounds is not None:
+            real = trim_native(real, spacing, case["plane"], bounds[case["case_id"]])
+        if args.trim_generated:
+            produced = trim_generated(produced, policy)
         report = read_report(case["archive"], case["study_uid"])
         accumulator.add(case["case_id"], case["bucket"], case["modality"], real, produced,
                         spacing, case["plane"], report, case["study_uid"])
@@ -534,8 +635,8 @@ def log_wandb(config, args, metrics, out):
         mode="disabled" if args.no_wandb else os.environ.get("WANDB_MODE", "online"),
         config={"regime": args.regime, "split": args.split, "ckpt": args.ckpt,
                 "label": args.label, "cases": args.cases,
-                "generators": manifest_generators(out),
-                "max_blocks": args.max_blocks, "n_per_bucket": args.n_per_bucket,
+                "generators": manifest_generators(out), "modality_ckpt": args.modality_ckpt,
+                "pathology_ckpt": args.pathology_ckpt, "max_blocks": args.max_blocks, "n_per_bucket": args.n_per_bucket,
                 "modality_cfg_scale": guidance.modality_cfg_scale,
                 "report_cfg_scale": guidance.report_cfg_scale},
     )
@@ -577,14 +678,22 @@ def main():
         if args.num_shards > 1:
             return  # the --combine pass scores every shard's volumes, including this one
 
-    result = combine_shards(out)
+    # Shard features were scored untrimmed, so a trimmed score is always a rescore into its own file.
+    result = None if args.gt_bounds else combine_shards(out)
     if result is None:
-        print("[combine] no shard feature files -- rescoring from the cached volumes")
+        print("[combine] rescoring from the cached volumes")
         result = score_cached(config, args, out, device)
     result.update({"regime": args.regime, "split": args.split, "ckpt": args.ckpt,
                    "label": args.label, "cases": args.cases,
-                   "generators": manifest_generators(out), "extractors": signature()})
-    with open(os.path.join(out, "metrics.json"), "w") as f:
+                   "generators": manifest_generators(out), "extractors": signature(),
+                   "modality_ckpt": args.modality_ckpt,
+                   "pathology_ckpt": args.pathology_ckpt,
+                   "gt_bounds": args.gt_bounds, "trim_generated": args.trim_generated})
+    name = "metrics.json"
+    if args.gt_bounds:
+        name = (f"metrics_{os.path.basename(os.path.normpath(args.gt_bounds))}"
+                f"{'_trimgen' if args.trim_generated else ''}.json")
+    with open(os.path.join(out, name), "w") as f:
         json.dump(result, f, indent=2)
 
     print_metrics(result["metrics"], out)
