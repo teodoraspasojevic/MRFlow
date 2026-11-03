@@ -257,7 +257,7 @@ def test_combine_emits_every_key_and_counts_what_it_says():
         real = phantom((20 if i else 80, 96, 96), seed=i)
         acc.add(f"{i}" * 16, "t1w__axial", "t1w", real, phantom((80, 256, 256), seed=9),
                 spacing, plane, {"findings": f"case {i}", "impression": "normal"},
-                f"study-{i}", f"cond-{i}")
+                f"study-{i}")
     acc.add_missing("f" * 16, "t1w__axial", "t1w")
     acc.add_missing("e" * 16, "mra__axial", "mra")
 
@@ -295,7 +295,7 @@ def test_the_challenge_family_scores_the_released_pair_not_the_canonicalized_one
     real, produced = phantom((20, 96, 96)), phantom((80, 256, 256), seed=9)
     acc = EvalAccumulator(use_hlip=False)
     acc.add("a" * 16, "t1w__axial", "t1w", real, produced, (4.0, 1.0, 1.0), "AXIAL",
-            {"findings": "a case", "impression": "normal"}, "study-a", "cond-a")
+            {"findings": "a case", "impression": "normal"}, "study-a")
 
     scored = [r for r in acc.results()["per_case"] if r["status"] == "scored"][0]
     direct = compute_basic_metrics(real, produced)
