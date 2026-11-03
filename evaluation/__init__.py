@@ -10,8 +10,9 @@ See `evaluation/README.md` for the pipeline and what each metric means.
                           `fid_2p5d_radimagenet_*` (three anatomical planes, RadImageNet
                           ResNet-50) -- the CCELLA / Alignment-to-Synthesis protocol, on the same
                           canonicalized pair.
-    hlip_metrics.py       `hlip_*`: report-to-volume agreement and retrieval under the released
-                          MR-RATE-trained HLIP checkpoint. The only metrics that read the report.
+    hlip_metrics.py       `hlip_*`: report-to-volume agreement and retrieval under a released HLIP
+                          checkpoint (Michigan-trained, not MR-RATE). The only metrics that read
+                          the report.
     fid_inception.py      pytorch-fid v0.3.0, vendored verbatim. Do not edit.
     medicalnet_resnet.py  MedicalNet's 3D ResNet encoder, vendored. Do not edit.
     challenge_metrics.py  the VLM3D scoring container, vendored. MSE/PSNR/SSIM and the squeezenet
@@ -134,7 +135,7 @@ class EvalAccumulator:
     pathology classifier (`evaluation/pathology`) and the `pathology_*` keys.
     """
 
-    def __init__(self, device="auto", batch_size=32, hlip_batch_size=8, use_hlip=True,
+    def __init__(self, device="auto", batch_size=32, use_hlip=True,
                  modality_ckpt=None, pathology_ckpt=None):
         # Every extractor is built here, so `--combine` pays the model-loading cost once.
         self._fid_2p5d = FIDAccumulator(device=device)
@@ -143,8 +144,7 @@ class EvalAccumulator:
         self._is = InceptionScoreAccumulator(device=device, batch_size=batch_size)
         self._fid_3d = MedicalNet3dAccumulator(device=device)
         self._fid_rad = RadImageNet2p5dAccumulator(device=device, batch_size=batch_size)
-        self._hlip = (HlipAccumulator(device=device, batch_size=hlip_batch_size)
-                      if use_hlip else None)
+        self._hlip = HlipAccumulator() if use_hlip else None
         self._modality = (modality_consistency.ModalityConsistency(modality_ckpt, device=device)
                           if modality_ckpt else None)
         self._pathology = (pathology_consistency.PathologyConsistency(pathology_ckpt,
@@ -165,7 +165,7 @@ class EvalAccumulator:
 
         `spacing` is the ground truth's native (S, R, A) voxel size and `plane` its acquisition
         plane; together they say how to canonicalize it. `report` and `study_uid` are for HLIP: the
-        report builds its two text variants, and the study id says what a correct retrieval is.
+        study id groups a study's series into one HLIP study, scored against its report.
         """
         self.n_total += 1
         if not self.is_scored(modality):
@@ -190,8 +190,8 @@ class EvalAccumulator:
         self._fid_3d.add_pair(gt, gen, plane)
         self._fid_rad.add_pair(gt, gen, plane)
         if self._hlip is not None:
-            # The generation only, against its study's own report.
-            self._hlip.add(report, modality, plane, study_uid, gen)
+            # Both sides, grouped by study: generated studies and their real ceiling.
+            self._hlip.add(case_id, study_uid, report, gen, gt)
         if self._modality is not None:
             # Both sides of the pair: the generation against its conditioning modality, the
             # ground truth against its label.

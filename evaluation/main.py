@@ -299,9 +299,6 @@ def parse_args():
     parser.add_argument("--feature_batch_size", type=int, default=32,
                         help="Slices per forward pass in the Inception and RadImageNet "
                              "extractors. Lower it on a small GPU.")
-    parser.add_argument("--hlip_batch_size", type=int, default=8,
-                        help="Volumes per forward pass in the HLIP tower. A ViT-L over 1568 "
-                             "tokens is the heaviest extractor here; 8 fits an h200 comfortably.")
     parser.add_argument("--hlip", action=argparse.BooleanOptionalAction, default=True,
                         help="Score report-to-volume agreement with the released HLIP brain-MRI "
                              "checkpoint. --no-hlip skips the tower and its 1.5 GB download; the "
@@ -416,8 +413,7 @@ def run_shard(config, args, out, device):
     generator.trim = False
     tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
     accumulator = EvalAccumulator(device=device, batch_size=args.feature_batch_size,
-                                  hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip,
-                                  modality_ckpt=args.modality_ckpt,
+                                  use_hlip=args.hlip, modality_ckpt=args.modality_ckpt,
                                   pathology_ckpt=args.pathology_ckpt)
     generate = REGIMES[args.regime]
     cases = []
@@ -567,8 +563,7 @@ def score_cached(config, args, out, device):
     print(f"[score] {len(cases)} cases from {len(manifests)} shards")
 
     accumulator = EvalAccumulator(device=device, batch_size=args.feature_batch_size,
-                                  hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip,
-                                  modality_ckpt=args.modality_ckpt,
+                                  use_hlip=args.hlip, modality_ckpt=args.modality_ckpt,
                                   pathology_ckpt=args.pathology_ckpt)
     bounds, policy = load_trim_version(args.gt_bounds) if args.gt_bounds else (None, None)
     for case in tqdm(cases, disable=None):

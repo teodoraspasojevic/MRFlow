@@ -10,9 +10,11 @@ Roll out MRFlow over an MR-RATE split and score it with **four metric families a
   the same Fréchet arithmetic on medical-image backbones, following the protocol CCELLA and
   Alignment-to-Synthesis use. `fid_3d_medicalnet` is **volume-level** — one feature per volume, not
   per slice — and the 2.5D one scores the three anatomical planes separately.
-- **`hlip_*`**, from [`hlip_metrics.py`](hlip_metrics.py): the MR-RATE-trained HLIP
-  vision-language model asked whether the generated volume matches the report it was generated
-  from, as a paired cosine and as report→volume retrieval. **The only metric here that reads the
+- **`hlip_*`**, from [`hlip_metrics.py`](hlip_metrics.py): the HLIP vision-language model
+  (trained on University of Michigan brain MRI and head CT, **not** on MR-RATE) asked whether
+  each generated **study** (all of its series at once) matches its report, read one impression
+  sentence at a time, as a paired cosine and as report↔study retrieval; `hlip_real_*` is the same
+  on the real series. **The only metric here that reads the
   conditioning at all**; every other one would score the same if the reports had been shuffled.
 - **MSE/PSNR/SSIM and the squeezenet 2.5D FID**, from
   [`challenge_metrics.py`](challenge_metrics.py), the VLM3D scoring container vendored. The
@@ -73,9 +75,8 @@ sbatch --dependency=afterany:$JOB slurms/mrflow_eval_helma.sh \
 
 **`--limit` is per task**, so cases = array size × limit. Drop it to run the whole split.
 
-Three knobs on the feature extractors: `--feature_batch_size` (slices per forward pass, default 32)
-and `--hlip_batch_size` (volumes per forward pass, default 8) for a smaller GPU, and `--no-hlip` to
-skip the HLIP tower entirely. Everything runs on CPU too, just slowly — `device="auto"` picks
+Two knobs on the feature extractors: `--feature_batch_size` (slices per forward pass, default 32)
+for a smaller GPU, and `--no-hlip` to skip the HLIP tower entirely. Everything runs on CPU too, just slowly — `device="auto"` picks
 whatever is there.
 
 ### Which cases: `--n_per_bucket`
@@ -249,7 +250,7 @@ deviate is named. The references, read from source:
 | `IS_mean`, `IS_std` | [`torch-fidelity`](https://github.com/toshas/torch-fidelity) `torch_fidelity/metric_isc.py` | logits (not probabilities), shuffled with `RandomState(2020).permutation(N)`, 10 contiguous splits at `i*N//splits`, KL in float64. The shuffle makes the splits representative; it does **not** make the value order-invariant |
 | `fid_3d_medicalnet` | [MedicalNet](https://github.com/Tencent/MedicalNet) 3D ResNet-50, the protocol [CCELLA](https://github.com/grabkeem/CCELLA) ([arXiv:2506.10230](https://arxiv.org/html/2506.10230)) and Alignment-to-Synthesis ([arXiv:2506.00633](https://arxiv.org/html/2506.00633)) use | `resnet_50_23dataset.pth` (the 23-dataset pretrain), `layer4` map globally average-pooled to 2048-d, one vector **per volume**, the encoder frozen and in eval mode |
 | `fid_2p5d_radimagenet_*` | [RadImageNet](https://github.com/BMEII-AI/RadImageNet) ResNet-50, the Report2CT ([arXiv:2509.14780](https://arxiv.org/pdf/2509.14780)) / Alignment-to-Synthesis 2.5D protocol | the official PyTorch `ResNet50.pt`, `layer4` map globally average-pooled to 2048-d, one vector **per slice**, three anatomical planes accumulated separately, `_mean` their unweighted mean |
-| `hlip_*` | [HLIP](https://github.com/zch0414/hlip), built from its own [model card](https://huggingface.co/zch0414/clip-vit_base-scan_study-dualdinotxt1568) | the MR-RATE-trained checkpoint `zch0414/clip-vit_base-scan_study-dualdinotxt1568` at revision `6e4b8ab1`, its tokenizer, its `loader` preprocessing, its `model_configs/*.json` architecture, `encode_text` and the image prefix token each variant was trained against (`[:, 1]` findings, `[:, 0]` impression), all L2-normalized |
+| `hlip_*` | [HLIP](https://github.com/zch0414/hlip), built from its own [model card](https://huggingface.co/zch0414/clip-vit_base-scan_study-dualdinotxt1568) | the checkpoint `zch0414/clip-vit_base-scan_study-dualdinotxt1568` at revision `6e4b8ab1` (Michigan-trained, not MR-RATE), its tokenizer, its `loader` preprocessing, its `model_configs/*.json` architecture, its multi-scan study input, `encode_text` over `"This study shows: " + <sentence>`, and image token `[:, 0]` (the head trained on single sentences), all L2-normalized |
 
 The three image references consume **uint8** images, so both volumes are percentile-normalized to
 `[0, 1]` and then quantized to uint8 before Inception, the I3D or RadImageNet see them. MedicalNet
@@ -269,13 +270,13 @@ metrics](#the-container-metrics-and-why-they-stay-separate).
 | `fid_3d_medicalnet` | Frechet distance over MedicalNet features, **one per volume** — so the sample count is the case count, like FVD |
 | `fid_2p5d_radimagenet_axial` / `_coronal` / `_sagittal` | Frechet distance over RadImageNet features of **every** slice of that anatomical plane |
 | `fid_2p5d_radimagenet_mean` | the unweighted arithmetic mean of those three; a plane that is undefined drops out rather than dragging it to nan |
-| `hlip_<variant>_volume_cosine_mean` / `_std` | cosine between each generated volume and **its own** text, for `variant` in `findings` / `impression`, each against the image token it was trained against |
-| `hlip_<variant>_to_volume_r1` / `_r5` / `_r10` | text→volume retrieval: the fraction of queries with a correct volume in the top K |
-| `hlip_<variant>_to_volume_r*_within_stratum` | the same, with candidates restricted to the query's own **modality *and* plane** — the harder and more informative number |
-| `hlip_<variant>_positives_per_query_mean` | how many correct volumes each query had |
+| `hlip_cosine_mean` / `_std` | each generated **study** (all its series in one HLIP input) against **its own** report: the mean cosine over the report's impression sentences, averaged over studies |
+| `hlip_report_to_study_r1` / `_r5` / `_r10`, `_mrr`, `_auroc` | each report ranks every generated study: its own in the top K; mean reciprocal rank; the fraction of wrong studies scored below its own. Chance is `K / n_hlip_studies` and 0.5 |
+| `hlip_study_to_report_*` | the same, each study ranking every report — the cleaner direction, since a study's scan count cannot favour it |
+| `hlip_real_*` | every `hlip_*` score on the **real** series of the same studies and scans — the ceiling |
 | `n_fid_2d_inception_slices_real` / `_fake`, `n_fvd_*_clips_real` / `_fake`, `n_is_slices`, `n_fid_3d_medicalnet_volumes_*`, `n_fid_2p5d_radimagenet_<plane>_*` | samples behind each number — read these against the 2048/400 feature dimension, and against `n_scored_files` for the study count |
-| `n_hlip_<variant>_queries` / `_candidates` / `_pairs` | **read these before reading an R@K**: it is capped at `min(K, n_candidates)`, so R@5 and R@10 are uninformative below 5 and 10 candidates |
-| `n_hlip_<variant>_excluded_no_text` / `_truncated` / `_token_collisions` | cases with no text for that variant (excluded, never scored against an empty string), strings past HLIP's 256-token context, and ids whose truncated tokens are indistinguishable |
+| `n_hlip_studies` / `_scans` / `_sentences` | **read `n_hlip_studies` before an R@K**: it sets chance, and R@5 and R@10 are trivially 1 below 5 and 10 studies |
+| `n_hlip_duplicate_reports` / `_excluded_no_impression` / `_truncated` | studies whose impression is the same sentences as another's (tied, scored at their expected value), studies with no impression sentence (excluded from both sides), and sentences past HLIP's 256-token context |
 | `MSE_mean` / `PSNR_mean` / `SSIM_mean` | **container**: per case on its own normalized pair, then averaged over the scored cases |
 | `FID_2p5D_XY` / `_XZ` / `_YZ` / `_Avg` | **container**: Frechet distance over squeezenet1_1 (512-d) features of every 4th slice, per array axis, and their mean |
 
@@ -295,8 +296,7 @@ Everything a reader needs to know whether a number of ours is comparable with on
 | `fid_3d_medicalnet` | MedicalNet `resnet_50_23dataset.pth` (sha256 `ff48a622…`) | z-score over nonzero voxels | trilinear to 128³ | 1 | **no slice selection**: the whole volume | 2048 | **one volume** | one row per study | 128³ stretches the slice axis, so length is not read here |
 | `FVD_f16` / `FVD_f64` | StyleGAN-V Kinetics-400 I3D torchscript | `[0, 1]` → uint8 → `[0,255]`, detector rescales | detector's own 224², bilinear | grey ×3 | **16 / 64** consecutive frames, centred, one clip | 400 | one clip = one volume | one row per study | the frame count is part of the metric's definition and is deliberately *not* all-slices |
 | `IS_mean` / `IS_std` | the same TF Inception, 1008-way logits | `[0, 1]` → uint8 | 299², bilinear | grey ×3 | **every** slice of array axis 0 | 1008 | one slice | longer volume → more rows | no ground truth involved |
-| `hlip_findings_*` | HLIP `clip-vit_base-scan_study-dualdinotxt1568` @ `6e4b8ab1` (MR-RATE-trained) | `[0, 1]`, then the official loader's scalar ImageNet normalize | pad to square → 256² → **full-depth deterministic resample of the whole slice axis to 48** (`nearest-exact`) → centre crop 224² | 1 | all of them, resampled to **48**: an architectural constant (`img_size=(48,224,224)`, patch `(6,16,16)` → 1568 tokens), not a sampling policy | 768, `image_features[:, 1]` | **one volume = one study of one scan** | one row per study | `"This study looks like: " + findings`, HLIP's own template; identity is `study_uid` |
-| `hlip_impression_*` | the same | the same | the same | 1 | the same | 768, `image_features[:, 0]` | the same | one row per study | `"This study shows: " + impression`, HLIP's own template; identity is `study_uid` |
+| `hlip_*` / `hlip_real_*` | HLIP `clip-vit_base-scan_study-dualdinotxt1568` @ `6e4b8ab1` (Michigan-trained, not MR-RATE) | `[0, 1]` → uint8, then the official loader's scalar ImageNet normalize | per series: pad to square → 256² → `nearest-exact` along the slice axis to **48** → centre crop 224² | 1 | **48** per series, the rest dropped (110 of a 158-slice volume): an architectural constant (`img_size=(48,224,224)`, patch `(6,16,16)` → 1568 tokens), not a sampling policy | 768, `image_features[:, 0]` | **one study = all its scored series, one HLIP input** | one row per study | `"This study shows: " + <sentence>` per impression sentence, mean cosine over sentences; identity is `study_uid` |
 | `FID_2p5D_*`, `MSE`/`PSNR`/`SSIM` | VLM3D container, squeezenet1_1 | container's per-slice window | 224² | grey ×3 | every 4th slice of each *array* axis | 512 | one slice | — | the leaderboard's own quirks, kept unchanged |
 
 **The all-slice rule.** Every slice is used unless the extractor architecturally forbids it or
@@ -410,102 +410,89 @@ ever falls back to random or ImageNet weights: a bad hash or a state-dict mismat
 Every other metric in this file would give the same answer if the reports had been shuffled before
 generation. These would not.
 
-`hlip_<variant>_volume_cosine_mean` is the cosine between each generated volume and its own text,
-both L2-normalized; `_std` is the spread over pairs. The retrieval numbers build the full
-text×volume cosine matrix and ask, for each query, whether a correct volume is among the K
-highest-scoring candidates.
+**The unit is the study.** An MR-RATE report describes a whole study, and HLIP embeds a whole
+study, so every scored series of one `study_uid` goes into the model together, as one multi-scan
+input, and is compared with that study's report. On the test population that is 1,010 series in
+268 studies, 202 of them with two or more series. `hlip_*` scores the generated studies and
+`hlip_real_*` the real series of the same cases — the same studies, the same scans, so the second
+is the ceiling of the first. A series that was not generated (missing, collapsed, excluded by a
+trimmed version) leaves both sides of its study.
 
 - **Model.** [HLIP](https://github.com/zch0414/hlip) (TMLR 2026), checkpoint
   [`zch0414/clip-vit_base-scan_study-dualdinotxt1568`](https://huggingface.co/zch0414/clip-vit_base-scan_study-dualdinotxt1568)
-  pinned at revision `6e4b8ab1a1330c59f64a72773c454e513591cf89` — the release upstream **trains on
-  the MR-RATE training split**, with `--text-process-cfg "sentence and findings"`. Its larger
-  sibling `clip-vit_large-scan_study-*` is a stronger brain-MRI tower but was trained on
-  institutional data and only *evaluated* on MR-RATE; in-domain is worth more here than raw
-  strength, and using it would mean scoring MR-RATE reports with a tower that never read one. The
-  build is the model card's: its vendored `hlip` package registers the visual encoder with timm,
+  pinned at revision `6e4b8ab1a1330c59f64a72773c454e513591cf89`. **It is not trained on MR-RATE.**
+  It is one of the four February 2026 releases built on the
+  [`hlip-ablation`](https://github.com/Zch0414/hlip/tree/hlip-ablation) branch. The
+  [ablation blog](https://zch0414.github.io/hlip-ablation/) says they were trained on University
+  of Michigan data (BrainMRI220K + HeadCT240K):
+  - the image side saw whole multi-scan studies;
+  - the text side saw LLM-summarized reports (Prima's pipeline,
+    [paper](https://arxiv.org/abs/2505.21862) appendix B) behind `"This study shows: "`.
+
+  Upstream's MR-RATE-trained models have no released weights, so no released HLIP checkpoint has
+  seen MR-RATE. Because the training data is Michigan's, there is no MR-RATE train/test leakage. The
+  larger sibling `clip-vit_large-scan_study-*` has the same provenance. Base was chosen over it on
+  the mistaken belief that base was in-domain, and that choice has not been re-made on evidence.
+  The build is the model card's: its vendored `hlip` package registers the visual encoder with timm,
   its `model_configs/*.json` is the architecture, its tokenizer files are the tokenizer. Nothing
   pretrained is fetched for either tower, so **every weight comes from the checkpoint**, and
   `load_hlip` raises if any parameter did not — a randomly initialised tower would still produce
   plausible-looking cosines.
-- **Input.** The model card's `loader`: `[0, 255]` ÷ 255, pad to square, bilinear resize to 256²,
-  `nearest-exact` along the slice axis to 48, centre-crop to 224², normalize by the *scalar* means
-  of the ImageNet channel statistics. A generated series is presented as a study holding one scan,
-  `[1, 1, 1, 48, 224, 224]`. **No padding and no mask**: the checkpoint is built with
-  `max_num_scans=0`, so it has no per-scan position embedding and no attention or padding mask
-  anywhere — `num_scans` is read off the input's shape and every slot present is a real scan, which
-  is why the official `StudyDataset` runs at `batch_size=1`. A blank scan must therefore never be
-  fabricated to pad: `_scan2study` averages prefix tokens over the scan axis, so an empty slot would
-  drag the study embedding. The 48-slice depth is an **architectural** cap (`img_size=(48,224,224)`
-  at patch `(6,16,16)` → 1568 tokens) and the official loader's `nearest-exact` resample is what
-  meets it. What the loader does **not** pin is the intensity mapping — upstream's scans are uint8
-  tensors built by data-processing code the repo has since removed — so our 0.5/99.5 percentile
-  window over nonzero voxels is not provably their transform. It is the same transform for every
-  model scored here, so comparisons hold; absolute cosines are not comparable to HLIP's published
-  numbers.
-- **Two image embeddings, and each variant is scored against its own.** `dualdinotxt` means the
-  visual head emits two prefix tokens (the trunk's `cls_token` and `reg_token`) and upstream trains
-  them under **separate contrastive losses**: `image_features[:, 0]` against the impression
-  sentence, `image_features[:, 1]` against the findings (`hlip_train/train.py`,
-  `image_features_sentence` / `image_features_report`). `VARIANTS` holds that mapping and
-  `signature()` records it. Crossing them is silent — the cosines stay in range and merely stop
-  meaning what the key name says. Upstream's zero-shot scripts index `[:, 0]` unconditionally
-  because every prompt they ship is a `"This study shows: …"` one.
-- **Text: HLIP's own MR-RATE templates**, re-encoded by HLIP's own tokenizer and text tower; the
-  generator's CXR-BERT *vector* never reaches this file. `findings` is
-  `"This study looks like: " + findings` and `impression` is `"This study shows: " + impression` —
-  upstream's `get_findings` / `get_impressions`, spaced after the colon where upstream is
-  inconsistent about it. Both are identified by `study_uid`: one study's report is one report
-  however many series it has. There is **no impression↔findings fallback**: a case missing a
-  section is excluded from that variant alone and counted in `n_hlip_<variant>_excluded_no_text`,
-  and strings past HLIP's 256-token context are counted in `n_hlip_<variant>_truncated`.
-- **The generator's own conditioning string is no longer scored.** `hlip_condition_*` was a third
-  variant holding the exact `[MODALITY] … [PLANE] …` + `[FINDINGS]` + `[IMPRESSION]` string the
-  model was conditioned on. It is gone: that string is deliberately outside this tower's text
-  distribution, and **42.7% of them ran past the 256-token context** (300 val series, median 238,
-  p90 403, max 655), so the number reported truncation as much as generation quality.
-  `conditioning_uid` survives in `main.py` as manifest provenance — no metric reads it.
-- **Positives come from the study id, never from a row index or a string.** A candidate is correct
-  for a query when it belongs to that same study; the diagonal is one such positive and is never
-  excluded, and a study with several series has several. Queries are the distinct studies, so one
-  study contributing several series does not become several identical queries — but it does get
-  several chances to be hit, which `hlip_<variant>_positives_per_query_mean` reports. Two studies
-  whose reports read alike stay two answers.
-- **R@K is capped at `min(K, n_candidates)`** — a four-volume run reports R@5 = R@10 = 1.0, which
-  means nothing. Read `n_hlip_<variant>_candidates` first, and use a production pool of hundreds;
-  the smoke run checks plumbing only. For the same reason, a comparison across guidance settings
-  should be restricted to the cases every setting generated: a collapsed rollout changes the
-  candidate pool, not just the score.
-- **Does it discriminate at all? Impression does; findings barely.** Measured on 57 real MR-RATE
-  val series (ground truth, not rollouts), each variant against the token it is scored on:
+- **Text: one impression sentence at a time.** Image token 0 (`cls`) was trained against
+  `"This study shows: "` + one sentence of an LLM-summarized report (`hlip-ablation` `data.py`
+  `get_sentence`). MR-RATE impressions are bulleted findings, so `impression_sentences` splits them
+  into bullets and the bullets into sentences, drops headers (`Cranial:`, `MR Venography:`) and
+  anonymisation placeholders (`[radiologist_1]`), and each sentence becomes one
+  `"This study shows: <sentence>"` text. A report's similarity to a study is the **mean cosine over
+  its sentences**. On the test population that is 1.9 sentences per study, a median of 69
+  characters each; **20 of the 268 studies have an empty impression** and are excluded from both
+  sides, counted in `n_hlip_excluded_no_impression`. Findings are not scored: token 1 was trained on
+  the whole summary, and no released checkpoint saw a findings template.
+- **Image: the study, through the hierarchy it was trained with.** Each series is prepared by the
+  model card's `loader`: pad to square, bilinear resize to 256², `nearest-exact` along the slice
+  axis to 48, centre-crop to 224², the *scalar* means of the ImageNet channel statistics. The
+  study's series are stacked into `[1, n_scans, 1, 48, 224, 224]`; layers 0, 1, 3, 4, 6, 7, 9 and 10
+  attend within each scan, layers 2, 5, 8 and 11 across the whole study. `max_num_scans=0` means no
+  per-scan position embedding and no mask, so the scans are an unordered set (tested) and every slot
+  must be a real one — a blank scan is never added. The 48-slice depth is an **architectural** cap,
+  and `nearest-exact` meets it by **keeping 48 slices of each series and dropping the rest** (110
+  of a 158-slice volume). The intensity mapping is not pinned by upstream: its scans are uint8
+  tensors built by data-processing code it has since removed, and the paper states a [0.5, 99.5]
+  percentile clip without saying over which voxels. Ours is a 0.5/99.5 window over all voxels, the
+  same for every model, so comparisons hold; absolute cosines are not comparable to HLIP's
+  published numbers.
+- **The model runs once, after pooling.** A study's series land in different array tasks, and study
+  attention needs all of them in one forward pass. So a shard keeps each series as the uint8
+  48×224×224 scan the model would read (2.4 MB a side, ~150 MB per shard feature file at 32
+  tasks), and `summarize` encodes every study when the run is pooled — inside `--combine`, or at
+  the end of a rescore. uint8 is what upstream's own scans are; for the 256² volumes the metrics
+  are handed, the stored scan is exactly what the loader computes from a uint8 volume.
+  [`rescore_hlip.py`](rescore_hlip.py) rescores a finished run with the HLIP keys alone — the same
+  filters and trims as `score_cached`, written to `<run>/hlip_study[_<bounds>[_trimgen]].json` —
+  for when only HLIP has changed; `--raw_root` points it at another machine's MR-RATE copy.
+- **The numbers.** With `n` studies and one correct answer per row:
+  - `cosine_mean` / `_std`: the matched report–study score over studies;
+  - `report_to_study_r{1,5,10}`, `_mrr`, `_auroc`: each report ranks all `n` studies;
+  - `study_to_report_*`: each study ranks all `n` reports. This is the cleaner direction, because
+    it compares one study with every report, so how many scans a study has cannot favour it.
 
-  | variant | token | matched | shuffled | σ above shuffled | R@1 (chance 0.018) |
-  |---|---|---|---|---|---|
-  | `impression` | 0 | 0.1861 | 0.1415 | **4.13** | 0.035 |
-  | `findings` | 1 | 0.0818 | 0.0672 | **1.39** | 0.053 |
-
-  Both variants do score highest on the token upstream trained them against (findings reads 1.13σ
-  on token 0 against 1.39 on token 1; impression 4.13 on token 0 against 4.03 on token 1) — the
-  mapping is right, but the gap between tokens is far smaller than the gap between variants. So
-  **read `hlip_impression_*` as the primary number.** The findings head is the one upstream's
-  `train.py` trains through a `logit_bias` stand-in it marks FIXME, and every prompt HLIP ships for
-  zero-shot work is a `"This study shows: …"` one, so the impression head is the better-exercised
-  of the two.
-
-  Even 4.1σ is a ceiling worth keeping in view: at n=57 impression's R@1 is twice chance and
-  findings' three times, on *real* scans. A small `hlip_*` gap between two models is noise; only a
-  large one is evidence.
-  `tests/test_medical_metrics.py::test_matched_beats_shuffled_on_real_mr_rate_volumes` asserts the
-  sign on impression at n=64 and reports findings without asserting, so a change that breaks the
-  text or image path is caught without the suite going flaky over findings' effect size. At that n,
-  1,000 permutations give **p=0.001** for impression (the floor the permutation count allows) and
-  **p=0.044** for findings — both positive, an order of magnitude apart in confidence.
-
-- **Retrieval depends on the size of the candidate pool** — more candidates is a harder retrieval —
-  which is one more reason scoring is a single pass over the whole population.
+  Chance is `K / n` for R@K, 0.5 for AUROC. **Ties are scored at their expected value under a
+  random tie-break**: normal studies often share an impression ("Cranial MRI examination within
+  normal limits."), no model can tell those apart, and counting the tie as a hit or as a miss would
+  bias the number either way. `n_hlip_duplicate_reports` says how many studies are tied like that.
+  Retrieval identity is the study id, never the text.
+- **Read `hlip_*` against `hlip_real_*`, never on its own.** The raw cosine moves with how
+  realistic a volume looks as well as with whether it matches its report, which is why a ceiling
+  and rank-based numbers are reported beside it. Generated series of one study are rolled out
+  independently, so they need not share an anatomy the way real ones do — part of any gap to the
+  ceiling is that, not the report.
 - **Independence.** MRFlow conditions on CXR-BERT, so HLIP is an independent judge.
   `warn_if_not_independent` checks `config.mri.text_checkpoint` at start-up and prints a banner if
   that ever stops being true — a model scored by its own conditioning encoder is grading its own
-  homework.
+  homework. The HLIP-conditioned arms in the `MRFlow-hlip*` worktrees are not independent of it.
+- `tests/test_medical_metrics.py::test_matched_beats_shuffled_on_real_mr_rate_studies` asserts that
+  on 40 real val studies a report sits closer to its own study than to a shuffled one (1,000
+  permutations).
 
 `--no-hlip` skips the tower and its 1.5 GB download; the `hlip_*` keys then read nan.
 
@@ -623,18 +610,17 @@ numbers that mean something before the bookkeeping that qualifies them:
 1. `FVD_f16`, `FVD_f64`
 2. `fid_2d_inception`, `fid_3d_medicalnet`, `fid_2p5d_radimagenet_{mean,axial,coronal,sagittal}`,
    `FID_2p5D_{Avg,XY,XZ,YZ}`
-3. HLIP, most important first and grouped by metric across the three variants so the same number
-   reads side by side: `_volume_cosine_mean`, `_to_volume_r{1,5,10}`, then the harder
-   `_within_stratum` triple, then `_volume_cosine_std` and `_positives_per_query_mean`
+3. HLIP, each number generated-then-real side by side: `_cosine_mean`, the R@K of both
+   directions, their AUROC and MRR, then `_cosine_std`
 4. `IS_mean`, `IS_std`
 5. `PSNR_mean`, `MSE_mean`, `SSIM_mean`
 6. every `n_*`: the per-metric sample counts in the same family order, then the run-level file
    counts
 
-44 scores and 37 counts. **Both sample counts are reported for every distance** — nothing forces a
+103 scores and 42 counts. **Both sample counts are reported for every distance** — nothing forces a
 rollout to the reference's length, so **unequal counts are expected** and equalizing them would
-hide a real failure mode. `n_hlip_<variant>_{queries,candidates}` matter for a different reason —
-an R@K is capped at `min(K, n_candidates)`, so a tiny run reports R@10 = 1.0.
+hide a real failure mode. `n_hlip_studies` matters for a different reason —
+it sets an R@K's chance level, and a run of fewer than 10 studies reports R@10 = 1.0.
 
 One caveat on the counts: `n_total_files` counts eligible MR-RATE series from `list_series` (report
 present, not derived, not a localizer, no duplicate acquisitions), not files in the platform's
