@@ -527,7 +527,7 @@ def main():
                 and global_step % config.checkpointing_steps == 0
             ):
                 # Mid-spike, a save would become the checkpoint the guard reloads into.
-                if spike_factor and loss_slow and loss_fast > 1.5 * loss_slow:
+                if spike_factor and spike_steps >= 500 and loss_fast > 1.5 * loss_slow:
                     logger.warning(f"Loss rising at step {global_step}; checkpoint not saved.")
                 else:
                     cleanup_checkpoints(config, logger)

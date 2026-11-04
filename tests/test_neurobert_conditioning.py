@@ -346,7 +346,14 @@ def test_one_training_step(neurobert):
     """train.py's step: frozen encoder untouched and gradient-free, text adapters and trunk move."""
     encoder = neurobert[0]
     before = {n: p.clone() for n, p in encoder.named_parameters()}
+    # A fresh STDiT is inert (final_layer and every cross_attn.proj zero-init), so on its first
+    # step nothing upstream of the output gets a gradient. Wake only those two, not the text
+    # adapters under test, so the zero-init pooled_embedder still has to leave zero below.
     model = make_model().cuda().train()
+    with torch.no_grad():
+        model.model.final_layer.linear.weight.normal_(0, 0.05)
+        for block in model.model.blocks:
+            block.cross_attn.proj.weight.normal_(0, 0.05)
     model.model.y_embedder.y_embedding.data.copy_(encode_neurobert_null(*neurobert, L))
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
     start = {n: p.detach().clone() for n, p in model.named_parameters()}

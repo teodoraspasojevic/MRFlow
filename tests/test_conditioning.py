@@ -383,9 +383,10 @@ def test_cond_image_and_plane_are_identical_across_branches():
 
     original = model.model.forward
 
-    def spy(x, timestep, y=None, mask=None, modality_id=None, plane_id=None, force_drop_ids=None):
+    def spy(x, timestep, y=None, mask=None, modality_id=None, plane_id=None, force_drop_ids=None,
+            pooled=None):
         seen["x"], seen["plane_id"], seen["timestep"] = x, plane_id, timestep
-        return original(x, timestep, y, mask, modality_id, plane_id, force_drop_ids)
+        return original(x, timestep, y, mask, modality_id, plane_id, force_drop_ids, pooled)
 
     model.model.forward = spy
     inputs = make_inputs(2, "cuda", plane=PLANE_TO_ID["SAGITTAL"])
