@@ -230,6 +230,10 @@ def load_init_weights(config, model, logger):
     `if_fine_tuned`, which resets the step counter *after* such a restore. Point `init_from` at a
     diffusers model directory (e.g. `checkpoint-680000/denoiser_ema`); its EMA save keys match the
     live model exactly, so a non-empty missing/unexpected list means the architectures differ.
+
+    `init_from_skip` lists key prefixes to leave at their fresh init, e.g. the text adapters of a
+    checkpoint trained on another text encoder: `[model.y_embedder., model.caption_norm.,
+    model.pooled_embedder.]` keeps an HLIP-tokens trunk under NeuroBERT conditioning.
     """
     path = config.get("init_from", None)
     if not path:
@@ -237,14 +241,19 @@ def load_init_weights(config, model, logger):
 
     if os.path.isdir(path):
         path = os.path.join(path, "diffusion_pytorch_model.safetensors")
-    missing, unexpected = model.load_state_dict(load_file(path), strict=False)
+    skip = tuple(config.get("init_from_skip", None) or ())
+    state = {k: v for k, v in load_file(path).items() if not k.startswith(skip)}
+    missing, unexpected = model.load_state_dict(state, strict=False)
     logger.info(f"Initialized weights from {path}")
+    if skip:
+        logger.info(f"  left at fresh init: {sorted(n for n in missing if n.startswith(skip))}")
 
     # Only the class-conditioning tensors may be absent -- they postdate the CTFlow checkpoint and
     # are zero-initialized, so the model still predicts exactly what it did. Anything else missing,
     # or anything unexpected, means the config and the checkpoint disagree: that must fail loudly
     # rather than train a partly random model for hours.
-    allowed = {n for n in missing if n.split(".")[-2] in ("modality_embedder", "plane_embedder")}
+    allowed = {n for n in missing if n.split(".")[-2] in ("modality_embedder", "plane_embedder")
+               or n.startswith(skip)}
     if allowed:
         logger.info(f"  new class-conditioning tensors left zero-initialized: {sorted(allowed)}")
     surprises, extras = sorted(set(missing) - allowed), sorted(unexpected)

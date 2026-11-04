@@ -14,9 +14,9 @@ needed and `test` works the same as `val`:
                    per contrast and plane, so `n_total_files` counts series rather than the files
                    in the platform's ground-truth directory. Deduplicating here and not from
                    `mri.max_repeats` is deliberate; see `run_shard`.
-    conditioning   CXR-BERT over the study's report plus the series' acquisition markers -- the
-                   same `encode_conditioning` call preprocessing makes, so the embedding the model
-                   sees here is the one it trained against.
+    conditioning   the config's `mri.text_encoder` over the study's report -- the same
+                   `build_conditioner` call preprocessing makes, so the embedding the model sees
+                   here is the one it trained against.
     generation     one `REGIMES` entry. The task is report-to-volume, so `full-body` is the
                    default; the others exist to diagnose it.
 
@@ -57,10 +57,10 @@ from tqdm import tqdm
 
 import wandb
 from echosyn.common import *
-from echosyn.common.mrrate import (build_text_encoder, encode_conditioning, encode_volume,
+from echosyn.common.mrrate import (build_conditioner, encode_volume,
                                    list_series, load_native_volume, modality_to_id, plane_order,
                                    plane_to_id, preprocess_volume, read_member, read_report,
-                                   sample_id)
+                                   sample_id, text_condition)
 from auto_regressive_generate import LatentAutoregressiveGenerator
 from evaluation import (METRIC_KEYS, EvalAccumulator, comparison_frames,
                         merge_states, metrics_from, signature)
@@ -414,7 +414,7 @@ def run_shard(config, args, out, device):
     generator = build_generator(config, args.ckpt, device, args)
     # Trim here rather than inside generate(), so a collapsed rollout's raw block is still at hand.
     generator.trim = False
-    tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
+    encode_text = build_conditioner(mri, device)
     accumulator = EvalAccumulator(device=device, batch_size=args.feature_batch_size,
                                   hlip_batch_size=args.hlip_batch_size, use_hlip=args.hlip,
                                   modality_ckpt=args.modality_ckpt,
@@ -451,11 +451,18 @@ def run_shard(config, args, out, device):
             nii_bytes = read_member(entry["archive"], entry["member"])
             real, spacing = load_native_volume(nii_bytes, entry["plane"])
             report = read_report(entry["archive"], entry["study_uid"])
-            embedding = encode_conditioning(
-                tokenizer, text_encoder, report,
-                entry["modality"], entry["plane"], max_length=mri.text_max_length,
-            )
-            embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
+            embedding = encode_text(report, entry["modality"], entry["plane"])
+            if isinstance(embedding, dict):
+                # Token-sequence conditioning, exactly as MRRateLatentBlockDataset builds it.
+                sections = mri.get("text_sections") or mri.hlip_sections
+                tokens, mask, pooled = text_condition(embedding, sections,
+                                                      config.denoiser.args.model_max_length)
+                embedding = {"encoder_hidden_states": tokens[None].to(device),
+                             "mask": mask[None].to(device)}
+                if mri.get("neurobert_global_condition") != "none":
+                    embedding["pooled"] = pooled[None].to(device)
+            else:
+                embedding = (embedding / (embedding.norm(p=2) + 1e-6)).unsqueeze(0).to(device)
 
             labels = (torch.tensor([modality_to_id(entry["modality"])], device=device),
                       torch.tensor([plane_to_id(entry["plane"])], device=device))
@@ -664,7 +671,7 @@ def main():
 
     # CLI guidance scales override the config, so a sweep is one sbatch argument.
     check_label_mapping(config)
-    warn_if_not_independent(config.mri.text_checkpoint)
+    warn_if_not_independent(config.mri.get("text_encoder") or config.mri.text_checkpoint)
     for name in ("modality_cfg_scale", "report_cfg_scale"):
         if getattr(args, name) is not None:
             config.guidance[name] = getattr(args, name)

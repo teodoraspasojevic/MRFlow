@@ -854,7 +854,7 @@ class Attention(nn.Module):
 
 
 class MultiHeadCrossAttention(nn.Module):
-    def __init__(self, d_model, num_heads, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, d_model, num_heads, attn_drop=0.0, proj_drop=0.0, qk_norm=False):
         super(MultiHeadCrossAttention, self).__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
@@ -864,6 +864,8 @@ class MultiHeadCrossAttention(nn.Module):
 
         self.q_linear = nn.Linear(d_model, d_model)
         self.kv_linear = nn.Linear(d_model, d_model * 2)
+        self.q_norm = nn.LayerNorm(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = nn.LayerNorm(self.head_dim) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(d_model, d_model)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -876,6 +878,8 @@ class MultiHeadCrossAttention(nn.Module):
         q = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)
         kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
         k, v = kv.unbind(2)
+        # LayerNorm autocasts to fp32; xformers needs q, k, v in one dtype.
+        q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
 
         attn_bias = None
         if mask is not None:
@@ -1034,6 +1038,7 @@ class STDiTBlock(nn.Module):
         drop_path=0.0,
         enable_flashattn=False,
         uncond=False,
+        qk_norm=False,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -1047,10 +1052,11 @@ class STDiTBlock(nn.Module):
             hidden_size,
             num_heads=num_heads,
             qkv_bias=True,
+            qk_norm=qk_norm,
             enable_flashattn=False,
         )
         if uncond:
-            self.cross_attn = self.mha_cls(hidden_size, num_heads)
+            self.cross_attn = self.mha_cls(hidden_size, num_heads, qk_norm=qk_norm)
         self.norm2 = nn.LayerNorm(hidden_size, eps=1e-6, elementwise_affine=False)
         self.mlp = Mlp(
             in_features=hidden_size,
@@ -1071,6 +1077,7 @@ class STDiTBlock(nn.Module):
             hidden_size,
             num_heads=num_heads,
             qkv_bias=True,
+            qk_norm=qk_norm,
             enable_flashattn=self.enable_flashattn,
         )
 
@@ -1143,6 +1150,10 @@ class STDiT(nn.Module):
         enable_flashattn=False,
         num_modality_classes=0,  # 0 to disable
         num_plane_classes=0,  # 0 to disable
+        qk_norm=False,  # LayerNorm on q and k in every attention, bounds the logits
+        pooled_channels=0,  # pooled report vector added to the timestep embedding; 0 to disable
+        y_norm=False,  # RMSNorm on the projected caption tokens (Sana)
+        y_norm_scale_factor=1.0,  # initial RMSNorm gain; Sana uses 0.01
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -1184,6 +1195,10 @@ class STDiT(nn.Module):
             if caption_channels > 0
             else None
         )
+        # Sana's fix for a non-T5 text encoder in this block: the projected caption tokens are
+        # RMS-normalized before any cross-attention sees them, null report included.
+        self.y_norm_scale_factor = y_norm_scale_factor
+        self.caption_norm = nn.RMSNorm(hidden_size, eps=1e-5) if y_norm else None
 
         # Modality and plane class conditioning, NVIDIA MAISI's pattern: one nn.Embedding per
         # attribute at the timestep-embedding width, summed into the timestep embedding. Kept
@@ -1196,6 +1211,12 @@ class STDiT(nn.Module):
         )
         self.plane_embedder = (
             nn.Embedding(num_plane_classes, hidden_size) if num_plane_classes > 0 else None
+        )
+        # A pooled report vector (HLIP's projected CLS, NeuroBERT's mean-pooled embedding) into
+        # the timestep embedding, SD3's route for its pooled CLIP vector, while the token sequence
+        # goes through cross-attention.
+        self.pooled_embedder = (
+            nn.Linear(pooled_channels, hidden_size) if pooled_channels > 0 else None
         )
 
         drop_path = [x.item() for x in torch.linspace(0, drop_path, depth)]
@@ -1210,6 +1231,7 @@ class STDiT(nn.Module):
                     d_t=self.num_temporal,
                     d_s=self.num_spatial,
                     uncond=(caption_channels > 0),
+                    qk_norm=qk_norm,
                 )
                 for i in range(self.depth)
             ]
@@ -1226,7 +1248,7 @@ class STDiT(nn.Module):
         self.sp_rank = None
 
     def forward(self, x, timestep, y=None, mask=None, modality_id=None, plane_id=None,
-                force_drop_ids=None):
+                force_drop_ids=None, pooled=None):
         """
         Forward pass of STDiT.
         Args:
@@ -1237,6 +1259,7 @@ class STDiT(nn.Module):
             modality_id (torch.Tensor): modality class ids; of shape [B], dtype long
             plane_id (torch.Tensor): plane class ids; of shape [B], dtype long
             force_drop_ids (torch.Tensor): per-sample null-report mask; of shape [B], bool
+            pooled (torch.Tensor): pooled report vector; of shape [B, pooled_channels]
 
         Returns:
             x (torch.Tensor): output latent representation; of shape [B, C, T, H, W]
@@ -1274,9 +1297,25 @@ class STDiT(nn.Module):
             assert ids.shape == (B,), f"{name} must be [{B}], got {tuple(ids.shape)}"
             t = t + embedder(ids).to(t.dtype)
 
+        # The null report drops the token sequence and the pooled vector together, so CFG keeps
+        # its three branches. Drawn here rather than inside y_embedder so both routes agree.
+        if force_drop_ids is None and self.training and self.y_embedder is not None \
+                and self.y_embedder.uncond_prob > 0:
+            force_drop_ids = torch.rand(B, device=x.device) < self.y_embedder.uncond_prob
+        assert (pooled is None) == (self.pooled_embedder is None), \
+            "pooled must be given exactly when pooled_channels > 0"
+        if self.pooled_embedder is not None:
+            keep = 1.0 if force_drop_ids is None else (~force_drop_ids.bool())[:, None].to(t.dtype)
+            t = t + self.pooled_embedder(pooled.to(t.dtype)) * keep
+        if mask is not None and force_drop_ids is not None:
+            # A dropped report is the whole learned null sequence, not its first len(report) rows.
+            mask = torch.where(force_drop_ids.bool()[:, None], torch.ones_like(mask), mask)
+
         t0 = self.t_block(t)  # [B, C]
         if self.y_embedder is not None and y is not None:
             y = self.y_embedder(y, self.training, force_drop_ids)  # [B, 1, N_token, C]
+            if self.caption_norm is not None:
+                y = self.caption_norm(y.float()).to(y.dtype)  # fp32, as Sana computes it
 
             if mask is not None:
                 if mask.shape[0] != y.shape[0]:
@@ -1434,6 +1473,8 @@ class STDiT(nn.Module):
         if self.y_embedder is not None:
             nn.init.normal_(self.y_embedder.y_proj.fc1.weight, std=0.02)
             nn.init.normal_(self.y_embedder.y_proj.fc2.weight, std=0.02)
+        if self.caption_norm is not None:
+            nn.init.constant_(self.caption_norm.weight, self.y_norm_scale_factor)
 
         # Zero-out adaLN modulation layers in PixArt blocks:
         for block in self.blocks:
@@ -1446,9 +1487,11 @@ class STDiT(nn.Module):
 
         # Zero-out the class embeddings, so a checkpoint that predates them predicts exactly as it
         # did (t is unchanged) while every row still receives gradients and can diverge.
-        for embedder in (self.modality_embedder, self.plane_embedder):
+        for embedder in (self.modality_embedder, self.plane_embedder, self.pooled_embedder):
             if embedder is not None:
                 nn.init.constant_(embedder.weight, 0)
+        if self.pooled_embedder is not None:
+            nn.init.constant_(self.pooled_embedder.bias, 0)
 
 
 @dataclass
@@ -1509,6 +1552,10 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
         enable_flashattn=False,
         num_modality_classes=0,
         num_plane_classes=0,
+        qk_norm=False,
+        pooled_channels=0,
+        y_norm=False,
+        y_norm_scale_factor=1.0,
     ):
 
         super().__init__()
@@ -1532,6 +1579,10 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
             enable_flashattn=enable_flashattn,
             num_modality_classes=num_modality_classes,
             num_plane_classes=num_plane_classes,
+            qk_norm=qk_norm,
+            pooled_channels=pooled_channels,
+            y_norm=y_norm,
+            y_norm_scale_factor=y_norm_scale_factor,
         )
 
     def forward(
@@ -1545,6 +1596,7 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
         modality_id=None,
         plane_id=None,
         force_drop_ids=None,
+        pooled=None,
         *args,
         **kwargs,
     ):
@@ -1558,6 +1610,7 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
             modality_id (torch.Tensor): modality class ids; of shape [B], dtype long
             plane_id (torch.Tensor): plane class ids; of shape [B], dtype long
             force_drop_ids (torch.Tensor): per-sample null-report mask; of shape [B], bool
+            pooled (torch.Tensor): pooled report vector; of shape [B, pooled_channels]
         """
         if type(timestep) == int or timestep.ndim == 0:
             timestep = torch.ones(x.shape[0], device=x.device) * timestep
@@ -1582,6 +1635,7 @@ class DiffuserSTDiT(ModelMixin, ConfigMixin):
             modality_id=modality_id,
             plane_id=plane_id,
             force_drop_ids=force_drop_ids,
+            pooled=pooled,
         )
         if not return_dict:
             return (output,)

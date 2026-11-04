@@ -506,6 +506,191 @@ def encode_report(tokenizer, model, text, max_length=512):
     return tokens[:, 0].float().cpu()
 
 
+def encode_hlip(model, tokenizer, report, sections):
+    """Report -> [len(sections), 768]: one HLIP text embedding per section, one caption token each.
+
+    Each section goes through HLIP's own MR-RATE template ("This study looks like: " for findings,
+    "This study shows: " for impression), the strings its text tower was trained on, and is encoded
+    on its own. A missing section is the bare template, i.e. what HLIP makes of an empty one. No
+    acquisition prefix: modality and plane reach the model as class embeddings. HLIP's context is
+    256 tokens, so ~27% of findings are truncated; impressions almost never are.
+    """
+    from evaluation.hlip_metrics import TEMPLATES
+
+    texts = [TEMPLATES[s] + (report.get(s) or "").strip() for s in sections]
+    with torch.no_grad():
+        vecs = model.encode_text(tokenizer(texts).to(next(model.parameters()).device)).float()
+    return (vecs / vecs.norm(dim=-1, keepdim=True)).cpu()
+
+
+def encode_hlip_tokens(model, tokenizer, report):
+    """Report -> `{section: {"tokens": [n, 768] fp16, "pooled": [768]}}` for findings and impression.
+
+    One pass of HLIP's text tower per section, with `encode_hlip`'s template and 256-token cut:
+    `tokens` is BiomedBERT's last hidden state over the non-pad positions (CLS first), `pooled`
+    the L2-normalized projected CLS, i.e. exactly `encode_hlip`'s vector. Both sections are stored
+    so a config picks its sections without re-encoding.
+    """
+    from evaluation.hlip_metrics import TEMPLATES
+
+    text = model.text
+    out = {}
+    with torch.no_grad():
+        for s in ("findings", "impression"):
+            ids = tokenizer([TEMPLATES[s] + (report.get(s) or "").strip()])
+            ids = ids.to(next(model.parameters()).device)
+            mask = (ids != text.config.pad_token_id).long()
+            hidden = text.transformer(input_ids=ids, attention_mask=mask)
+            pooled = text.proj(text.pooler(hidden, mask)).float()[0]
+            out[s] = {"tokens": hidden.last_hidden_state[0, :int(mask.sum())].half().cpu(),
+                      "pooled": (pooled / pooled.norm()).cpu()}
+    return out
+
+
+def encode_hlip_null(model, tokenizer):
+    """[256, 768]: HLIP's text tower over the empty string, every padded position kept.
+
+    Sana's null caption: the text encoder's own encoding of "" padded to the context, so the
+    denoiser's learned null report starts on the same scale as real report tokens.
+    """
+    text = model.text
+    with torch.no_grad():
+        ids = tokenizer([""]).to(next(model.parameters()).device)
+        mask = (ids != text.config.pad_token_id).long()
+        hidden = text.transformer(input_ids=ids, attention_mask=mask).last_hidden_state
+    return hidden[0].float().cpu()
+
+
+# NeuroBERT (Wood et al., Radiology: AI 2025, doi:10.1148/ryai.240619): a 6-layer RoBERTa trained
+# from scratch on UK neuroradiology reports, MLM then Findings<->Summary section matching through
+# mean pooling. The .bin is the only weight file, so it is pinned by sha256 too.
+NEUROBERT_REPO = "davvwood/NeuroBERT"
+NEUROBERT_REVISION = "69c974a5a846953179f2737f5ef8d402f4a9e0d5"
+NEUROBERT_SHA256 = "cb913e3a260f01f25010d4f83967acdda4b848126988da7e164af4b72d5f489a"
+NEUROBERT_FORMAT = "neurobert-v1"  # bump when format_neurobert changes
+
+
+def neurobert_tag(max_length):
+    """What a cached NeuroBERT artifact was encoded with; `text_condition` checks it."""
+    return f"{NEUROBERT_REPO}@{NEUROBERT_REVISION[:8]}|max{max_length}|mean|{NEUROBERT_FORMAT}"
+
+
+def load_neurobert(device):
+    """Frozen NeuroBERT -> (model, tokenizer), at the pinned revision.
+
+    Built as `RobertaModel(config)` and loaded strictly from the sha256-checked .bin, because
+    transformers refuses `torch.load` below torch 2.6 and there is no safetensors file. The pooler
+    is left out: its weights are untouched initialization (std 0.0200, bias 0), never trained.
+    """
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer, RobertaConfig, RobertaModel
+
+    path = snapshot_download(NEUROBERT_REPO, revision=NEUROBERT_REVISION,
+                             allow_patterns=["config.json", "pytorch_model.bin", "vocab.json",
+                                             "merges.txt", "tokenizer.json", "tokenizer_config.json",
+                                             "special_tokens_map.json"])
+    weights = os.path.join(path, "pytorch_model.bin")
+    with open(weights, "rb") as f:
+        if hashlib.sha256(f.read()).hexdigest() != NEUROBERT_SHA256:
+            raise RuntimeError(f"{weights} does not match the pinned sha256")
+    state = torch.load(weights, map_location="cpu", weights_only=True)
+    state = {k: v for k, v in state.items()
+             if not k.startswith("pooler.") and k != "embeddings.position_ids"}
+    model = RobertaModel(RobertaConfig.from_pretrained(path), add_pooling_layer=False)
+    model.load_state_dict(state, strict=True)
+    model.eval().requires_grad_(False).to(device)
+    return model, AutoTokenizer.from_pretrained(path)
+
+
+def format_neurobert(report):
+    """MR-RATE report -> NeuroBERT's input string: `findings: ... impression: ...`, lowercased.
+
+    Both sections verbatim under MR-RATE's own headings, inline as in the model card's
+    `mri head: ... conclusion: ...`. Lowercased because the vocabulary is: a capital letter is a
+    lone byte token ("Left" -> L/ef/t). Whitespace runs become one space, since the BPE has no tab
+    merge and no newline merge other than after spaces. Nothing else is touched. An empty section
+    is left out with its heading.
+    """
+    parts = [f"{s}: {' '.join(report[s].split())}"
+             for s in ("findings", "impression") if (report.get(s) or "").strip()]
+    return " ".join(parts).lower()
+
+
+def encode_neurobert_tokens(model, tokenizer, report, max_length=512):
+    """Report -> `{"neurobert": {"tokens": [n, 768] fp16, "pooled": [768], "n_tokens", "tag"}}`.
+
+    `tokens` is the last hidden state over every position, `<s>` and `</s>` included, cut at
+    `max_length` (right truncation keeps `</s>`). `pooled` is the SentenceTransformer embedding --
+    the mean of those same states, the representation NeuroBERT's sentence objective trained --
+    L2-normalized, since that objective is a cosine. `n_tokens` is the untruncated length.
+    """
+    text = format_neurobert(report)
+    ids = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
+    with torch.no_grad():
+        hidden = model(**ids.to(model.device)).last_hidden_state[0].float()
+    pooled = hidden.mean(0)
+    return {"neurobert": {
+        "tokens": hidden.half().cpu(),
+        "pooled": (pooled / pooled.norm()).cpu(),
+        "n_tokens": len(tokenizer(text, verbose=False)["input_ids"]),
+        "tag": neurobert_tag(max_length),
+    }}
+
+
+def encode_neurobert_null(model, tokenizer, max_length=512):
+    """[max_length, 768]: NeuroBERT over the empty string, padded to the context, every position
+    kept -- Sana's null caption, as `encode_hlip_null`."""
+    ids = tokenizer("", padding="max_length", max_length=max_length, return_tensors="pt")
+    with torch.no_grad():
+        hidden = model(**ids.to(model.device)).last_hidden_state
+    return hidden[0].float().cpu()
+
+
+def text_condition(artifact, sections, max_tokens):
+    """A token-sequence artifact -> (tokens [max_tokens, D], mask [max_tokens] bool,
+    pooled [len(sections) * D]): the sections' sequences concatenated and zero-padded, and their
+    pooled vectors concatenated. NeuroBERT artifacts carry a tag that must match `max_tokens`."""
+    for s in sections:
+        if "tag" in artifact[s] and artifact[s]["tag"] != neurobert_tag(max_tokens):
+            raise ValueError(f"text artifact {artifact[s]['tag']!r} != {neurobert_tag(max_tokens)!r}")
+    tokens = torch.cat([artifact[s]["tokens"] for s in sections]).float()
+    if len(tokens) > max_tokens:
+        raise ValueError(f"{len(tokens)} text tokens > model_max_length {max_tokens}")
+    mask = torch.zeros(max_tokens, dtype=torch.bool)
+    mask[:len(tokens)] = True
+    padded = torch.zeros(max_tokens, tokens.shape[1])
+    padded[:len(tokens)] = tokens
+    pooled = torch.cat([artifact[s]["pooled"] for s in sections]).float()
+    return padded, mask, pooled
+
+
+def build_conditioner(mri, device):
+    """`encode(report, modality, plane) -> [N, D]` for the config's `mri.text_encoder`.
+
+    `cxr_bert` (the default, so older configs keep working) is the prefixed CXR-BERT CLS of
+    `encode_conditioning`, `[1, 768]`; `hlip` is `encode_hlip` over `mri.hlip_sections`, one token
+    per section, so `denoiser.args.model_max_length` must equal their count. `hlip_tokens` and
+    `neurobert_tokens` return their artifact dicts instead, which `text_condition` turns into model
+    inputs.
+    """
+    if mri.get("text_encoder", "cxr_bert") == "neurobert_tokens":
+        model, tokenizer = load_neurobert(device)
+        return lambda report, modality, plane: encode_neurobert_tokens(
+            model, tokenizer, report, mri.text_max_length)
+    if mri.get("text_encoder", "cxr_bert") == "hlip_tokens":
+        from evaluation.hlip_metrics import load_hlip
+        model, tokenizer = load_hlip(device)
+        return lambda report, modality, plane: encode_hlip_tokens(model, tokenizer, report)
+    if mri.get("text_encoder", "cxr_bert") == "hlip":
+        from evaluation.hlip_metrics import load_hlip
+        model, tokenizer = load_hlip(device)
+        sections = list(mri.hlip_sections)
+        return lambda report, modality, plane: encode_hlip(model, tokenizer, report, sections)
+    tokenizer, model = build_text_encoder(mri.text_checkpoint, device)
+    return lambda report, modality, plane: encode_conditioning(
+        tokenizer, model, report, modality, plane, max_length=mri.text_max_length)
+
+
 ### Artifact storage ###
 
 
@@ -522,9 +707,9 @@ class LatentStore:
     bundle is written fresh, so a killed shard re-encodes all of its series.
     """
 
-    def __init__(self, root, name, bundle=False):
+    def __init__(self, root, name, bundle=False, bundle_dir="latents"):
         self.root = root
-        self.zip_path = os.path.join("latents", f"{name}.zip") if bundle else None
+        self.zip_path = os.path.join(bundle_dir, f"{name}.zip") if bundle else None
         if bundle:
             path = os.path.join(root, self.zip_path)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -568,6 +753,7 @@ class LatentStore:
 # `zip` is the bundle the two paths are members of, or empty when they are loose files.
 MANIFEST_FIELDS = ("sample_id", "split", "modality", "plane", "n_slices",
                    "latent_path", "embedding_path", "zip")
+EMBEDDING_MANIFEST_FIELDS = ("sample_id", "split", "embedding_path", "zip")
 
 
 def read_manifest(root, split):
@@ -579,10 +765,10 @@ def read_manifest(root, split):
     return rows
 
 
-def write_manifest(path, rows):
+def write_manifest(path, rows, fields=MANIFEST_FIELDS):
     """One CSV per preprocessing shard; the dataset globs them, so there is no merge step."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)

@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 
 from echosyn.common.mrrate import (label_counts, load_artifact, modality_to_id, plane_to_id,
-                                   read_manifest)
+                                   read_manifest, text_condition)
 
 
 class LatentBlockDataset(Dataset):
@@ -87,11 +87,25 @@ class MRRateLatentBlockDataset(Dataset):
 
     Modality and plane are resolved to integer class ids at construction, so an unmapped label
     fails here rather than 40 minutes into a run.
+
+    `text_sections`, when set, reads token-sequence artifacts (`encode_hlip_tokens`,
+    `encode_neurobert_tokens`): `embedding` is then the sections' token sequences padded to
+    `max_text_tokens`, plus `embedding_mask` and `pooled`. `global_condition: none` leaves `pooled`
+    out, for a denoiser with `pooled_channels: 0`.
+
+    `embedding_root`, when set, is a second tree holding a different conditioning's report
+    embeddings (`lvfm/preprocess_mrrate.py --embeddings_only`); its rows are joined to the latent
+    manifest on `sample_id`. Unset, the embeddings stored next to the latents are used.
     """
 
     def __init__(self, root, split, block_size=16, p_start=0.3, p_end=0.2,
-                 deterministic=False, seed=42):
+                 deterministic=False, seed=42, embedding_root=None, text_sections=None,
+                 max_text_tokens=None, global_condition="mean_pool"):
         self.root = root
+        self.text_sections = list(text_sections) if text_sections else None
+        self.max_text_tokens = max_text_tokens
+        assert global_condition in ("mean_pool", "none"), global_condition
+        self.global_condition = global_condition
         self.block_size = block_size
         self.p_start = p_start
         self.p_end = p_end
@@ -104,6 +118,17 @@ class MRRateLatentBlockDataset(Dataset):
 
         # Resolve every label up front: the whole manifest is validated once, in the main process.
         self.labels = [(modality_to_id(r["modality"]), plane_to_id(r["plane"])) for r in self.rows]
+
+        self.embedding_root = embedding_root or root
+        self.embedding_rows = self.rows
+        if embedding_root:
+            by_id = {r["sample_id"]: r for r in read_manifest(embedding_root, split)}
+            absent = [r["sample_id"] for r in self.rows if r["sample_id"] not in by_id]
+            if absent:
+                raise RuntimeError(f"{len(absent)} of {len(self.rows)} {split!r} series have no "
+                                   f"embedding under {embedding_root} (first: {absent[:3]})")
+            self.embedding_rows = [by_id[r["sample_id"]] for r in self.rows]
+            print(f"[{split}] embeddings from {embedding_root}")
         modality, plane, pair = label_counts(self.rows)
         print(f"[{split}] {len(self.rows)} series")
         print(f"[{split}] modality: {dict(sorted(modality.items()))}")
@@ -130,6 +155,13 @@ class MRRateLatentBlockDataset(Dataset):
         rng = random.Random(f"{self.seed}-{idx}") if self.deterministic else random
 
         latent = load_artifact(self.root, row, "latent_path")
+        # A trimmed dataset version (lvfm/trim_mrrate.py) reads the latents it was built from and
+        # records the retained window; manifests without these columns use every slice.
+        if row.get("trim_stop"):
+            if latent.shape[1] != int(row["source_slices"]):
+                raise RuntimeError(f"{row['sample_id']}: latent has {latent.shape[1]} slices, the "
+                                   f"trim bounds were computed on {row['source_slices']}")
+            latent = latent[:, int(row["trim_start"]):int(row["trim_stop"])]
         b, T = self.block_size, latent.shape[1]
 
         roll = rng.random()
@@ -141,12 +173,23 @@ class MRRateLatentBlockDataset(Dataset):
             t = rng.randint(0, T - 2 * b)
             block_curr, block_next = latent[:, t:t + b], latent[:, t + b:t + 2 * b]
 
-        embedding = load_artifact(self.root, row, "embedding_path")
-        embedding = embedding / (embedding.norm(p=2) + 1e-6)
+        embedding = load_artifact(self.embedding_root, self.embedding_rows[idx], "embedding_path")
+        text = {}
+        if self.text_sections:
+            # Token-sequence conditioning: padded tokens and their mask for cross-attention, the
+            # pooled vector for the timestep embedding. Hidden states are not normalized.
+            embedding, mask, pooled = text_condition(embedding, self.text_sections,
+                                                     self.max_text_tokens)
+            text = {"embedding_mask": mask}
+            if self.global_condition != "none":
+                text["pooled"] = pooled
+        else:
+            embedding = embedding / (embedding.norm(p=2) + 1e-6)
 
         modality_id, plane_id = self.labels[idx]
 
         return {
+            **text,
             # Posterior parameters, not latents -- train.py samples these before scaling.
             "image": block_curr.float(),   # condition: [2C, T, H, W]
             "video": block_next.float(),   # target:    [2C, T, H, W]

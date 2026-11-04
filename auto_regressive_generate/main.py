@@ -26,7 +26,7 @@ from PIL import Image
 from torchvision import transforms
 
 from echosyn.common import *
-from echosyn.common.mrrate import modality_to_id, plane_to_id
+from echosyn.common.mrrate import modality_to_id, plane_to_id, text_condition
 from auto_regressive_generate import LatentAutoregressiveGenerator
 
 
@@ -64,7 +64,9 @@ def save_video_as_frames(video: torch.Tensor, output_dir: str, n_frames: int = 2
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Auto-regressive CT volume generation")
-    parser.add_argument("--embedding", type=str, required=True, help="Path to CT embedding .pt file")
+    parser.add_argument("--embedding", type=str, required=True,
+                        help="Report embedding .pt: a tensor, or a token-sequence artifact dict "
+                             "(one study's member of the embedding cache's zip bundle)")
     parser.add_argument("--gt-latent", type=str, default=None, help="Path to GT latent .pt file (gt-head / block-wise modes)")
     parser.add_argument("--config", type=str, required=True, help="Path to training config file")
     parser.add_argument("--ckpt", type=str, required=True, help="Path to model checkpoint (denoiser_ema)")
@@ -105,9 +107,20 @@ def main():
     vae_scaling = get_vae_scaler(config, device)
 
     # Load embedding
-    prompt_embedding = torch.load(args.embedding, map_location=device)
-    prompt_embedding = prompt_embedding.unsqueeze(0)
-    prompt_embedding = prompt_embedding / (prompt_embedding.norm(p=2) + 1e-6)
+    prompt_embedding = torch.load(args.embedding, map_location="cpu")
+    if isinstance(prompt_embedding, dict):
+        # Token-sequence conditioning, exactly as MRRateLatentBlockDataset builds it.
+        mri = config.mri
+        tokens, mask, pooled = text_condition(prompt_embedding,
+                                              mri.get("text_sections") or mri.hlip_sections,
+                                              config.denoiser.args.model_max_length)
+        prompt_embedding = {"encoder_hidden_states": tokens[None].to(device),
+                            "mask": mask[None].to(device)}
+        if mri.get("neurobert_global_condition") != "none":
+            prompt_embedding["pooled"] = pooled[None].to(device)
+    else:
+        prompt_embedding = prompt_embedding.unsqueeze(0).to(device)
+        prompt_embedding = prompt_embedding / (prompt_embedding.norm(p=2) + 1e-6)
 
     # Class labels. Resolved through the shared tables, so an id means the same thing here as it
     # did in training, and the checkpoint's own mapping is checked against them.

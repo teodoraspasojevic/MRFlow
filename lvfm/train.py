@@ -100,6 +100,10 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
 
     text_embeddings = torch.stack([e["embedding"] for e in ref_elements], dim=0)
     text_embeddings = text_embeddings.to(accelerator.device, dtype=weight_dtype)
+    # Token-sequence conditioning also carries a padding mask and a pooled vector.
+    text_kwargs = {key: torch.stack([e[key] for e in ref_elements]).to(accelerator.device)
+                   for key in ("embedding_mask", "pooled") if key in ref_elements[0]}
+    text_kwargs = {"mask" if k == "embedding_mask" else k: v for k, v in text_kwargs.items()}
 
     # Validation is fully conditioned: real modality, real plane, no report dropout.
     modality_id = torch.stack([e["modality_id"] for e in ref_elements]).to(accelerator.device)
@@ -122,6 +126,7 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
             kwargs = {
                 **kwargs,
                 "encoder_hidden_states": text_embeddings,
+                **text_kwargs,
                 "cond_image": ref_images,
                 "modality_id": modality_id,
                 "plane_id": plane_id,
@@ -210,7 +215,7 @@ def restore_last_checkpoint(config, accelerator, ema_denoiser, lr_scheduler, log
     """
     dirs = [d for d in os.listdir(config.output_dir) if d.startswith("checkpoint-")]
     if not dirs:
-        raise RuntimeError("Non-finite gradients with no checkpoint to fall back to.")
+        raise RuntimeError("Divergence with no checkpoint to fall back to.")
     path = max(dirs, key=lambda d: int(d.split("-")[1]))
 
     accelerator.load_state(os.path.join(config.output_dir, path))
@@ -251,6 +256,11 @@ def main():
     # Before the EMA copy and before prepare(), so EMA starts from these weights and a later
     # resume still wins over them.
     load_init_weights(config, denoiser, logger)
+    # The learned null report starts as the text encoder's encoding of "" (Sana's null caption).
+    null_text = OmegaConf.select(config, "mri.null_text")
+    if null_text:
+        denoiser.model.y_embedder.y_embedding.data.copy_(torch.load(null_text))
+        logger.info(f"Initialized the null report from {null_text}")
     vae_scaling = get_vae_scaler(config, accelerator.device)
     clamp_v = config.get("clamp_v", float("inf"))
 
@@ -313,6 +323,9 @@ def main():
     consecutive_skips = 0
     recoveries = 0
     recovery_step = 0
+    spike_factor = config.get("loss_spike_factor", None)
+    loss_fast = loss_slow = None
+    spike_steps = 0
     progress_bar = tqdm(
         range(0, config.max_train_steps),
         initial=initial_global_step,
@@ -338,6 +351,9 @@ def main():
 
             text_embeddings = batch["embedding"]
             forward_kwargs["encoder_hidden_states"] = text_embeddings
+            if "embedding_mask" in batch:
+                forward_kwargs["mask"] = batch["embedding_mask"]
+                forward_kwargs["pooled"] = batch.get("pooled")
 
             # Semantic conditioning: modality may be nulled, the report may be dropped, and plane is
             # always the real plane. Class ids stay long -- never cast to the model dtype.
@@ -390,6 +406,19 @@ def main():
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+            # A collapse can keep its gradients finite: the loss jumps to the predict-zero level and
+            # stays there with small gradients, so the non-finite guard never fires -- measured,
+            # mrflow_from_scratch_hlip-tokens trained dead from step 4.8k to 22k. Off unless
+            # `loss_spike_factor` is set. Fast and slow EMAs of the rank-mean loss, so every rank
+            # sees the same numbers and reloads together.
+            spiked = False
+            if spike_factor and accelerator.sync_gradients and not skip_update:
+                step_mean = accelerator.reduce(loss.detach(), "mean").item()
+                loss_fast = step_mean if loss_fast is None else 0.9 * loss_fast + 0.1 * step_mean
+                loss_slow = step_mean if loss_slow is None else 0.995 * loss_slow + 0.005 * step_mean
+                spike_steps += 1
+                spiked = spike_steps >= 500 and loss_fast > spike_factor * loss_slow
+
             if skip_update:
                 skipped_steps += 1
                 consecutive_skips += 1
@@ -397,39 +426,6 @@ def main():
                     f"Non-finite grad norm at step {global_step}; update skipped "
                     f"({consecutive_skips} in a row, {skipped_steps} total)."
                 )
-                # Every rank sees the same all-reduced norm, so they all skip together. A skip
-                # freezes the weights, so when the weight state itself is what overflows, skipping
-                # can never clear it -- measured, the skips then run until the guard fires. Reload
-                # the last checkpoint in place rather than exiting: the state that blew up is the
-                # only thing that has to go, and keeping the allocation saves the queue wait the
-                # chain's afternotok leg would otherwise cost.
-                if consecutive_skips >= config.get("max_consecutive_skipped_steps", 25):
-                    recoveries += 1
-                    max_recoveries = config.get("max_recoveries", 3)
-                    if recoveries > max_recoveries:
-                        raise RuntimeError(
-                            f"{consecutive_skips} consecutive non-finite gradients at step "
-                            f"{global_step}, {recoveries - 1} reloads deep -- the model is dead."
-                        )
-                    logger.warning(
-                        f"{consecutive_skips} consecutive non-finite gradients at step "
-                        f"{global_step}; reload {recoveries} of {max_recoveries}."
-                    )
-                    global_step = restore_last_checkpoint(
-                        config, accelerator, ema_denoiser, lr_scheduler, logger
-                    )
-                    # A checkpoint carries the RNG and sampler state that led into the blow-up, so
-                    # a plain reload would replay straight back into it. Reseed to take a different
-                    # draw; every rank reseeds identically, as at startup.
-                    set_seed(config.seed + 1000 * recoveries)
-                    recovery_step = global_step
-                    consecutive_skips = 0
-                    infinite_loader = cycle(train_dataloader)
-                    optimizer.zero_grad(set_to_none=True)
-                    progress_bar.reset()
-                    progress_bar.update(global_step)
-                    torch.cuda.empty_cache()
-                    continue
             elif accelerator.sync_gradients:
                 consecutive_skips = 0
                 # A reload that carried the run a whole checkpoint interval past the blow-up
@@ -437,6 +433,41 @@ def main():
                 # kill while the run is plainly training.
                 if recoveries and global_step - recovery_step >= config.checkpointing_steps:
                     recoveries = 0
+
+            # Every rank sees the same all-reduced norm, so they all skip together. A skip freezes
+            # the weights, so when the weight state itself is what overflows, skipping can never
+            # clear it -- measured, the skips then run until the guard fires. Reload the last
+            # checkpoint in place rather than exiting: the state that blew up is the only thing
+            # that has to go, and keeping the allocation saves the queue wait the chain's
+            # afternotok leg would otherwise cost.
+            if consecutive_skips >= config.get("max_consecutive_skipped_steps", 25) or spiked:
+                reason = (f"loss spike (EMA {loss_fast:.3f} vs {loss_slow:.3f})" if spiked else
+                          f"{consecutive_skips} consecutive non-finite gradients")
+                recoveries += 1
+                max_recoveries = config.get("max_recoveries", 3)
+                if recoveries > max_recoveries:
+                    raise RuntimeError(
+                        f"{reason} at step {global_step}, {recoveries - 1} reloads deep -- "
+                        f"the model is dead."
+                    )
+                logger.warning(f"{reason} at step {global_step}; reload {recoveries} of "
+                               f"{max_recoveries}.")
+                global_step = restore_last_checkpoint(
+                    config, accelerator, ema_denoiser, lr_scheduler, logger
+                )
+                # A checkpoint carries the RNG and sampler state that led into the blow-up, so a
+                # plain reload would replay straight back into it. Reseed to take a different draw;
+                # every rank reseeds identically, as at startup.
+                set_seed(config.seed + 1000 * recoveries)
+                recovery_step = global_step
+                consecutive_skips = 0
+                loss_fast = loss_slow  # re-measured against the pre-spike baseline
+                infinite_loader = cycle(train_dataloader)
+                optimizer.zero_grad(set_to_none=True)
+                progress_bar.reset()
+                progress_bar.update(global_step)
+                torch.cuda.empty_cache()
+                continue
 
             logs = {
                 "step_loss": loss.detach().item(),
@@ -461,6 +492,7 @@ def main():
                         # Realized rates, so a mis-specified condition_states block is visible.
                         "report_drop_rate": report_drop.float().mean().item(),
                         "modality_null_rate": (modality_id == CFG_NULL_MODALITY_ID).float().mean().item(),
+                        **({"loss_ema_ratio": loss_fast / loss_slow} if loss_slow else {}),
                     },
                     step=global_step,
                 )
@@ -494,8 +526,12 @@ def main():
                 and accelerator.is_main_process
                 and global_step % config.checkpointing_steps == 0
             ):
-                cleanup_checkpoints(config, logger)
-                save_checkpoint(config, accelerator, logger, global_step, ema_denoiser)
+                # Mid-spike, a save would become the checkpoint the guard reloads into.
+                if spike_factor and loss_slow and loss_fast > 1.5 * loss_slow:
+                    logger.warning(f"Loss rising at step {global_step}; checkpoint not saved.")
+                else:
+                    cleanup_checkpoints(config, logger)
+                    save_checkpoint(config, accelerator, logger, global_step, ema_denoiser)
 
             if accelerator.sync_gradients and global_step >= config.max_train_steps:
                 break

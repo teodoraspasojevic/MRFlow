@@ -25,6 +25,13 @@ def safe_compile(model: torch.nn.Module, name: str = "model", dynamic: bool = Fa
         return model
 
 
+def text_kwargs(prompt_embeds, repeats=1):
+    """Denoiser kwargs for one report, repeated `repeats` times along the batch."""
+    if not isinstance(prompt_embeds, dict):
+        prompt_embeds = {"encoder_hidden_states": prompt_embeds}
+    return {k: v.repeat(repeats, *[1] * (v.dim() - 1)) for k, v in prompt_embeds.items()}
+
+
 class LatentAutoregressiveGenerator:
     """
     Auto-regressive generator for latent video volumes.
@@ -104,6 +111,8 @@ class LatentAutoregressiveGenerator:
         return latents
 
     def velocity(self, t, y, prompt_embeds, cond_image, modality_id, plane_id):
+        # `prompt_embeds` is the [B, N, D] report tokens, or for token-sequence conditioning a dict
+        # of `encoder_hidden_states`, `mask` and `pooled` -- see `text_kwargs`.
         """One velocity for the ODE right-hand side, guided over modality and report.
 
         Three branches, batched into a single denoiser call:
@@ -124,7 +133,7 @@ class LatentAutoregressiveGenerator:
         s_mod, s_rep = self.modality_cfg_scale, self.report_cfg_scale
         if s_mod == 1.0 and s_rep == 1.0:
             return self.denoiser(
-                y, t, encoder_hidden_states=prompt_embeds, cond_image=cond_image,
+                y, t, **text_kwargs(prompt_embeds), cond_image=cond_image,
                 modality_id=modality_id, plane_id=plane_id,
             ).sample
 
@@ -133,7 +142,7 @@ class LatentAutoregressiveGenerator:
         drop = torch.tensor([True, True, False], device=y.device)
         v = self.denoiser(
             y.repeat(K, 1, 1, 1, 1), t,
-            encoder_hidden_states=prompt_embeds.repeat(K, 1, 1),
+            **text_kwargs(prompt_embeds, K),
             cond_image=cond_image.repeat(K, 1, 1, 1, 1),
             modality_id=torch.cat([null_modality, modality_id, modality_id]),
             plane_id=plane_id.repeat(K),
