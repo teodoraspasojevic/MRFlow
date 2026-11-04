@@ -29,9 +29,13 @@ export http_proxy="http://proxy.nhr.fau.de:80"
 export https_proxy="http://proxy.nhr.fau.de:80"
 export no_proxy="localhost,127.0.0.1"
 
+# Text2CT is compared only once both of its runs exist (it can be generated later and this rerun).
 T2CT_NULL=$WS/baselines/runs/text2ct_test_step56000_null
-[ -f $T2CT_NULL/shard-0000.json ] || $VENV/bin/python -m baselines.common.ingest \
-    --cases $SUBSET --nifti $T2CT_NULL/nifti --out $T2CT_NULL --label "Text2CT step56000 null report"
+T2CT_FULL=$WS/baselines/runs/text2ct_test_step56000_cfg1
+if [ -d $T2CT_NULL/nifti ] && [ ! -f $T2CT_NULL/shard-0000.json ]; then
+    $VENV/bin/python -m baselines.common.ingest --cases $SUBSET --nifti $T2CT_NULL/nifti \
+        --out $T2CT_NULL --label "Text2CT step56000 null report"
+fi
 
 compare() {   # <full-report run> <null-report run>
     echo "=== $2"
@@ -40,7 +44,9 @@ compare() {   # <full-report run> <null-report run>
         --score_collapsed --workers 16 --out "$2/hlip_null_report.json"
 }
 
-compare $WS/baselines/runs/text2ct_test_step56000_cfg1 $T2CT_NULL
+if [ -f $T2CT_NULL/shard-0000.json ] && [ -f $T2CT_FULL/shard-0000.json ]; then
+    compare $T2CT_FULL $T2CT_NULL
+fi
 compare $WS/eval/final/scratch_old_ckpt180k/mod1-rep1 $WS/eval/null_report/cxrbert_ckpt180k
 compare $WS/eval/final/qknorm_trim-v1_ckpt120k_mod1rep1 $WS/eval/null_report/qknorm_trim-v1_ckpt120k
 compare $WS/eval/final/sectioned_trim-v1_ckpt200k/mod1-rep1 $WS/eval/null_report/sectioned_trim-v1_ckpt200k
