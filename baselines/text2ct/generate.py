@@ -80,6 +80,8 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=None,
                         help="Report CFG. Defaults to the checkpoint's cfg.guidance_scale (5.0, "
                              "upstream's own). 1.0 is the plain conditional prediction.")
+    parser.add_argument("--null_report", action="store_true",
+                        help="Condition on the zero context only (no report), at --guidance_scale 1.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--overwrite", action="store_true",
                         help="Regenerate cases whose NIfTI already exists. Off, so a requeued "
@@ -113,6 +115,7 @@ class Text2CTSampler:
         self.scale_factor = scale_factor
         self.num_inference_steps = num_inference_steps
         self.guidance_scale = guidance_scale
+        self.null_report = False   # zero context, Text2CT's own unconditional branch
         paths = weight_paths(config)
 
         self.unet, _ = build_unet(config["text2ct_root"], paths["unet"], self.device,
@@ -148,7 +151,8 @@ class Text2CTSampler:
         """-> `(X, Y, Z)` float32 in the decoder's own range. No HU mapping; see the module docstring."""
         generator = torch.Generator(device=self.device).manual_seed(seed)
         latent = torch.randn((1,) + self.latent_shape, device=self.device, generator=generator)
-        context = encode_reports(self.encoder, [text]).to(self.device)
+        context = (null_context(1, self.device) if self.null_report
+                   else encode_reports(self.encoder, [text]).to(self.device))
         labels = torch.tensor([modality_to_id(modality)], device=self.device, dtype=torch.long)
 
         scheduler = build_noise_scheduler(self.config["text2ct_root"], self.config["model_def"])
@@ -194,6 +198,7 @@ def main():
 
     sampler = Text2CTSampler(config, state_dict, scale_factor, args.device,
                              args.num_inference_steps, guidance)
+    sampler.null_report = args.null_report
 
     done = skipped = failed = 0
     for case in cases:
@@ -226,7 +231,8 @@ def main():
         json.dump({"shard": args.shard, "num_shards": args.num_shards,
                    "checkpoint": args.checkpoint, "step": payload.get("global_step"),
                    "epoch": payload.get("epoch"), "seed": args.seed,
-                   "guidance_scale": guidance, "scale_factor": scale_factor,
+                   "guidance_scale": guidance, "null_report": args.null_report,
+                   "scale_factor": scale_factor,
                    "num_inference_steps": args.num_inference_steps,
                    "grid": [volume_cfg["inplane_size"], volume_cfg["inplane_size"],
                             volume_cfg["num_slices"]], "spacing_mm": list(grid_spacing(config)),

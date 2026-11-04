@@ -10,7 +10,7 @@ to their own file beside the run's metrics; nothing else in the run is touched.
 writes `<run>/hlip_study_mrflow_flux_trim-v1_trimgen.json` (`hlip_study.json` without bounds).
 Generated volumes are read from `<run>/generated/` if it exists, otherwise from `generated.tar`
 in place. `--raw_root` replaces the MR-RATE root the manifests record, for a machine that keeps
-the archives elsewhere.
+the archives elsewhere, and `--study_subset <cases file>` keeps only the studies that file lists.
 """
 
 import argparse
@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--score_collapsed", action="store_true")
     parser.add_argument("--raw_root", default=HELMA_RAW_ROOT,
                         help="where this machine keeps the MR-RATE archives")
+    parser.add_argument("--study_subset", default=None,
+                        help="a frozen cases file: score only the studies it lists")
     parser.add_argument("--workers", type=int, default=8, help="processes reading volumes")
     parser.add_argument("--limit", type=int, default=None, help="first N cases only (smoke runs)")
     parser.add_argument("--overwrite", action="store_true")
@@ -47,10 +49,26 @@ def parse_args():
 
 
 def output_name(args):
-    if not args.gt_bounds:
-        return "hlip_study.json"
-    return (f"hlip_study_{os.path.basename(os.path.normpath(args.gt_bounds))}"
-            f"{'_trimgen' if args.trim_generated else ''}.json")
+    name = "hlip_study"
+    if args.gt_bounds:
+        name += (f"_{os.path.basename(os.path.normpath(args.gt_bounds))}"
+                 f"{'_trimgen' if args.trim_generated else ''}")
+    if args.study_subset:
+        name += "_" + os.path.basename(args.study_subset).removesuffix(".json")
+    return name + ".json"
+
+
+def run_cases(out, study_subset=None, limit=None):
+    """Every case of a run's manifests, optionally only those of the subset's studies."""
+    cases = [c for p in sorted(glob(os.path.join(out, "shard-*.json")))
+             for c in json.load(open(p))["cases"]][:limit]
+    if not cases:
+        raise SystemExit(f"no shard-*.json in {out}")
+    if study_subset:
+        with open(study_subset) as handle:
+            keep = {c["study_uid"] for c in json.load(handle)["cases"]}
+        cases = [c for c in cases if c["study_uid"] in keep]
+    return cases
 
 
 def skip_reason(case, bounds, score_collapsed):
@@ -96,16 +114,25 @@ def _load(case):
     return acc.state()
 
 
+def load_states(out, cases, raw_root, bounds, policy, trim, workers):
+    """One HLIP state per case, read in `workers` processes."""
+    tar = None
+    if not os.path.isdir(os.path.join(out, "generated")):
+        with tarfile.open(os.path.join(out, "generated.tar")) as handle:
+            tar = {m.name: (m.offset_data, m.size) for m in handle.getmembers() if m.isfile()}
+    job = {"out": out, "tar": tar, "raw_root": raw_root, "bounds": bounds, "policy": policy,
+           "trim_generated": trim}
+    with Pool(workers, initializer=_init, initargs=(job,)) as pool:
+        return pool.map(_load, cases, chunksize=4)
+
+
 def main():
     args = parse_args()
     path = os.path.join(args.out, output_name(args))
     if os.path.exists(path) and not args.overwrite:
         raise SystemExit(f"{path} exists; pass --overwrite to redo it")
 
-    cases = [c for p in sorted(glob(os.path.join(args.out, "shard-*.json")))
-             for c in json.load(open(p))["cases"]][:args.limit]
-    if not cases:
-        raise SystemExit(f"no shard-*.json in {args.out}")
+    cases = run_cases(args.out, args.study_subset, args.limit)
     bounds, policy = load_trim_version(args.gt_bounds) if args.gt_bounds else (None, None)
     skipped = {}
     keep = []
@@ -117,19 +144,12 @@ def main():
             keep.append(case)
     print(f"[hlip] {len(cases)} cases, {len(keep)} reach HLIP, skipped {skipped}")
 
-    tar = None
-    if not os.path.isdir(os.path.join(args.out, "generated")):
-        with tarfile.open(os.path.join(args.out, "generated.tar")) as handle:
-            tar = {m.name: (m.offset_data, m.size) for m in handle.getmembers() if m.isfile()}
-    job = {"out": args.out, "tar": tar, "raw_root": args.raw_root, "bounds": bounds,
-           "policy": policy, "trim_generated": args.trim_generated}
-    with Pool(args.workers, initializer=_init, initargs=(job,)) as pool:
-        states = pool.map(_load, keep, chunksize=4)
-
+    states = load_states(args.out, keep, args.raw_root, bounds, policy, args.trim_generated,
+                         args.workers)
     metrics = hlip_metrics.summarize(hlip_metrics.merge_states(states))
     result = {"metrics": metrics, "extractors": {"hlip": hlip_metrics.signature()},
               "gt_bounds": args.gt_bounds, "trim_generated": args.trim_generated,
-              "n_cases": len(cases), "skipped": skipped}
+              "study_subset": args.study_subset, "n_cases": len(cases), "skipped": skipped}
     with open(path, "w") as handle:
         json.dump(result, handle, indent=2)
     for key, value in metrics.items():

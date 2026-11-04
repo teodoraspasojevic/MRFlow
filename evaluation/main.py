@@ -299,6 +299,13 @@ def parse_args():
     parser.add_argument("--feature_batch_size", type=int, default=32,
                         help="Slices per forward pass in the Inception and RadImageNet "
                              "extractors. Lower it on a small GPU.")
+    parser.add_argument("--study_subset", type=str, default=None,
+                        help="A frozen cases file (baselines/cases-*.json): keep only the series "
+                             "of the studies it lists, after the usual selection.")
+    parser.add_argument("--null_report", action="store_true",
+                        help="Generate with every report replaced by the model's learned null "
+                             "(its modality_only training state). Measures how much the report "
+                             "drives alignment.")
     parser.add_argument("--hlip", action=argparse.BooleanOptionalAction, default=True,
                         help="Score report-to-volume agreement with the released HLIP brain-MRI "
                              "checkpoint. --no-hlip skips the tower and its 1.5 GB download; the "
@@ -399,6 +406,10 @@ def run_shard(config, args, out, device):
         # Before the shard slice, so every task carves its cases out of the same population.
         if args.n_per_bucket:
             series = select_cases(series, args.n_per_bucket)
+    if args.study_subset:
+        with open(args.study_subset) as handle:
+            keep = {c["study_uid"] for c in json.load(handle)["cases"]}
+        series = [e for e in series if e["study_uid"] in keep]
     series = series[args.shard::args.num_shards][:args.limit]
     # After the slice, so a shard only promises examples from buckets it will actually reach --
     # which matters under a small --limit, where a task sees only the head of the list.
@@ -411,6 +422,7 @@ def run_shard(config, args, out, device):
     generator = build_generator(config, args.ckpt, device, args)
     # Trim here rather than inside generate(), so a collapsed rollout's raw block is still at hand.
     generator.trim = False
+    generator.null_report = args.null_report
     tokenizer, text_encoder = build_text_encoder(mri.text_checkpoint, device)
     accumulator = EvalAccumulator(device=device, batch_size=args.feature_batch_size,
                                   use_hlip=args.hlip, modality_ckpt=args.modality_ckpt,
@@ -497,7 +509,8 @@ def run_shard(config, args, out, device):
     # it has pooled it. The volumes and the manifest are what survive.
     torch.save(accumulator.state(), os.path.join(out, f"shard-{args.shard:04d}.pt"))
     with open(os.path.join(out, f"shard-{args.shard:04d}.json"), "w") as handle:
-        json.dump({"shard": args.shard, "num_shards": args.num_shards, "cases": cases},
+        json.dump({"shard": args.shard, "num_shards": args.num_shards,
+                   "null_report": args.null_report, "cases": cases},
                   handle, indent=2)
     done = sum(c["status"] == "generated" for c in cases)
     print(f"[shard {args.shard}] {len(cases)} cases, {done} volumes cached, "

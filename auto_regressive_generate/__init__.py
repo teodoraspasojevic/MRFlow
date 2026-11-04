@@ -67,6 +67,7 @@ class LatentAutoregressiveGenerator:
         self.dtype = torch.bfloat16 if use_bf16 else torch.float32
         self.ode_steps = ode_steps
         self.trim = True
+        self.null_report = False   # replace every report by the learned null (modality_only)
 
         if use_compile:
             self.denoiser = safe_compile(self.denoiser, "denoiser", dynamic=compile_dynamic)
@@ -123,14 +124,15 @@ class LatentAutoregressiveGenerator:
         """
         s_mod, s_rep = self.modality_cfg_scale, self.report_cfg_scale
         if s_mod == 1.0 and s_rep == 1.0:
+            drop = torch.ones_like(modality_id, dtype=torch.bool) if self.null_report else None
             return self.denoiser(
                 y, t, encoder_hidden_states=prompt_embeds, cond_image=cond_image,
-                modality_id=modality_id, plane_id=plane_id,
+                modality_id=modality_id, plane_id=plane_id, force_drop_ids=drop,
             ).sample
 
         K = 3
         null_modality = torch.full_like(modality_id, CFG_NULL_MODALITY_ID)
-        drop = torch.tensor([True, True, False], device=y.device)
+        drop = torch.tensor([True, True, self.null_report], device=y.device)
         v = self.denoiser(
             y.repeat(K, 1, 1, 1, 1), t,
             encoder_hidden_states=prompt_embeds.repeat(K, 1, 1),

@@ -470,6 +470,9 @@ trimmed version) leaves both sides of its study.
   [`rescore_hlip.py`](rescore_hlip.py) rescores a finished run with the HLIP keys alone — the same
   filters and trims as `score_cached`, written to `<run>/hlip_study[_<bounds>[_trimgen]].json` —
   for when only HLIP has changed; `--raw_root` points it at another machine's MR-RATE copy.
+  [`hlip_null_report.py`](hlip_null_report.py) compares a model's full-report run with its
+  `main.py --null_report` run on the same studies (paired, study-bootstrap CI on the AUROC drop);
+  `slurms/hlip_null_report_submit.sh` runs the whole experiment on `baselines/cases-test-null100.json`.
 - **The numbers.** With `n` studies and one correct answer per row:
   - `cosine_mean` / `_std`: the matched report–study score over studies;
   - `report_to_study_r{1,5,10}`, `_mrr`, `_auroc`: each report ranks all `n` studies;
