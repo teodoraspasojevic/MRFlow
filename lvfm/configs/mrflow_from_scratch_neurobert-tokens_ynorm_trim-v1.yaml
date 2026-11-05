@@ -471,5 +471,14 @@ validation:
   timesteps: 25
   frames: ${globals.target_nframes}
   fps: ${globals.target_fps}
+  fid_fvd:                       # val/fid_block, val/fvd_block: 128 fixed val blocks generated
+    blocks: 128                  # teacher-forced (real previous block), 50 Euler steps, against the
+    steps: 50                    # real blocks; for comparing checkpoints of this run, not quoting.
+    batch_size: 16               # See echosyn/common/block_fid.py.
+  alignment:                     # report-volume alignment, logged as val/report_*: each of 64 val
+    queries: 64                  # blocks (distinct studies) is scored under its own report and 15
+    candidates: 16               # others by its flow loss at 8 fixed timesteps; R@1 chance = 1/16.
+    timesteps: 8                 # See echosyn/common/report_alignment.py.
+    batch_size: 32
 
 seed: 42

@@ -95,6 +95,10 @@ def instantiate_class_from_config(config, *args, **kwargs):
 
 
 def setup_accelerator_and_logging(config, logger):
+    from datetime import timedelta  # local: this module is star-imported downstream
+
+    from accelerate import InitProcessGroupKwargs
+
     logging_dir = os.path.join(config.output_dir, config.logging_dir)
     accelerator_project_config = ProjectConfiguration(
         project_dir=config.output_dir, logging_dir=logging_dir
@@ -105,6 +109,9 @@ def setup_accelerator_and_logging(config, logger):
         log_with=config.report_to,
         project_config=accelerator_project_config,
         step_scheduler_with_optimizer=False,
+        # Validation runs on rank 0 while the others wait at the next allreduce; NCCL's default
+        # 10 min would turn a slow validation into a dead job.
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(minutes=30))],
     )
 
     logging.basicConfig(

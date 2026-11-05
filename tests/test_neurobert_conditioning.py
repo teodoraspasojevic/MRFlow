@@ -412,3 +412,94 @@ def test_init_from_hlip_tokens_keeps_the_trunk_and_reinits_the_text_adapters(tmp
         elif k in hlip_state:
             assert torch.equal(v, hlip_state[k]), k
     assert not model.model.pooled_embedder.weight.any()  # zero init: a no-op at step 0
+
+
+### 8. Report-volume alignment (validation metric) ###
+
+from echosyn.common.report_alignment import pick_queries, report_alignment  # noqa: E402
+
+ALIGN_REPORTS = [  # study -> report; study 4 repeats study 0's text, study 5 is empty
+    {"findings": "Acute infarct in the left pons.", "impression": "Left pontine infarct."},
+    {"findings": "Chronic small vessel disease.", "impression": "No acute abnormality."},
+    {"findings": "Right frontal meningioma, 2 cm.", "impression": "Meningioma."},
+    {"findings": "Hydrocephalus with periventricular oedema.", "impression": "Hydrocephalus."},
+    {"findings": "Acute infarct in the left pons.", "impression": "Left pontine infarct."},
+    EMPTY,
+    {"findings": "Multiple sclerosis plaques.", "impression": "Demyelination."},
+]
+
+
+@pytest.fixture
+def align_dataset(tmp_path, neurobert):
+    """Eight series of seven studies: study 0 has two series."""
+    root, emb = tmp_path / "data", tmp_path / "emb"
+    for d in (root / "latents", root / "manifest", root / "boundary", emb / "embeddings",
+              emb / "manifest"):
+        d.mkdir(parents=True)
+    for name in ("black", "white"):
+        torch.save(torch.zeros(2 * LATENT_C, RES, RES), root / "boundary" / f"{name}.pt")
+    for s, report in enumerate(ALIGN_REPORTS):
+        torch.save(encode_neurobert_tokens(*neurobert, report, L), emb / "embeddings" / f"s{s}.pt")
+    rows, emb_rows = [], []
+    for i, s in enumerate([0, 0, 1, 2, 3, 4, 5, 6]):
+        sid = f"sample{i}"
+        latent = torch.cat([torch.randn(LATENT_C, 2 * BLOCK, RES, RES),
+                            torch.full((LATENT_C, 2 * BLOCK, RES, RES), 0.01)]).half()
+        torch.save(latent, root / "latents" / f"{sid}.pt")
+        rows.append({"sample_id": sid, "split": "val", "modality": "T1w", "plane": "AXIAL",
+                     "n_slices": 2 * BLOCK, "latent_path": f"latents/{sid}.pt",
+                     "embedding_path": "", "zip": ""})
+        emb_rows.append({"sample_id": sid, "split": "val", "embedding_path": f"embeddings/s{s}.pt",
+                         "zip": ""})
+    for path, fields, data in ((root / "manifest" / "val-0000.csv", list(rows[0]), rows),
+                               (emb / "manifest" / "val-0000.csv", EMBEDDING_MANIFEST_FIELDS,
+                                emb_rows)):
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(data)
+    return MRRateLatentBlockDataset(str(root), "val", block_size=BLOCK, p_start=0, p_end=0,
+                                    deterministic=True, embedding_root=str(emb),
+                                    text_sections=["neurobert"], max_text_tokens=L)
+
+
+ALIGN_CONFIG = OmegaConf.create({"sample_latents": True, "globals": {"latent_channels": LATENT_C}})
+
+
+def align(model, dataset, **kwargs):
+    scaling = {"mean": torch.tensor(0.0, device="cuda"), "std": torch.tensor(1.0, device="cuda")}
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        return report_alignment(model.cuda().eval(), dataset, ALIGN_CONFIG, scaling,
+                                queries=8, candidates=4, timesteps=3, batch_size=5, **kwargs)
+
+
+def test_alignment_queries_are_distinct_studies_with_distinct_nonempty_reports(align_dataset):
+    picked = pick_queries(align_dataset, 8)
+    studies = [align_dataset.embedding_rows[i]["embedding_path"] for i in picked]
+    assert len(set(studies)) == len(studies) == 5  # 7 studies, minus the empty and the duplicate
+    assert "embeddings/s5.pt" not in studies
+    assert not {"embeddings/s0.pt", "embeddings/s4.pt"} <= set(studies)
+    assert picked == pick_queries(align_dataset, 8)
+
+
+@gpu_only
+def test_alignment_of_a_text_blind_model_is_exactly_chance(align_dataset):
+    # A fresh STDiT outputs 0 whatever the report: every candidate ties, and ties count at their
+    # expected value, never as a hit.
+    m = align(make_model(), align_dataset)
+    assert m["report_queries"] == 5 and m["report_chance"] == 0.25
+    assert m["report_r1"] == pytest.approx(0.25) and m["report_r5"] == pytest.approx(1.0)
+    assert m["report_mean_rank"] == pytest.approx(2.5)
+    assert m["report_mrr"] == pytest.approx((1 + 1 / 2 + 1 / 3 + 1 / 4) / 4)
+    assert m["report_gap_shuffled"] == 0 and m["report_gap_null"] == 0
+
+
+@gpu_only
+def test_alignment_reads_the_report_and_is_deterministic(align_dataset):
+    torch.manual_seed(0)
+    model = wake(make_model())
+    m1, m2 = align(model, align_dataset), align(model, align_dataset)
+    assert m1 == m2
+    assert m1["report_gap_shuffled"] != 0 and m1["report_gap_null"] != 0
+    assert 0 <= m1["report_r1"] <= 1 and 1 <= m1["report_mean_rank"] <= 4
+    assert all(map(lambda v: v == v, m1.values()))  # no nan

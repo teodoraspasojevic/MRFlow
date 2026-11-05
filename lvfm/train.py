@@ -31,6 +31,8 @@ import wandb
 from echosyn.common import *
 from echosyn.common.schedulers import StepBasedLearningRateScheduleWithWarmup
 from echosyn.common.datasets import instantiate_dataset
+from echosyn.common.block_fid import block_fid_fvd
+from echosyn.common.report_alignment import report_alignment
 from echosyn.common.mrrate import CFG_NULL_MODALITY_ID
 
 
@@ -163,16 +165,27 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
         ref_videos = to_uint8_frames(ref_videos, config).cpu()
         ref_videos = rearrange(ref_videos, "(b t) c h w -> b c t h w", b=B)
 
-        # Paired: the generation and ref_videos are the same block of the same volume, so these are
-        # per-case scores rather than the marginal distribution distances (FVD/FID) reported
-        # separately. They measure structural agreement only, not report-volume semantics.
-        metrics = paired_image_metrics(synthetic_video, ref_videos)
 
         videos = torch.cat([
             label_frames(ref_images, "condition"),
             label_frames(ref_videos, "ground truth"),
             label_frames(synthetic_video, "generated"),
         ], dim=3)
+
+    # Distribution metrics over a fixed set of blocks, replacing the per-case PSNR/SSIM of these
+    # four previews: a generated block is a sample, not a reconstruction of the reference one.
+    metrics = {}
+    if config.validation.get("fid_fvd"):
+        val_denoiser.forward = val_denoiser.forward_original
+        metrics.update(block_fid_fvd(val_denoiser, val_vae, val_dataset, config, vae_scaling,
+                                     **config.validation.fid_fvd))
+
+    if config.validation.get("alignment"):
+        # Report-volume alignment from the model's own loss; see echosyn/common/report_alignment.py.
+        val_denoiser.forward = val_denoiser.forward_original
+        with accelerator.autocast():
+            metrics.update(report_alignment(val_denoiser, val_dataset, config, vae_scaling,
+                                            **config.validation.alignment))
 
     videos = rearrange(videos, "b c t h w -> t c h (b w)")
     if step is not None:
