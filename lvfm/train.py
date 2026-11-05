@@ -198,8 +198,9 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
     videos = videos.numpy()
 
     logger.info(f"Done sampling. {metrics}")
-    # Four plots; the rest of the dict is in the log line above.
-    metrics = {k: metrics[k] for k in ("fid_block", "fvd_block", "report_r1", "report_r5")
+    # The plotted subset; the rest of the dict is in the log line above.
+    metrics = {k: metrics[k] for k in ("fid_block", "fvd_block", "report_r1", "report_r5",
+                                       "report_loss", "report_gap_shuffled", "report_gap_null")
                if k in metrics}
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
