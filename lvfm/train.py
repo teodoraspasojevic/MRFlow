@@ -199,7 +199,7 @@ def log_validation(config, maybe_ema_denoiser, accelerator, weight_dtype, val_da
 
     logger.info(f"Done sampling. {metrics}")
     # Four plots; the rest of the dict is in the log line above.
-    metrics = {k: metrics[k] for k in ("fid_block", "fvd_block", "report_mrr", "report_gap_shuffled")
+    metrics = {k: metrics[k] for k in ("fid_block", "fvd_block", "report_r1", "report_r5")
                if k in metrics}
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
