@@ -20,6 +20,7 @@ import io
 import json
 import os
 import random
+import re
 import tarfile
 import zipfile
 from collections import OrderedDict
@@ -566,36 +567,78 @@ def encode_hlip_null(model, tokenizer):
 # mean pooling. The .bin is the only weight file, so it is pinned by sha256 too.
 NEUROBERT_REPO = "davvwood/NeuroBERT"
 NEUROBERT_REVISION = "69c974a5a846953179f2737f5ef8d402f4a9e0d5"
-NEUROBERT_SHA256 = "cb913e3a260f01f25010d4f83967acdda4b848126988da7e164af4b72d5f489a"
-NEUROBERT_FORMAT = "neurobert-v1"  # bump when format_neurobert changes
+NEUROBERT_FORMAT = "neurobert-v2"  # bump when format_neurobert changes
+# The encoder MRFlow conditions on is that release fine-tuned on MR-RATE official-train reports,
+# MLM then radiology section matching; its recipe and hashes are in stage4_manifest.json next to
+# the weights. Same tokenizer, config and pooling; only the weights differ, so the release
+# snapshot still supplies everything but them. The file is pinned by sha256;
+# MRFLOW_NEUROBERT_WEIGHTS points at it on a machine that keeps it elsewhere.
+NEUROBERT_WEIGHTS = os.environ.get(
+    "MRFLOW_NEUROBERT_WEIGHTS",
+    "/hnvme/workspace/y100dc19-mrflow-final/models/neurobert-mlm-rsm/model.safetensors")
+NEUROBERT_WEIGHTS_SHA256 = "00dfdb0ce31264dae54ba989ef2d0a578448f852983123442b52eda6dbbffa33"
+# US -> British spellings, whole lowercase words. A pair is here when its British form is one token
+# of NeuroBERT's vocabulary (it was trained on UK reports) or splits into fewer tokens than the US
+# form; derived from every word of MR-RATE's train and val reports and reviewed by hand. No hemi-
+# (half) or chemo- word is touched: "hemisphere" is not "haemisphere".
+NEUROBERT_US_TO_UK = {
+    "hemorrhage": "haemorrhage", "hemorrhages": "haemorrhages", "hemorrhagic": "haemorrhagic",
+    "hemorrhaged": "haemorrhaged", "hemorrhaging": "haemorrhaging", "rehemorrhage": "rehaemorrhage",
+    "posthemorrhagic": "posthaemorrhagic", "microhemorrhage": "microhaemorrhage",
+    "microhemorrhages": "microhaemorrhages", "microhemorrhagic": "microhaemorrhagic",
+    "hematoma": "haematoma", "hematomas": "haematomas", "cephalhematoma": "cephalhaematoma",
+    "cephalohematoma": "cephalohaematoma", "hematohygroma": "haematohygroma",
+    "hematosinus": "haematosinus", "hematologic": "haematologic", "hematological": "haematological",
+    "hematologically": "haematologically", "hematopoietic": "haematopoietic",
+    "hematopoiesis": "haematopoiesis", "hematogenous": "haematogenous",
+    "hemangioma": "haemangioma", "hemangiomas": "haemangiomas", "hemangiomatic": "haemangiomatic",
+    "hemangiomatous": "haemangiomatous", "hemangioblastoma": "haemangioblastoma",
+    "hemangioblastomas": "haemangioblastomas", "hemangiopericytoma": "haemangiopericytoma",
+    "hemangioendothelioma": "haemangioendothelioma", "hemosiderin": "haemosiderin",
+    "hemosiderins": "haemosiderins", "hemosiderosis": "haemosiderosis", "hemoglobin": "haemoglobin",
+    "methemoglobin": "methaemoglobin", "metahemoglobin": "metahaemoglobin",
+    "deoxyhemoglobin": "deoxyhaemoglobin", "hemodynamic": "haemodynamic",
+    "hemodynamics": "haemodynamics", "hemostatic": "haemostatic",
+    "edema": "oedema", "ischemic": "ischaemic", "ischemia": "ischaemia",
+    "microischemic": "microischaemic", "microischemia": "microischaemia",
+    "postischemic": "postischaemic", "nonischemic": "nonischaemic", "angioischemic": "angioischaemic",
+    "tumor": "tumour", "tumors": "tumours", "tumoral": "tumoural", "pseudotumor": "pseudotumour",
+    "neurotumor": "neurotumour", "leukemic": "leukaemic", "leukoencephalopathy": "leucoencephalopathy",
+    "anemia": "anaemia", "anesthesia": "anaesthesia", "anesthetic": "anaesthetic",
+    "pediatric": "paediatric", "etiology": "aetiology", "etiologies": "aetiologies",
+    "etiologic": "aetiologic", "etiological": "aetiological", "fetal": "foetal",
+    "gray": "grey", "center": "centre", "centered": "centred", "fibers": "fibres",
+    "artifact": "artefact", "artifacts": "artefacts", "artifactual": "artefactual",
+}
+_NEUROBERT_UK = re.compile(r"\b(" + "|".join(sorted(NEUROBERT_US_TO_UK, key=len, reverse=True)) + r")\b")
 
 
 def neurobert_tag(max_length):
     """What a cached NeuroBERT artifact was encoded with; `text_condition` checks it."""
-    return f"{NEUROBERT_REPO}@{NEUROBERT_REVISION[:8]}|max{max_length}|mean|{NEUROBERT_FORMAT}"
+    return (f"{NEUROBERT_REPO}@{NEUROBERT_REVISION[:8]}+mlm-rsm-{NEUROBERT_WEIGHTS_SHA256[:8]}"
+            f"|max{max_length}|mean|{NEUROBERT_FORMAT}")
 
 
 def load_neurobert(device):
-    """Frozen NeuroBERT -> (model, tokenizer), at the pinned revision.
+    """Frozen fine-tuned NeuroBERT -> (model, tokenizer).
 
-    Built as `RobertaModel(config)` and loaded strictly from the sha256-checked .bin, because
-    transformers refuses `torch.load` below torch 2.6 and there is no safetensors file. The pooler
-    is left out: its weights are untouched initialization (std 0.0200, bias 0), never trained.
+    Config and tokenizer come from the release snapshot at the pinned revision; the weights are
+    the sha256-pinned fine-tuned file (`NEUROBERT_WEIGHTS`), loaded strictly into
+    `RobertaModel(config)` with no pooler (the release's pooler was never trained either).
     """
     from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
     from transformers import AutoTokenizer, RobertaConfig, RobertaModel
 
     path = snapshot_download(NEUROBERT_REPO, revision=NEUROBERT_REVISION,
-                             allow_patterns=["config.json", "pytorch_model.bin", "vocab.json",
-                                             "merges.txt", "tokenizer.json", "tokenizer_config.json",
+                             allow_patterns=["config.json", "vocab.json", "merges.txt",
+                                             "tokenizer.json", "tokenizer_config.json",
                                              "special_tokens_map.json"])
-    weights = os.path.join(path, "pytorch_model.bin")
-    with open(weights, "rb") as f:
-        if hashlib.sha256(f.read()).hexdigest() != NEUROBERT_SHA256:
-            raise RuntimeError(f"{weights} does not match the pinned sha256")
-    state = torch.load(weights, map_location="cpu", weights_only=True)
-    state = {k: v for k, v in state.items()
-             if not k.startswith("pooler.") and k != "embeddings.position_ids"}
+    with open(NEUROBERT_WEIGHTS, "rb") as f:
+        if hashlib.sha256(f.read()).hexdigest() != NEUROBERT_WEIGHTS_SHA256:
+            raise RuntimeError(f"{NEUROBERT_WEIGHTS} does not match the pinned sha256")
+    state = load_file(NEUROBERT_WEIGHTS)
+    state = {k: v for k, v in state.items() if k != "embeddings.position_ids"}
     model = RobertaModel(RobertaConfig.from_pretrained(path), add_pooling_layer=False)
     model.load_state_dict(state, strict=True)
     model.eval().requires_grad_(False).to(device)
@@ -608,12 +651,13 @@ def format_neurobert(report):
     Both sections verbatim under MR-RATE's own headings, inline as in the model card's
     `mri head: ... conclusion: ...`. Lowercased because the vocabulary is: a capital letter is a
     lone byte token ("Left" -> L/ef/t). Whitespace runs become one space, since the BPE has no tab
-    merge and no newline merge other than after spaces. Nothing else is touched. An empty section
-    is left out with its heading.
+    merge and no newline merge other than after spaces. Then US spellings in `NEUROBERT_US_TO_UK`
+    become British, whole words only, since the vocabulary is British. Nothing else is touched. An
+    empty section is left out with its heading.
     """
     parts = [f"{s}: {' '.join(report[s].split())}"
              for s in ("findings", "impression") if (report.get(s) or "").strip()]
-    return " ".join(parts).lower()
+    return _NEUROBERT_UK.sub(lambda m: NEUROBERT_US_TO_UK[m.group(1)], " ".join(parts).lower())
 
 
 def encode_neurobert_tokens(model, tokenizer, report, max_length=512):

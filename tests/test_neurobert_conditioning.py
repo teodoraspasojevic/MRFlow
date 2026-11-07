@@ -23,7 +23,8 @@ from echosyn.common.models import DiffuserSTDiT
 from echosyn.common.mrrate import (EMBEDDING_MANIFEST_FIELDS, NUM_MODALITY_CLASSES,
                                    NUM_PLANE_CLASSES, encode_neurobert_null,
                                    encode_neurobert_tokens, format_neurobert, load_neurobert,
-                                   neurobert_tag, text_condition)
+                                   neurobert_tag, text_condition,
+                                   NEUROBERT_US_TO_UK, NEUROBERT_WEIGHTS_SHA256)
 
 gpu_only = pytest.mark.skipif(not torch.cuda.is_available(), reason="xformers has no CPU kernel")
 
@@ -83,6 +84,34 @@ def test_format_keeps_the_report_and_its_sections():
                     "keeping with an acute infarct. no haemorrhage. the ventricles are of normal "
                     "size. impression: — acute left pontine infarct. — no hydrocephalus.")
     assert text == text.lower() and "\n" not in text and "\t" not in text
+
+
+def test_us_spellings_become_british_whole_words_only():
+    text = format_neurobert({"findings": "Hemorrhage, ISCHEMIC edema and a tumor in the gray matter "
+                                         "of the left hemisphere after chemotherapy; hemangiomas.",
+                             "impression": "Microhemorrhages."})
+    assert text == ("findings: haemorrhage, ischaemic oedema and a tumour in the grey matter of the "
+                    "left hemisphere after chemotherapy; haemangiomas. impression: microhaemorrhages.")
+    assert format_neurobert({"findings": "haemorrhage"}) == "findings: haemorrhage"   # idempotent
+
+
+def test_british_forms_are_vocabulary_words(neurobert):
+    """The table's rule: each British form is one token, or fewer tokens than its US form."""
+    tokenizer = neurobert[1]
+    n = lambda w: len(tokenizer.tokenize(" " + w))
+    assert all(n(uk) == 1 or n(uk) < n(us) for us, uk in NEUROBERT_US_TO_UK.items())
+    assert not set(NEUROBERT_US_TO_UK.values()) & set(NEUROBERT_US_TO_UK)
+    assert not any(us.startswith(("hemi", "chem")) for us in NEUROBERT_US_TO_UK)
+
+
+def test_weights_are_pinned(tmp_path, monkeypatch):
+    import echosyn.common.mrrate as mrrate
+    fake = tmp_path / "model.safetensors"
+    fake.write_bytes(b"not the fine-tuned encoder")
+    monkeypatch.setattr(mrrate, "NEUROBERT_WEIGHTS", str(fake))
+    with pytest.raises(RuntimeError, match="sha256"):
+        load_neurobert("cpu")
+    assert NEUROBERT_WEIGHTS_SHA256[:8] in neurobert_tag(L)
 
 
 def test_missing_sections_are_left_out():

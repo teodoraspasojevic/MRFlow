@@ -1,3 +1,9 @@
+# Encoder (2026-11-07): NeuroBERT @ 69c974a5 fine-tuned on MR-RATE official-train reports, MLM then
+# radiology section matching (mrrate.NEUROBERT_WEIGHTS, sha256 00dfdb0c..., MRFLOW_NEUROBERT_WEIGHTS
+# overrides the path), and reports put in British spelling before encoding (format neurobert-v2).
+# Its artifacts live in data/mrflow_neurobert-mlm-rsm_tokens; the release encoder's in
+# data/mrflow_neurobert_tokens no longer pass text_condition's tag check.
+#
 # mrflow_from_scratch_hlip-tokens_ynorm_trim-v1 with NeuroBERT (davvwood/NeuroBERT @ 69c974a5,
 # Wood et al., Radiology: AI 2025) in place of HLIP's text tower. Differences from the parent, all
 # of them:
@@ -271,8 +277,8 @@ mri:
   text_encoder: neurobert_tokens  # echosyn.common.mrrate.build_conditioner
   text_sections: [neurobert]    # findings and impression, one string, one artifact per study
   neurobert_global_condition: mean_pool  # or none, with denoiser.args.pooled_channels: 0
-  embedding_root: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_neurobert_tokens
-  null_text: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_neurobert_tokens/null_text.pt
+  embedding_root: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_neurobert-mlm-rsm_tokens
+  null_text: /hnvme/workspace/y100dc19-mrflow-final/data/mrflow_neurobert-mlm-rsm_tokens/null_text.pt
   text_max_length: 512          # NeuroBERT's context; longer reports lose their tail
   vae_batch_size: 32            # slices per VAE forward
   # Series selection. All ~576k eligible train series would be ~9 TB of latents and ~1300
