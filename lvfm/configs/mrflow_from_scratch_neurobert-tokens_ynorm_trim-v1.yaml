@@ -1,6 +1,7 @@
 # Encoder (2026-11-07): NeuroBERT @ 69c974a5 fine-tuned on MR-RATE official-train reports, MLM then
 # radiology section matching (mrrate.NEUROBERT_WEIGHTS, sha256 00dfdb0c..., MRFLOW_NEUROBERT_WEIGHTS
-# overrides the path), and reports put in British spelling before encoding (format neurobert-v2).
+# overrides the path); reports are encoded in their original US spelling, as fine-tuned
+# (format neurobert-v4; v2 converted to British spelling and is rejected by the tag check).
 # Its artifacts live in data/mrflow_neurobert-mlm-rsm_tokens; the release encoder's in
 # data/mrflow_neurobert_tokens no longer pass text_condition's tag check.
 #

@@ -20,7 +20,6 @@ import io
 import json
 import os
 import random
-import re
 import tarfile
 import zipfile
 from collections import OrderedDict
@@ -567,7 +566,7 @@ def encode_hlip_null(model, tokenizer):
 # mean pooling. The .bin is the only weight file, so it is pinned by sha256 too.
 NEUROBERT_REPO = "davvwood/NeuroBERT"
 NEUROBERT_REVISION = "69c974a5a846953179f2737f5ef8d402f4a9e0d5"
-NEUROBERT_FORMAT = "neurobert-v2"  # bump when format_neurobert changes
+NEUROBERT_FORMAT = "neurobert-v4"  # v4: no spelling change (v2/v3 made US spellings British)  # bump when format_neurobert changes
 # The encoder MRFlow conditions on is that release fine-tuned on MR-RATE official-train reports,
 # MLM then radiology section matching; its recipe and hashes are in stage4_manifest.json next to
 # the weights. Same tokenizer, config and pooling; only the weights differ, so the release
@@ -577,40 +576,6 @@ NEUROBERT_WEIGHTS = os.environ.get(
     "MRFLOW_NEUROBERT_WEIGHTS",
     "/hnvme/workspace/y100dc19-mrflow-final/models/neurobert-mlm-rsm/model.safetensors")
 NEUROBERT_WEIGHTS_SHA256 = "00dfdb0ce31264dae54ba989ef2d0a578448f852983123442b52eda6dbbffa33"
-# US -> British spellings, whole lowercase words. A pair is here when its British form is one token
-# of NeuroBERT's vocabulary (it was trained on UK reports) or splits into fewer tokens than the US
-# form; derived from every word of MR-RATE's train and val reports and reviewed by hand. No hemi-
-# (half) or chemo- word is touched: "hemisphere" is not "haemisphere".
-NEUROBERT_US_TO_UK = {
-    "hemorrhage": "haemorrhage", "hemorrhages": "haemorrhages", "hemorrhagic": "haemorrhagic",
-    "hemorrhaged": "haemorrhaged", "hemorrhaging": "haemorrhaging", "rehemorrhage": "rehaemorrhage",
-    "posthemorrhagic": "posthaemorrhagic", "microhemorrhage": "microhaemorrhage",
-    "microhemorrhages": "microhaemorrhages", "microhemorrhagic": "microhaemorrhagic",
-    "hematoma": "haematoma", "hematomas": "haematomas", "cephalhematoma": "cephalhaematoma",
-    "cephalohematoma": "cephalohaematoma", "hematohygroma": "haematohygroma",
-    "hematosinus": "haematosinus", "hematologic": "haematologic", "hematological": "haematological",
-    "hematologically": "haematologically", "hematopoietic": "haematopoietic",
-    "hematopoiesis": "haematopoiesis", "hematogenous": "haematogenous",
-    "hemangioma": "haemangioma", "hemangiomas": "haemangiomas", "hemangiomatic": "haemangiomatic",
-    "hemangiomatous": "haemangiomatous", "hemangioblastoma": "haemangioblastoma",
-    "hemangioblastomas": "haemangioblastomas", "hemangiopericytoma": "haemangiopericytoma",
-    "hemangioendothelioma": "haemangioendothelioma", "hemosiderin": "haemosiderin",
-    "hemosiderins": "haemosiderins", "hemosiderosis": "haemosiderosis", "hemoglobin": "haemoglobin",
-    "methemoglobin": "methaemoglobin", "metahemoglobin": "metahaemoglobin",
-    "deoxyhemoglobin": "deoxyhaemoglobin", "hemodynamic": "haemodynamic",
-    "hemodynamics": "haemodynamics", "hemostatic": "haemostatic",
-    "edema": "oedema", "ischemic": "ischaemic", "ischemia": "ischaemia",
-    "microischemic": "microischaemic", "microischemia": "microischaemia",
-    "postischemic": "postischaemic", "nonischemic": "nonischaemic", "angioischemic": "angioischaemic",
-    "tumor": "tumour", "tumors": "tumours", "tumoral": "tumoural", "pseudotumor": "pseudotumour",
-    "neurotumor": "neurotumour", "leukemic": "leukaemic", "leukoencephalopathy": "leucoencephalopathy",
-    "anemia": "anaemia", "anesthesia": "anaesthesia", "anesthetic": "anaesthetic",
-    "pediatric": "paediatric", "etiology": "aetiology", "etiologies": "aetiologies",
-    "etiologic": "aetiologic", "etiological": "aetiological", "fetal": "foetal",
-    "gray": "grey", "center": "centre", "centered": "centred", "fibers": "fibres",
-    "artifact": "artefact", "artifacts": "artefacts", "artifactual": "artefactual",
-}
-_NEUROBERT_UK = re.compile(r"\b(" + "|".join(sorted(NEUROBERT_US_TO_UK, key=len, reverse=True)) + r")\b")
 
 
 def neurobert_tag(max_length):
@@ -651,13 +616,14 @@ def format_neurobert(report):
     Both sections verbatim under MR-RATE's own headings, inline as in the model card's
     `mri head: ... conclusion: ...`. Lowercased because the vocabulary is: a capital letter is a
     lone byte token ("Left" -> L/ef/t). Whitespace runs become one space, since the BPE has no tab
-    merge and no newline merge other than after spaces. Then US spellings in `NEUROBERT_US_TO_UK`
-    become British, whole words only, since the vocabulary is British. Nothing else is touched. An
+    merge and no newline merge other than after spaces. Spelling is left as written (US): the
+    encoder was fine-tuned on MR-RATE reports spelled that way, and British-spelled input scored
+    worse on the Stage 4 benchmark. Nothing else is touched. An
     empty section is left out with its heading.
     """
     parts = [f"{s}: {' '.join(report[s].split())}"
              for s in ("findings", "impression") if (report.get(s) or "").strip()]
-    return _NEUROBERT_UK.sub(lambda m: NEUROBERT_US_TO_UK[m.group(1)], " ".join(parts).lower())
+    return " ".join(parts).lower()
 
 
 def encode_neurobert_tokens(model, tokenizer, report, max_length=512):
