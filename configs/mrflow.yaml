@@ -1,0 +1,189 @@
+# MRFlow: report-conditioned 3D brain MRI autoregressive generation on MR-RATE.
+#
+# A Spatial-Temporal DiT-L trained from scratch with flow matching in FLUX-VAE latent space,
+# generating a volume block by block (16 latent slices per block), each block conditioned on the
+# previous one. Conditioning:
+#   report     NeuroBERT (davvwood/NeuroBERT, fine-tuned on MR-RATE train reports) over
+#              "findings: ... impression: ...": its token states feed cross-attention, their
+#              mean-pooled embedding is added to the timestep embedding.
+#   modality   class embedding (T1w, T2w, FLAIR, SWI, MRA, UNKNOWN, plus a CFG null).
+#   plane      class embedding (axial, sagittal, coronal).
+#
+# Every path below marked /path/to is a placeholder; see README.md for the data format.
+
+globals:
+  target_fps: 32                # only the mp4/gif writer reads this; MR slices are not a time axis
+  target_nframes: 16            # latent slices per block == STDiT input_size[0]
+  outputs: ["video", "image"]   # unused: read by no interpolation and no Python (EchoSyn legacy)
+  resolution: 256               # in-plane image size fed to the VAE
+  latent_res: 32                # 256 / 8, the FLUX f8 in-plane latent size
+  latent_channels: 16
+  max_steps: 200_000
+
+max_train_steps: ${globals.max_steps}
+gradient_accumulation_steps: 2   # CTFlow's own microbatching: 16/GPU x 4 x 16 nodes x 2 = 2048
+mixed_precision: "bf16"
+use_ema: true
+max_grad_norm: 1.0
+max_grad_value: -1
+loss_spike_factor: 3.0           # reload when the fast loss EMA exceeds 3x the slow one
+
+# Preprocessing stores both posterior parameters, so latents are 32 channels and every read draws
+# a fresh sample. Must stay true: false would silently take the first 16 channels -- the mean -- and
+# train on one frozen encoding per volume.
+sample_latents: true
+
+# Pixel-range constants. MR volumes are normalized to [0, 1]. The sequence boundaries -- an
+# all-black seed block and an all-white stop block -- are the ends of that range.
+decode_scale: 255.0
+decode_shift: 0.0
+black_value: 0.0
+white_value: 1.0
+
+# --- Data: latents and report embeddings (see README.md, Data format). ---
+mri:
+  dataset_root: /path/to/data/mrflow_latents
+  text_sections: [neurobert]    # findings and impression, one string, one artifact per study
+  neurobert_global_condition: mean_pool  # or none, with denoiser.args.pooled_channels: 0
+  embedding_root: /path/to/data/mrflow_neurobert_tokens
+  null_text: /path/to/data/mrflow_neurobert_tokens/null_text.pt
+
+denoiser:
+    target: mrflow.models.DiffuserSTDiT
+    args: # DiT-L
+        input_size:
+          - ${globals.target_nframes}
+          - ${globals.latent_res}
+          - ${globals.latent_res}
+        in_channels: 32           # 16 target + 16 condition, concatenated on the channel dim
+        out_channels: ${globals.latent_channels}
+        patch_size: [2, 2, 2]
+        hidden_size: 1024
+        depth: 24
+        num_heads: 16
+        mlp_ratio: 4.0
+        class_dropout_prob: 0.0
+        drop_path: 0.0
+        no_temporal_pos_emb: false
+        caption_channels: 768     # NeuroBERT hidden states
+        model_max_length: 512     # NeuroBERT's context; padded and masked
+        pooled_channels: 768      # NeuroBERT's mean-pooled embedding into t; 0 for none
+        qk_norm: true
+        y_norm: true              # RMSNorm on the projected caption tokens (Sana)
+        y_norm_scale_factor: 0.01 # its initial gain, Sana's value
+        space_scale: 1.0
+        time_scale: 1.0
+        enable_flashattn: false
+        num_modality_classes: 7   # CFG_NULL, T1w, T2w, FLAIR, SWI, MRA, UNKNOWN
+        num_plane_classes: 3      # AXIAL, SAGITTAL, CORONAL -- no null, plane is never guided
+
+optimizer:
+  target: torch.optim.AdamW
+  args:
+    # Stable boundary measured in a 4-arm sweep: 4e-4 diverges, 2e-4 does not.
+    lr: 2e-4
+    betas: [0.9, 0.999]
+    weight_decay: 1e-2
+    eps: 1e-08
+
+scheduler:
+  target: mrflow.schedulers.StepBasedLearningRateScheduleWithWarmup
+  args:
+    warmup_steps: 2000
+    # Not tied to max_steps: CTFlow's decay curve, ref_steps 1e6.
+    ref_steps: 1_000_000
+    eta_min: 1e-6
+    decay_rate: 2.0
+
+vae:
+  # Must be the checkpoint the latents were encoded with; get_vae_scaler reads scaling_factor and
+  # shift_factor out of its config.json.
+  target: diffusers.AutoencoderKL
+  pretrained: /path/to/flux-vae
+
+datasets:
+    - name: MRRateLatentBlock
+      active: true
+      params:
+        root: ${mri.dataset_root}
+        embedding_root: ${mri.embedding_root}
+        text_sections: ${mri.text_sections}
+        max_text_tokens: ${denoiser.args.model_max_length}
+        global_condition: ${mri.neurobert_global_condition}
+        split: train
+        block_size: ${globals.target_nframes}
+        p_start: 0.3
+        p_end: 0.2
+
+val_datasets:
+    - name: MRRateLatentBlock
+      active: true
+      params:
+        root: ${mri.dataset_root}
+        embedding_root: ${mri.embedding_root}
+        text_sections: ${mri.text_sections}
+        max_text_tokens: ${denoiser.args.model_max_length}
+        global_condition: ${mri.neurobert_global_condition}
+        split: val
+        block_size: ${globals.target_nframes}
+        p_start: 0.0             # validation compares real -> real blocks
+        p_end: 0.0
+        deterministic: true      # same examples at every validation step
+        seed: ${seed}
+
+dataloader:
+  target: torch.utils.data.DataLoader
+  args:
+    shuffle: true
+    batch_size: 16               # per GPU; fits 140 GiB (H200)
+    num_workers: 16
+    pin_memory: true
+    drop_last: true
+    persistent_workers: true
+
+noise_offset: 0.05
+noise_cond_image: 0.05
+no_conditionning: False
+p_drop_conditionning: 0.0        # previous-block dropout: an autoregressive trick, not semantic CFG
+
+# Semantic condition states, sampled per sample. Explicit rather than two independent Bernoulli
+# draws: independent dropout at 0.1/0.1 would leave only 1% fully-null, and that branch is the base
+# of the guidance expansion. Must sum to 1.
+condition_states:
+  full: 0.80                     # real modality, real report
+  modality_only: 0.10            # real modality, null report
+  semantic_null: 0.10            # CFG_NULL modality, null report
+
+# Inference guidance. 1.0/1.0 is exactly the fully conditional prediction, so these defaults
+# reproduce single-branch behaviour and cost one denoiser call instead of three.
+guidance:
+  modality_cfg_scale: 1.0
+  report_cfg_scale: 1.0
+
+output_dir: /path/to/experiments/${wandb_args.name}
+logging_dir: logs
+
+report_to: wandb
+wandb_args:
+  project: MRFlow
+  name: mrflow
+  group: mrflow
+  id: null
+
+checkpointing_steps: 2_000
+# Every other checkpoint is deleted at each save; the latest is always kept.
+checkpoints_to_keep: [10000, 20000, 50000, 100000, 120000, 140000, 160000, 180000, 190000, 200000]
+
+# Random init. resume_from_checkpoint: latest continues an interrupted run.
+init_from: null
+resume_from_checkpoint: latest
+if_fine_tuned: false
+
+validation:
+  samples: 4
+  steps: 20_000                  # monitoring cadence only
+  timesteps: 25
+  frames: ${globals.target_nframes}
+  fps: ${globals.target_fps}
+
+seed: 42

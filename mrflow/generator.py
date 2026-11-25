@@ -1,0 +1,264 @@
+# Adapted from CTFlow (https://github.com/WongJiayi/CTFlow); modified for MRFlow.
+import time
+
+import torch
+from torchdiffeq import odeint_adjoint as odeint
+
+from mrflow import *
+from mrflow.mri import CFG_NULL_MODALITY_ID
+
+
+def safe_compile(model: torch.nn.Module, name: str = "model", dynamic: bool = False) -> torch.nn.Module:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+    try:
+        print(f"[compile] {name} starting (dynamic={dynamic})...", flush=True)
+        start = time.time()
+        compiled = torch.compile(model, dynamic=dynamic)
+        print(f"[compile] {name} wrapped in {time.time() - start:.1f}s "
+              f"(actual compilation happens lazily, on first forward call)")
+        return compiled
+    except Exception as exc:  # pragma: no cover -- environment-dependent (Triton/Inductor availability)
+        print(f"[compile] falling back to eager for {name}: {exc}")
+        return model
+
+
+def text_kwargs(prompt_embeds, repeats=1):
+    """Denoiser kwargs for one report, repeated `repeats` times along the batch."""
+    if not isinstance(prompt_embeds, dict):
+        prompt_embeds = {"encoder_hidden_states": prompt_embeds}
+    return {k: v.repeat(repeats, *[1] * (v.dim() - 1)) for k, v in prompt_embeds.items()}
+
+
+class LatentAutoregressiveGenerator:
+    """Generates a latent volume block by block, each block conditioned on the previous one."""
+
+    def __init__(
+        self,
+        denoiser,
+        vae,
+        device,
+        vae_scaling,
+        config,
+        block_size: int = 16,
+        overlap: int = 8,
+        eps: float = 0.1,
+        modality_cfg_scale: float = 1.0,
+        report_cfg_scale: float = 1.0,
+        use_bf16: bool = False,
+        use_compile: bool = False,
+        compile_dynamic: bool = False,
+        ode_steps: int = 201,
+    ):
+        self.denoiser = denoiser
+        self.vae = vae
+        self.device = device
+        self.vae_scaling = vae_scaling
+        self.config = config
+        self.block_size = block_size
+        self.overlap = overlap
+        self.eps = eps
+        self.modality_cfg_scale = modality_cfg_scale
+        self.report_cfg_scale = report_cfg_scale
+        self.dtype = torch.bfloat16 if use_bf16 else torch.float32
+        self.ode_steps = ode_steps
+        self.trim = True
+
+        if use_compile:
+            self.denoiser = safe_compile(self.denoiser, "denoiser", dynamic=compile_dynamic)
+
+        res = self.config.globals.resolution
+        self.zero_latent = self.encode_image(torch.full((1, 3, res, res), float(self.config.black_value)))
+
+        one_latent = self.encode_image(torch.full((1, 3, res, res), float(self.config.white_value)))
+        one_latent = sample_latents(self.config, one_latent)
+        one_latent = scale_latents(one_latent, vae_scaling) # white token is scaled now
+        self.one_latent = one_latent
+
+    def encode_image(self, img):
+        with torch.no_grad():
+            img = img.to(self.device).float()
+            img = self.vae.encode(img).latent_dist.sample()
+        return img
+
+    def decode_latent(self, latents, max_batch_size=64):
+        with torch.no_grad():
+            latents = unscale_latents(latents, self.vae_scaling)
+            b, c, t, h, w = latents.shape
+            latents = rearrange(latents, "b c t h w -> (b t) c h w")
+
+            decoded_chunks = []
+            for chunk in latents.split(max_batch_size, dim=0):
+                decoded = self.vae.decode(chunk.float()).sample
+                decoded_chunks.append(decoded)
+
+            latents = torch.cat(decoded_chunks, dim=0)
+            latents = to_uint8_frames(latents, self.config).cpu()
+            latents = rearrange(latents, "(b t) c h w -> b c t h w", b=b)
+            print("Decoded latents shape:", latents.shape)
+
+        return latents
+
+    def velocity(self, t, y, prompt_embeds, cond_image, modality_id, plane_id):
+        """Velocity for the ODE, with hierarchical classifier-free guidance.
+
+        v = v_base + s_mod * (v_modality - v_base) + s_rep * (v_full - v_modality), where base has a
+        null modality and null report, modality a null report. The three branches run as one batch;
+        at s_mod = s_rep = 1 only the conditional branch is evaluated.
+        """
+        s_mod, s_rep = self.modality_cfg_scale, self.report_cfg_scale
+        if s_mod == 1.0 and s_rep == 1.0:
+            return self.denoiser(
+                y, t, **text_kwargs(prompt_embeds), cond_image=cond_image,
+                modality_id=modality_id, plane_id=plane_id,
+            ).sample
+
+        K = 3
+        null_modality = torch.full_like(modality_id, CFG_NULL_MODALITY_ID)
+        drop = torch.tensor([True, True, False], device=y.device)
+        v = self.denoiser(
+            y.repeat(K, 1, 1, 1, 1), t,
+            **text_kwargs(prompt_embeds, K),
+            cond_image=cond_image.repeat(K, 1, 1, 1, 1),
+            modality_id=torch.cat([null_modality, modality_id, modality_id]),
+            plane_id=plane_id.repeat(K),
+            force_drop_ids=drop.repeat_interleave(modality_id.shape[0]),
+        ).sample
+
+        v_base, v_modality, v_full = v.chunk(K)
+        return v_base + s_mod * (v_modality - v_base) + s_rep * (v_full - v_modality)
+
+    def is_stop_frame(self, latent: torch.Tensor):
+        """Check if the last block is all-white (stop signal)."""
+        last_frame = latent[:, :, 0, :, :]
+        target = self.one_latent.expand_as(last_frame)
+        if_stop = torch.mean((torch.abs(last_frame - target) < self.eps).float())
+        return if_stop > 0.9
+
+    def trim_stop_frames(self, latent: torch.Tensor):
+        """Remove trailing all-white frames from the end of the volume."""
+        B, C, T, H, W = latent.shape
+        target = self.one_latent.expand(B, C, H, W)
+
+        keep_until = T
+        for i in reversed(range(T)):
+            frame = latent[:, :, i, :, :]
+            if torch.mean((torch.abs(frame - target) < self.eps).float()) > 0.9:
+                keep_until -= 1
+            else:
+                break
+
+        return latent[:, :, :keep_until, :, :]
+
+    def generate(self, prompt_embeds, modality_id, plane_id, max_blocks=30, gt_first_block=None):
+        """Generate a full latent volume [B, C, T, H, W].
+
+        Starts from the black block (or `gt_first_block`) and stops at the white block or `max_blocks`.
+        """
+        self.denoiser.eval()
+
+        B = 1
+        C = self.config.globals.latent_channels
+        H = W = self.config.globals.latent_res
+        T = self.block_size
+
+        if gt_first_block is None:
+            init_block = self.zero_latent.unsqueeze(0).permute(0, 2, 1, 3, 4)
+            init_block = init_block.repeat(B, 1, self.block_size, 1, 1)
+            init_block = scale_latents(init_block, self.vae_scaling)
+            init_block = init_block.to(self.dtype)
+        else:
+            init_block = gt_first_block
+
+        blocks = [init_block]
+        cur_step = 0
+        block_times = []
+
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=self.dtype):
+            while cur_step < max_blocks:
+                cur_latent = torch.cat(blocks, dim=2) # concatenate over T dimension
+
+                z = torch.randn((B, C, T, H, W), device=self.device, dtype=self.dtype)
+
+                cond_image_latent = cur_latent[:, :, -self.block_size:, :, :]
+                cond_image_latent = sample_latents(self.config, cond_image_latent)
+
+                def rhs(t, y):
+                    return self.velocity(t, y, prompt_embeds, cond_image_latent,
+                                         modality_id, plane_id)
+
+                timesteps = torch.linspace(1.0, 0.0, steps=self.ode_steps, device=self.device, dtype=torch.float32)
+                start_time = time.time()
+                new_block = odeint(
+                    rhs,
+                    z,
+                    timesteps,
+                    atol=1e-5,
+                    rtol=1e-5,
+                    adjoint_params=self.denoiser.parameters(),
+                    method="euler",
+                )[-1]
+                elapsed = time.time() - start_time
+                block_times.append(elapsed)
+
+                blocks.append(new_block)
+                cur_step += 1
+
+                if self.overlap > 0:
+                    last_overlap = new_block[:, :, -self.overlap:, :, :] # takes the last `overlap` frames of the new block
+                    blocks[-1] = new_block[:, :, :-self.overlap, :, :] # takes the first `overlap` frames of the new block
+                    blocks.append(last_overlap) # final result that the first and last 8 slices are added as separate chuncks to `blocks`
+
+                if self.is_stop_frame(new_block):
+                    print("[Generator] Stop block detected. Ending generation.")
+                    break
+
+        full_latent = torch.cat(blocks, dim=2)
+        if gt_first_block is None and full_latent.shape[2] > 16:
+            full_latent = full_latent[:, :, 16:]  # remove the zero-padded init block
+        if self.trim:
+            full_latent = self.trim_stop_frames(full_latent)
+
+        if block_times:
+            avg_time = sum(block_times) / len(block_times)
+            total_time = sum(block_times)
+            print(
+                f"[Timing] Avg block time: {avg_time:.3f}s | "
+                f"Total: {total_time:.3f}s | Blocks: {len(block_times)}"
+            )
+
+        return full_latent
+
+    def generate_next_block(self, prev_latent, prompt_embeds, modality_id, plane_id, trim=True):
+        """Generate the block following `prev_latent` (block-wise mode), stop frames trimmed."""
+        B = 1
+        C = self.config.globals.latent_channels
+        H = W = self.config.globals.latent_res
+        T = self.block_size
+        prev_latent = prev_latent.to(self.dtype)
+
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=self.dtype):
+            z = torch.randn((B, C, T, H, W), device=self.device, dtype=self.dtype)
+
+            def rhs(t, y):
+                return self.velocity(t, y, prompt_embeds, prev_latent, modality_id, plane_id)
+
+            # Same euler schedule as `generate`, so block-wise numbers stay comparable to a
+            # full rollout -- an adaptive solver's step count depends on the guided field.
+            timesteps = torch.linspace(1.0, 0.0, steps=self.ode_steps, device=self.device,
+                                       dtype=torch.float32)
+            start_time = time.time()
+            new_block = odeint(
+                rhs,
+                z,
+                timesteps,
+                atol=1e-5,
+                rtol=1e-5,
+                adjoint_params=self.denoiser.parameters(),
+                method="euler",
+            )[-1]
+            elapsed = time.time() - start_time
+            print(f"[Timing] Single block generation time: {elapsed:.3f}s")
+
+        # trim=False keeps the block whole, so teacher forcing stays aligned with the real volume.
+        return self.trim_stop_frames(new_block) if trim else new_block

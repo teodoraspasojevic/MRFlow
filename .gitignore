@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+logs/
+*.log
+wandb/
+
+# Checkpoints, latents and embeddings
+*.pt
+*.safetensors
+checkpoint-*/
