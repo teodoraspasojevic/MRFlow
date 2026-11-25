@@ -2,7 +2,10 @@
 
 **MRFlow: Report-Conditioned Autoregressive Flow Matching for Variable-Length 3D Brain MRI.**
 
-[Paper (coming soon)] | [Checkpoint (Hugging Face)](https://huggingface.co/teodora-spasojevic-fau/MRFlow)
+[![Paper](https://img.shields.io/badge/Paper-coming%20soon-lightgrey)](#)
+[![Model](https://img.shields.io/badge/%F0%9F%A4%97%20Model-MRFlow-yellow)](https://huggingface.co/teodora-spasojevic-fau/MRFlow)
+[![Dataset](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-MR--RATE-orange)](https://huggingface.co/datasets/Forithmus/MR-RATE)
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue)](LICENSE)
 
 MRFlow is a report-conditioned autoregressive flow-matching model for multi-sequence, multi-plane 3D
 brain MRI generation. A Spatial-Temporal DiT generates the series block by block in FLUX-VAE latent
